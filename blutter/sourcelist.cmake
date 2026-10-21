@@ -31,6 +31,8 @@ set(SRCS
     ElfHelper.h
     FridaWriter.cpp
     FridaWriter.h
+    SnapshotCodeAnalysis.cpp
+    SnapshotCodeAnalysis.h
     HtArrayIterator.h
     Util.cpp
     Util.h

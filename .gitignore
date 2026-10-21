@@ -15,3 +15,22 @@ pyrightconfig.json
 *.so
 *.dll
 *.lib
+# Local inputs and generated analysis artifacts
+*.apk
+*.apks
+*.aab
+*.xapk
+*.ipa
+*.elf
+*.dylib
+*.a
+*.log
+**/asm/
+**/ida_script/
+**/blutter_frida.js
+**/snapshot_*.json
+# Keep local notes out of source commits; CMake files are build inputs.
+*.md
+*.rst
+*.txt
+!CMakeLists.txt

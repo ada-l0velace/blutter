@@ -112,4 +112,7 @@ namespace dart {
 #  define DartGetRecordType(record) record.GetRecordType()
 #endif
 
+// VARIABLE_CLOSURE_LAYOUT is detected from the actual SDK offsets header.
+// Variable closure slots are decoded explicitly; do not alias them to fixed fields.
+
 #endif //PCH_H

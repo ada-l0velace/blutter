@@ -7,6 +7,10 @@
 #include <iostream>
 #include <sstream>
 #include <numeric>
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+#include <vm/heap/safepoint.h>
+#include "SnapshotCodeAnalysis.h"
+#endif
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
@@ -24,6 +28,94 @@ static std::unordered_map<std::string, std::string> OP_MAP {
 	{ "%", "mod" },
 	{ "&", "LAnd" }, { "|", "LOr" }, { "^", "xor" }, { "~", "not" }, {">>", "shar"}, {"<<", "shal"}, {">>", "shr"}
 };
+
+// Names and pool comments are data, including backslashes and newlines.
+// Emit a Python literal instead of inserting them into generated source.
+static std::string pythonString(const std::string& value)
+{
+	std::string result = "\"";
+	for (const unsigned char c : value) {
+		if (c == '\\' || c == '"') {
+			result += '\\';
+			result += c;
+		}
+		else if (c < 0x20 || c == 0x7f) {
+			result += std::format("\\x{:02x}", c);
+		}
+		else result += c;
+	}
+	return result + '"';
+}
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+// Optional numerical VM metadata audit, independent of IDA/asm exports.
+void DartDumper::DumpCoverageAudit(const char* filename)
+{
+	std::ofstream of(filename);
+	if (!of) throw std::runtime_error("Cannot create coverage audit");
+	auto* thread = dart::Thread::Current();
+	auto* zone = thread->zone();
+	const auto& tables = dart::GrowableObjectArray::Handle(
+		zone, thread->isolate_group()->object_store()->instructions_tables());
+	of << "{\"tables\":[";
+	for (intptr_t t = 0; !tables.IsNull() && t < tables.Length(); ++t) {
+		if (t) of << ',';
+		const auto& table = dart::InstructionsTable::Handle(
+			zone, dart::InstructionsTable::RawCast(tables.At(t)));
+		const auto& codes = dart::Array::Handle(zone, table.code_objects());
+		const auto* data = table.rodata();
+		const auto startPc = table.EntryPointAt(0) - data->entries()[0].pc_offset;
+		of << std::format("{{\"index\":{},\"data_address\":{},\"start_pc\":{},\"count\":{},\"first_with_code\":{},\"retained_code_count\":{},\"entries\":[",
+			t, reinterpret_cast<uintptr_t>(data) - app.base(), startPc - app.base(), data->length, data->first_entry_with_code, codes.Length());
+		for (uint32_t i = 0; i < data->length; ++i) {
+			if (i) of << ',';
+			of << std::format("{{\"index\":{},\"entry\":{},\"pc_offset\":{},\"stack_map_offset\":{}",
+				i, table.EntryPointAt(i) - app.base(), data->entries()[i].pc_offset, data->entries()[i].stack_map_offset);
+			if (i >= data->first_entry_with_code) {
+				const auto& code = dart::Code::Handle(zone,
+					dart::Code::RawCast(codes.At(i - data->first_entry_with_code)));
+				of << std::format(",\"code_entry\":{},\"payload\":{},\"size\":{},\"owner_cid\":{}",
+					code.EntryPoint() - app.base(), code.PayloadStart() - app.base(), code.Size(), code.owner().GetClassId());
+			}
+			of << '}';
+		}
+		of << "]}";
+	}
+	of << "],\"known_functions\":[";
+	bool comma = false;
+	for (const auto& [address, fn] : app.functions) {
+		if (comma) of << ','; comma = true;
+		of << std::format("{{\"entry\":{},\"payload\":{},\"size\":{},\"native_library\":{},\"null_function\":{}}}",
+			address, fn->PayloadAddress(), fn->Size(), &fn->Class().Library() == &app.nativeLib ? "true" : "false",
+			fn->Ptr() == dart::Function::null() ? "true" : "false");
+	}
+	of << "],\"known_stubs\":[";
+	comma = false;
+	for (const auto& [address, stub] : app.stubs) {
+		if (comma) of << ','; comma = true;
+		of << std::format("{{\"entry\":{},\"size\":{}}}", address, stub->Size());
+	}
+	of << "],\"heap_functions\":[";
+	class FunctionVisitor : public dart::ObjectVisitor {
+	public:
+		std::vector<dart::FunctionPtr> functions;
+		void VisitObject(dart::ObjectPtr object) override {
+			if (object->IsFunction()) functions.push_back(dart::Function::RawCast(object));
+		}
+	} visitor;
+	dart::HeapIterationScope iteration(thread);
+	iteration.IterateOldObjects(&visitor);
+	comma = false;
+	for (const auto ptr : visitor.functions) {
+		const auto& fn = dart::Function::Handle(zone, ptr);
+		if (comma) of << ','; comma = true;
+		const auto& code = dart::Code::Handle(zone, fn.CurrentCode());
+		of << std::format("{{\"entry\":{},\"unknown_code\":{},\"has_code\":{}}}",
+			fn.entry_point() - app.base(), code.IsUnknownDartCode() ? "true" : "false", fn.HasCode() ? "true" : "false");
+	}
+	of << "]}\n";
+}
+#endif
 
 static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::string& cls_prefix)
 {
@@ -87,7 +179,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 	std::filesystem::create_directory(outDir);
 	std::ofstream of((outDir / "addNames.py").string());
 	of << "import ida_funcs\n";
-	of << "import idaapi\n\n";
+	of << "import idaapi\nimport idc\n\n";
 
 	for (auto lib : app.libs) {
 		std::string lib_prefix = lib->GetName();
@@ -96,19 +188,24 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 			for (auto dartFn : cls->Functions()) {
 				const auto ep = dartFn->Address();
 				auto name = getFunctionName4Ida(*dartFn, cls_prefix);
+#if !defined(BLUTTER_SHOREBIRD_3C9C)
 				const auto fnSize = dartFn->Size();
 				if (fnSize > 0) {
 					of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + fnSize);
 				}
-				of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}\")\n", ep, lib_prefix, cls_prefix, name.c_str(), ep);
+#endif
+				of << std::format("idaapi.set_name({:#x}, {})\n", ep,
+					pythonString(std::format("{}_{}::{}_{:x}", lib_prefix, cls_prefix, name, ep)));
 				if (dartFn->HasMorphicCode()) {
 					const auto payloadAddr = dartFn->PayloadAddress();
 					const auto morphicAddr = dartFn->MonomorphicAddress();
 					if (payloadAddr != 0 && payloadAddr != ep) {
-						of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}_miss\")\n", payloadAddr, lib_prefix, cls_prefix, name.c_str(), ep);
+						of << std::format("idaapi.set_name({:#x}, {})\n", payloadAddr,
+							pythonString(std::format("{}_{}::{}_{:x}_miss", lib_prefix, cls_prefix, name, ep)));
 					}
 					if (morphicAddr != 0 && morphicAddr != ep && morphicAddr != payloadAddr) {
-						of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}_check\")\n", morphicAddr, lib_prefix, cls_prefix, name.c_str(), ep);
+						of << std::format("idaapi.set_name({:#x}, {})\n", morphicAddr,
+							pythonString(std::format("{}_{}::{}_{:x}_check", lib_prefix, cls_prefix, name, ep)));
 					}
 				}
 			}
@@ -123,12 +220,27 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 		std::replace(name.begin(), name.end(), '>', '@');
 		std::replace(name.begin(), name.end(), ',', '&');
 		std::replace(name.begin(), name.end(), ' ', '_');
-		of << std::format("idaapi.set_name({:#x}, \"{}_{:x}\")\n", ep, name.c_str(), ep);
-		if (stub->Size() == 0)
+		of << std::format("idaapi.set_name({:#x}, {})\n", ep,
+			pythonString(std::format("{}_{:x}", name, ep)));
+#if !defined(BLUTTER_SHOREBIRD_3C9C)
+		// UnknownDartCode can have a negative size sentinel. Keep its name,
+		// but do not emit a backwards IDA range for an unavailable size.
+		if (stub->Size() <= 0)
 			continue;
 		of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + stub->Size());
+#endif
 	}
 
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	// Export each VM payload exactly once, including checked-entry prefixes.
+	// Avoid guessed sizes and overlapping duplicate ranges from metadata aliases.
+	for (const auto& [start, end] : snapshotCodeRanges)
+		of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", start, end);
+	for (const auto& [start, end] : recoveredCodeRanges) {
+		of << std::format("idaapi.set_name({:#x}, \"unattributed_code_{:x}\")\n", start, start);
+	}
+#endif
 
 	// Note: create struct with a lot of member by ida script is very slow
 	//   use header file then adding comment is much faster
@@ -147,7 +259,7 @@ def create_Dart_structs():
 	struc = ida_struct.get_struc(sid2)
 )CBLOCK";
 	for (const auto& [offset, comment] : comments) {
-		of << "\tida_struct.set_member_cmt(ida_struct.get_member(struc, " << offset << "), '''" << comment << "''', True)\n";
+		of << "\tida_struct.set_member_cmt(ida_struct.get_member(struc, " << offset << "), " << pythonString(comment) << ", True)\n";
 	}
 	of << "\treturn sid1, sid2\n";
 	of << "thrs, pps = create_Dart_structs()\n";
@@ -398,7 +510,168 @@ void DartDumper::DumpCode(const char* out_dir)
 			dartCls->PrintFoot(of);
 		}
 	}
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	DumpSnapshotCode(out_dir);
+#endif
 }
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+void DartDumper::DumpSnapshotCode(const char* asm_dir)
+{
+	// A VM instructions-table entry is a native payload boundary. It does not
+	// recover an absent Dart name, signature, or checked/unchecked entry offset.
+	// Export raw code separately from the analyzer's typed/annotated output.
+	const auto directory = std::filesystem::path(asm_dir);
+	std::ofstream assembly(directory / "snapshot_code.asm");
+	std::ofstream manifest(directory.parent_path() / "snapshot_code.json");
+	if (!assembly || !manifest) throw std::runtime_error("Cannot create snapshot code output");
+	recoveredCodeRanges.clear();
+	snapshotCodeRanges.clear();
+	std::vector<uint64_t> metadataEntries;
+	std::vector<SnapshotAnalysis::Name> metadataNames;
+	for (const auto* library : app.libs) {
+		for (auto* cls : library->classes) {
+			for (const auto* fn : cls->Functions()) {
+				metadataEntries.push_back(fn->Address());
+				metadataNames.push_back({fn->Address(), fn->FullName(), "function"});
+			}
+		}
+	}
+	for (const auto& [address, stub] : app.stubs) {
+		metadataEntries.push_back(address);
+		metadataNames.push_back({address, stub->FullName(), "stub"});
+	}
+	std::sort(metadataEntries.begin(), metadataEntries.end());
+	const auto imageStart = reinterpret_cast<uintptr_t>(app.isolate_snapshot_instructions);
+	const auto imageSize = *reinterpret_cast<const uintptr_t*>(imageStart);
+	const auto imageEnd = imageStart + imageSize;
+	if (imageSize < 128 || imageEnd < imageStart)
+		throw std::runtime_error("Invalid instructions image size");
+	auto* thread = dart::Thread::Current();
+	const auto& tables = dart::GrowableObjectArray::Handle(thread->zone(),
+		thread->isolate_group()->object_store()->instructions_tables());
+	Disassembler disassembler(true);
+	if (tables.IsNull() || tables.Length() != 1)
+		throw std::runtime_error("Expected one root instructions table");
+	const auto& rootTable = dart::InstructionsTable::Handle(thread->zone(),
+		dart::InstructionsTable::RawCast(tables.At(0)));
+	if (!rootTable.rodata() || rootTable.rodata()->length == 0 || !rootTable.ContainsPc(imageEnd - 1))
+		throw std::runtime_error("Unsupported or missing root instructions table");
+	std::vector<SnapshotAnalysis::Payload> payloads;
+	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i) {
+		const auto start = rootTable.EntryPointAt(i);
+		const auto end = i + 1 < rootTable.rodata()->length ? rootTable.EntryPointAt(i + 1) : imageEnd;
+		if (start < imageStart + 128 || end <= start || end > imageEnd || start % 4 || end % 4)
+			throw std::runtime_error("Invalid instructions-table boundary");
+		payloads.push_back({start - app.base(), end - app.base(), {}, ""});
+	}
+	const auto& pool = app.GetObjectPool();
+	SnapshotAnalysis::Profile profile{"shorebird_3c9c", ARM64_REG_X27, ARM64_REG_X26,
+		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
+	for (const auto& [offset, name] : GetThreadOffsetsMap())
+		if (!name.empty()) profile.threadFields.emplace(offset, name);
+	profile.describePoolSlot = [&](int64_t index) -> SnapshotAnalysis::PoolSlot {
+		switch (pool.TypeAt(index)) {
+		case dart::ObjectPool::EntryType::kTaggedObject: {
+			auto& obj = dart::Object::Handle(pool.ObjectAt(index));
+			if (obj.IsUnlinkedCall()) return {"unlinked_call", "UnlinkedCall: target unresolved"};
+			return {"tagged_object", ObjectToString(obj, false)};
+		}
+		case dart::ObjectPool::EntryType::kImmediate: {
+			const auto value = pool.RawValueAt(index);
+			// Deserialization relocates some immediate code values into this
+			// reader's mapping. Export the original ELF VA, never a host pointer.
+			if (value >= imageStart && value < imageEnd)
+				return {"text_address_value", std::format("value in snapshot text: ELF {:#x}", value - app.base())};
+			return {"immediate", std::format("bits: {:#x}", value)};
+		}
+		case dart::ObjectPool::EntryType::kNativeFunction:
+			return {"native_function", "runtime native binding; target unresolved"};
+		default: return {"unknown", "slot kind unknown"};
+		}
+	};
+	SnapshotAnalysis::Analyzer annotations(std::move(profile), std::move(payloads), std::move(metadataNames));
+	// A separate first pass records cross-payload entry points before any alias
+	// tracking. Do not carry an alias through a known incoming branch target.
+	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i) {
+		const auto start = rootTable.EntryPointAt(i);
+		const auto end = i + 1 < rootTable.rodata()->length ? rootTable.EntryPointAt(i + 1) : imageEnd;
+		auto instructions = disassembler.Disasm(reinterpret_cast<const uint8_t*>(start), end - start, start - app.base());
+		annotations.RegisterEntries(instructions.Insns(), instructions.Count());
+	}
+	assembly << "// Raw native payloads from the VM instructions table.\n"
+		"// Names/types may be unavailable; this file contains no inferred Dart IL.\n";
+	manifest << "{\"format\":1,\"image_start\":" << imageStart - app.base()
+		<< ",\"image_end\":" << imageEnd - app.base()
+		<< ",\"table_data_address\":" << reinterpret_cast<uintptr_t>(rootTable.rodata()) - app.base()
+		<< ",\"table_length\":" << rootTable.rodata()->length
+		<< ",\"first_entry_with_code\":" << rootTable.rodata()->first_entry_with_code
+		<< ",\"ranges\":[";
+	bool comma = false;
+	uint64_t total = 0;
+	uint64_t undecoded = 0;
+	for (intptr_t t = 0; !tables.IsNull() && t < tables.Length(); ++t) {
+		const auto& table = dart::InstructionsTable::Handle(thread->zone(),
+			dart::InstructionsTable::RawCast(tables.At(t)));
+		if (!table.rodata() || table.rodata()->length == 0)
+			throw std::runtime_error("Missing instructions-table data");
+		// This profile supports the root image, not a deferred loading-unit file.
+		if (!table.ContainsPc(imageEnd - 1))
+			throw std::runtime_error("Unsupported deferred instructions table");
+		const auto length = table.rodata()->length;
+		for (uint32_t i = 0; i < length; ++i) {
+			const auto start = table.EntryPointAt(i);
+			const auto end = i + 1 < length ? table.EntryPointAt(i + 1) : imageEnd;
+			if (start < imageStart + 128 || end <= start || end > imageEnd ||
+				(start % 4) != 0 || (end % 4) != 0)
+				throw std::runtime_error("Invalid instructions-table boundary");
+			const auto address = start - app.base();
+			const auto limit = end - app.base();
+			snapshotCodeRanges.emplace_back(address, limit);
+			const auto name = std::lower_bound(metadataEntries.begin(), metadataEntries.end(), address);
+			const bool hasMetadata = name != metadataEntries.end() && *name < limit;
+			if (!hasMetadata) recoveredCodeRanges.emplace_back(address, limit);
+			if (comma) manifest << ','; comma = true;
+			manifest << std::format("{{\"table\":{},\"index\":{},\"start\":{},\"end\":{},\"discarded_code\":{},\"has_metadata_name\":{}}}",
+				t, i, address, limit, i < table.rodata()->first_entry_with_code ? "true" : "false", hasMetadata ? "true" : "false");
+			assembly << std::format("\n// Table {}, entry {}, {} Code metadata; {}existing export.\n// Payload {:#x}..{:#x}\n",
+				t, i, i < table.rodata()->first_entry_with_code ? "discarded" : "retained", hasMetadata ? "" : "no ", address, limit);
+			if (!hasMetadata) assembly << std::format("// unattributed_code_{:x}\n", address);
+			uint64_t cursor = address;
+			while (cursor < limit) {
+				auto instructions = disassembler.Disasm(
+					reinterpret_cast<const uint8_t*>(app.base() + cursor), limit - cursor, cursor);
+				if (instructions.Count() == 0) {
+					const auto word = *reinterpret_cast<const uint32_t*>(app.base() + cursor);
+					assembly << std::format("    // {:#x}: .word {:#010x} ; undecoded word\n", cursor, word);
+					cursor += 4;
+					++undecoded;
+					continue;
+				}
+				const auto comments = cursor == address && instructions.Count() * 4 == limit - address
+					? annotations.Analyze(instructions.Insns(), instructions.Count(), address)
+					: std::map<uint64_t, std::string>{};
+				for (size_t n = 0; n < instructions.Count(); ++n) {
+					const auto* instruction = instructions.Ptr(n);
+					assembly << std::format("    // {:#x}: {} {}", instruction->address, instruction->mnemonic, instruction->op_str);
+					if (const auto comment = comments.find(instruction->address); comment != comments.end())
+						assembly << " ; " << comment->second;
+					assembly << '\n';
+					cursor = instruction->address + instruction->size;
+				}
+			}
+			++total;
+		}
+	}
+	manifest << std::format("],\"payload_count\":{},\"additional_exports\":{},\"undecoded_words\":{}}}\n",
+		total, recoveredCodeRanges.size(), undecoded);
+	annotations.Write((directory.parent_path() / "snapshot_calls.json").string());
+	std::cout << std::format("Snapshot annotations: {} call/jump edges, {} pool/thread references\n",
+		annotations.Edges().size(), annotations.References().size());
+	std::cout << std::format("Snapshot code: {} payloads, {} additional anonymous exports, {} undecoded words\n",
+		total, recoveredCodeRanges.size(), undecoded);
+}
+#endif
 
 // collect instance ptr to dump the full contents in DumpObjects()
 static std::set<intptr_t> knownObjectPtrs;
@@ -528,7 +801,16 @@ std::string DartDumper::ObjectToString(dart::Object& obj, bool simpleForm, bool 
 			std::cout << std::format("[!] missing closure at {:#x}\n", closure.entry_point() - app.base());
 		}
 		//RELEASE_ASSERT(app.functions.contains(closure.entry_point() - app.base()));
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+		const auto imageStart = reinterpret_cast<uintptr_t>(app.isolate_snapshot_instructions);
+		const auto imageEnd = imageStart + *reinterpret_cast<const uintptr_t*>(imageStart);
+		const auto entry = closure.entry_point();
+		if (entry >= imageStart && entry < imageEnd)
+			return std::format("{} (ELF {:#x})", closure.ToCString(), entry - app.base());
+		return std::format("{} (entry unresolved)", closure.ToCString());
+#else
 		return std::format("{} ({:#x})", closure.ToCString(), closure.entry_point());
+#endif
 	}
 	case dart::kCodeCid: {
 		const auto& code = dart::Code::Cast(obj);

@@ -4,6 +4,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from reader_profiles import reader_profile, SHOREBIRD_BASE
 
 # assume git and cmake (64 bits) command is in PATH
 GIT_CMD = "git"
@@ -44,11 +45,15 @@ class DartLibInfo:
             self.has_compressed_ptrs = os_name != 'ios'
         else:
             self.has_compressed_ptrs = has_compressed_ptrs
-        self.lib_name = f'dartvm{version}_{os_name}_{arch}'
+        self.reader_profile = reader_profile(version, os_name, arch, self.has_compressed_ptrs, snapshot_hash)
+        self.sdk_key = version
+        if self.reader_profile:
+            self.sdk_key += f'_shorebird_{snapshot_hash}_{os_name}_{arch}_cp'
+        self.lib_name = f'dartvm{self.sdk_key}_{os_name}_{arch}'
 
 
 def checkout_dart(info: DartLibInfo):
-    clonedir = os.path.join(SDK_DIR, 'v'+info.version)
+    clonedir = os.path.join(SDK_DIR, 'v'+info.sdk_key)
 
     # if no version file,assume previous clone is failed. delete the whole directory and try again.
     version_file = os.path.join(clonedir, 'runtime', 'vm', 'version.cc')
@@ -66,6 +71,13 @@ def checkout_dart(info: DartLibInfo):
         # checkout only needed sources (runtime and tools)
         # since Dart 3.3 "third_party/double-conversion" is moved to outside of "runtime" directory
         subprocess.run([GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'], cwd=clonedir, check=True)
+        if info.reader_profile:
+            revision = subprocess.check_output([GIT_CMD, 'rev-parse', 'HEAD'], cwd=clonedir, text=True).strip()
+            if revision != SHOREBIRD_BASE:
+                raise RuntimeError(f'Unexpected upstream Dart base for Shorebird reader: {revision}')
+            patch = os.path.join(SCRIPT_DIR, 'scripts', 'shorebird_3c9c_runtime.patch')
+            subprocess.run([GIT_CMD, 'apply', '--check', patch], cwd=clonedir, check=True)
+            subprocess.run([GIT_CMD, 'apply', patch], cwd=clonedir, check=True)
         # delete some unnecessary files
         with os.scandir(clonedir) as it:
             for entry in it:
@@ -137,7 +149,7 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     with open(CMAKE_TEMPLATE_FILE, 'r') as f:
         code = f.read()
     with open(os.path.join(target_dir, 'CMakeLists.txt'), 'w') as f:
-        f.write(code.replace('VERSION_PLACE_HOLDER', info.version).replace('CXX_STD_PLACE_HOLDER', cpp_std))
+        f.write(code.replace('VERSION_PLACE_HOLDER', info.version).replace('SDK_KEY_PLACE_HOLDER', info.sdk_key).replace('CXX_STD_PLACE_HOLDER', cpp_std))
 
     # create dartsdk/vx.y.z/Config.cmake.in
     with open(os.path.join(target_dir, 'Config.cmake.in'), 'w') as f:
@@ -152,12 +164,14 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # Note: pointer compression feature is set from Flutter and no one change it when building app.
     #       so only one build of Dart runtime is enough
     builddir = os.path.join(BUILD_DIR, info.lib_name)
+    profile_macros = [f'-DBLUTTER_SHOREBIRD_3C9C={"ON" if info.reader_profile else "OFF"}']
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
-        f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'], 
+        f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + profile_macros,
         cwd=target_dir, check=True)
     
     # build and install dart vm library to packages directory
-    subprocess.run([NINJA_CMD], cwd=builddir, check=True)
+    jobs = ['-j', str(min(16, os.cpu_count() or 1))] if info.reader_profile else []
+    subprocess.run([NINJA_CMD] + jobs, cwd=builddir, check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
 
 def fetch_and_build(info: DartLibInfo):

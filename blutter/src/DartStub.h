@@ -6,6 +6,14 @@
 // forward declaration
 class DartAbstractType;
 
+// New SDKs removed OBJECT_STORE_STUB_CODE_LIST from stub_code_list.h: those
+// stubs are no longer stored in the object store. Provide an empty stand-in so
+// the enum stays buildable on both old and new engines.
+#ifndef OBJECT_STORE_STUB_CODE_LIST
+#define OBJECT_STORE_STUB_CODE_LIST(DO)
+#define BLUTTER_NO_OBJECT_STORE_STUBS 1
+#endif
+
 class DartStub : public DartFnBase
 {
 public:
@@ -22,6 +30,31 @@ public:
 		AllocateUserObjectStub,
 		TypeCheckStub,
 		UnknownStub,
+
+		// ------------------------------------------------------------------
+		// Compatibility aliases for SDKs without object-store stubs.
+		//
+		// VM_STUB_CODE_LIST members are emitted above with the `VMStub` suffix
+		// (e.g. DefaultTypeTest -> DefaultTypeTestVMStub), but plenty of code
+		// (notably CodeAnalyzer_arm64.cpp) was written against the pre-3.12
+		// spelling that had no `VM` infix. Older engines generated both
+		// OBJECT_STORE_STUB_CODE_LIST and VM_STUB_CODE_LIST entries, so the
+		// bare names existed. Re-expose them as plain-integer aliases so the
+		// comparisons keep compiling and keep the same numeric identity.
+		// ------------------------------------------------------------------
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+		AllocateMintSharedWithFPURegsStub = AllocateMintSharedWithFPURegsVMStub,
+		AllocateMintSharedWithoutFPURegsStub = AllocateMintSharedWithoutFPURegsVMStub,
+		ArrayWriteBarrierStub = ArrayWriteBarrierVMStub,
+		DefaultTypeTestStub = DefaultTypeTestVMStub,
+		DefaultNullableTypeTestStub = DefaultNullableTypeTestVMStub,
+		InitAsyncStub = InitAsyncVMStub,
+		InitLateStaticFieldStub = InitLateStaticFieldVMStub,
+		InitLateFinalStaticFieldStub = InitLateFinalStaticFieldVMStub,
+		LateInitializationErrorSharedWithFPURegsStub = LateInitializationErrorSharedWithFPURegsVMStub,
+		LateInitializationErrorSharedWithoutFPURegsStub = LateInitializationErrorSharedWithoutFPURegsVMStub,
+		WriteBarrierWrappersStub = WriteBarrierWrappersVMStub,
+#endif
 	};
 
 	DartStub(const dart::CodePtr ptr, Kind kind, uint64_t addr, int64_t size, std::string name) :

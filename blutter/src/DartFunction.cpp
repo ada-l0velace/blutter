@@ -7,9 +7,51 @@
 #include "CodeAnalyzer.h"
 #include <numeric>
 #include <array>
+#include <stdexcept>
 
 // place static member because no DartFnBase source file
 intptr_t DartFnBase::lib_base;
+
+#if defined(kSnapshotDataAsmSymbol)
+// A discarded Code is replaced by the shared UnknownDartCode stub. Its size
+// describes that stub, while Function::entry_point still identifies the real
+// function. Recover only discarded entries with a next table boundary.
+static std::pair<uint64_t, uint64_t> discardedFunctionRange(uint64_t entryPoint)
+{
+	auto* thread = dart::Thread::Current();
+	const auto& tables = dart::GrowableObjectArray::Handle(
+		thread->zone(), thread->isolate_group()->object_store()->instructions_tables());
+	if (!tables.IsNull()) {
+		for (intptr_t t = 0; t < tables.Length(); ++t) {
+			const auto& table = dart::InstructionsTable::Handle(
+				thread->zone(), dart::InstructionsTable::RawCast(tables.At(t)));
+			if (!table.ContainsPc(entryPoint))
+				continue;
+			const auto length = static_cast<intptr_t>(table.rodata()->length);
+			intptr_t lo = 0;
+			intptr_t hi = length;
+			while (lo < hi) {
+				const auto mid = lo + (hi - lo) / 2;
+				if (table.EntryPointAt(mid) <= entryPoint)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			const auto index = lo - 1;
+			if (index < 0 || index >= table.FirstEntryWithCode() || index + 1 >= length)
+				break;
+			const auto start = table.EntryPointAt(index);
+			const auto end = table.EntryPointAt(index + 1);
+			if (start <= entryPoint && entryPoint < end &&
+				(start % 4) == 0 && (end % 4) == 0)
+				return { start, end };
+			break;
+		}
+	}
+	throw std::runtime_error(std::format(
+		"Cannot resolve discarded function range at {:#x}", entryPoint));
+}
+#endif
 
 DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFnBase(), cls(cls), parent(nullptr), ptr(ptr), kind(NORMAL)
 {
@@ -82,6 +124,16 @@ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFn
 		ep_addr = ep;
 		//std::cout << std::format("Fn: {}, payload: {:#x}, ep_addr: {:#x}, ep: {:#x}\n", name.c_str(), payload_addr, ep_addr, ep);
 	}
+
+#if defined(kSnapshotDataAsmSymbol)
+	if (code.IsUnknownDartCode() && ep_addr != code.EntryPoint() - lib_base) {
+		const auto [start, end] = discardedFunctionRange(func.entry_point());
+		payload_addr = start - lib_base;
+		size = end - start;
+		// A discarded Code no longer supplies a distinct monomorphic address.
+		morphic_addr = ep_addr;
+	}
+#endif
 
 	//if (ep_addr != payload_addr) {
 	//	std::cout << std::format("Fn: {}, payload: {:#x}, morphic: {:#x}, ep: {:#x}\n", name.c_str(), payload_addr, morphic_addr, ep_addr);

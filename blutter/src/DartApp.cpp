@@ -309,18 +309,29 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 	ASSERT(!stubs.contains(ep_addr)); \
 	stubs[ep_addr] = stub;
 	OBJECT_STORE_STUB_CODE_LIST(DO);
-#ifndef NO_METHOD_EXTRACTOR_STUB
+
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	// New SDKs dropped OBJECT_STORE_STUB_CODE_LIST entirely. The stubs that
+	// used to live in the object store moved into the shared VM stub table, so
+	// the method-extractor pair and the throw stub are now reached via
+	// VM_STUB_CODE_LIST / StubCode:: accessors (handled below).
+	//
+	// The only extra thing we still need from here is the address of the throw
+	// stub, because the analyzer uses it to recognise rethrow/call sites.
+	throwStubAddr = dart::StubCode::Throw().EntryPoint() - base();
+#else
+	#ifndef NO_METHOD_EXTRACTOR_STUB
 	DO(build_nongeneric_method_extractor_code, BuildNonGenericMethodExtractor);
 	DO(build_generic_method_extractor_code, BuildGenericMethodExtractor);
-#endif
-#undef DO
-	
+	#endif
 	code = store->throw_stub();
 	throwStubAddr = code.EntryPoint();
 
 	// load VM stub code
 	// the dart entry point "static void main()" is a LazyCompileVMStub which call "main" stub (a real main)
 	ASSERT(dart::StubCode::HasBeenInitialized());
+#endif
+#undef DO
 #define DO(name) {\
 		const auto& code = dart::StubCode::name(); \
 		ep_addr = code.EntryPoint() - base(); \
@@ -370,6 +381,11 @@ DartFunction* DartApp::addFunctionNoCheck(const dart::Function& func)
 
 void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 {
+#if defined(kSnapshotDataAsmSymbol)
+	// Pruned snapshots can retain a synthetic Function at a VM-stub entry
+	// (UnknownDartCode or LazyCompile). Its null signature is not an app type.
+	if (stubs.contains(ep_addr)) return;
+#endif
 	if (!functions.contains(ep_addr)) {
 		auto dartFn = addFunctionNoCheck(func);
 		functions[dartFn->Address()] = dartFn;
@@ -378,6 +394,9 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
 public:
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	std::vector<dart::FunctionPtr> functionPtrs;
+#endif
 	explicit HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs) : codePtrs(codePtrs) {}
 	virtual ~HeapCodeVisitor() {}
 
@@ -385,11 +404,19 @@ public:
 	virtual void VisitObject(dart::ObjectPtr obj) {
 		if (obj->IsCode())
 			codePtrs.push_back(dart::Code::RawCast(obj));
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+		if (obj->IsFunction())
+			functionPtrs.push_back(dart::Function::RawCast(obj));
+#endif
 	}
 
 private:
 	std::vector<dart::CodePtr>& codePtrs;
 };
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+static bool hasInstructionsEntry(uintptr_t entry);
+#endif
 
 void DartApp::findFunctionInHeap()
 {
@@ -507,7 +534,33 @@ void DartApp::findFunctionInHeap()
 			//throw std::runtime_error(msg);
 		}
 	}
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	for (const auto ptr : visitor.functionPtrs) {
+		const auto& function = dart::Function::Handle(zone, ptr);
+		const auto entry = function.entry_point();
+		if (function.HasCode() && hasInstructionsEntry(entry))
+			addFunction(entry - base(), function);
+	}
+#endif
 }
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+// The VM can retain a Function while discarding its Code object. Such
+// functions are invisible to a Code-only heap scan and to pruned class lists.
+// Keep their real names/owners rather than recovering them as anonymous code.
+static bool hasInstructionsEntry(uintptr_t entry)
+{
+	auto* thread = dart::Thread::Current();
+	const auto& tables = dart::GrowableObjectArray::Handle(thread->zone(),
+		thread->isolate_group()->object_store()->instructions_tables());
+	for (intptr_t t = 0; !tables.IsNull() && t < tables.Length(); ++t) {
+		const auto& table = dart::InstructionsTable::Handle(thread->zone(),
+			dart::InstructionsTable::RawCast(tables.At(t)));
+		if (table.ContainsPc(entry)) return true;
+	}
+	return false;
+}
+#endif
 
 void DartApp::finalizeFunctionsInfo()
 {
@@ -581,6 +634,10 @@ void DartApp::finalizeFunctionsInfo()
 	auto& func = dart::Function::Handle();
 	for (auto& [_, dartFn] : functions) {
 		func = dartFn->ptr;
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+		// Anonymous retained Code objects have no Function metadata.
+		if (func.IsNull()) continue;
+#endif
 		const auto sigPtr = func.signature();
 		if (!sigPtr.IsHeapObject())
 			continue;

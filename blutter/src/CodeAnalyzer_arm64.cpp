@@ -175,8 +175,16 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
 		return new VarInteger(imm, VarValue::NativeInt);
 	}
 	else if (objType == dart::ObjectPool::EntryType::kNativeFunction) {
-		//val = pool.RawValueAt(idx);
+#if defined(kSnapshotDataAsmSymbol)
+		// A kNativeFunction entry is a bare C function pointer (used for FFI and
+		// for native entry trampolines). It is not a Dart object, so there is
+		// nothing to dereference. Emit it as a raw native address instead of
+		// aborting the whole dump - the value only ever ends up in an annotation.
+		auto imm = pool.RawValueAt(idx);
+		return new VarInteger((int64_t)imm, VarValue::NativeInt);
+#else
 		throw std::runtime_error("getting native function pool object from Dart code");
+#endif
 	}
 	else {
 		throw std::runtime_error(std::format("unknown pool object type: {}", (int)objType).c_str());
@@ -610,9 +618,24 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 
 				INSN_ASSERT(insn.id() == ARM64_INS_STR);
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
-				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_vm_tag_offset));
 				++insn;
 
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+				// This Shorebird profile checks the native-call state before BLR.
+				// Require the complete guard and its exact continuation target.
+				if (insn.id() == ARM64_INS_LDR) {
+					INSN_ASSERT(insn.ops(0).reg == ARM64_REG_X17);
+					INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == 0x8f0);
+					++insn;
+					INSN_ASSERT(insn.id() == ARM64_INS_CBZ && insn.ops(0).reg == ARM64_REG_X17);
+					const auto guardTarget = insn.ops(1).imm;
+					++insn;
+					INSN_ASSERT(insn.id() == ARM64_INS_BRK && insn.ops(0).imm == 0xb12a);
+					++insn;
+					INSN_ASSERT(insn.address() == guardTarget);
+				}
+#endif
 				INSN_ASSERT(insn.id() == ARM64_INS_BLR);
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
 				++insn;
@@ -624,12 +647,12 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 
 				INSN_ASSERT(insn.id() == ARM64_INS_STR);
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
-				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_vm_tag_offset));
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_LDR);
 				INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
-				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_saved_stack_limit_offset);
+				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_saved_stack_limit_offset));
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_SUB);
@@ -654,7 +677,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 	// weird case
 	// it should be easier to detect THR register if varaible tracking is fully implemented
 	else if ((insn.id() == ARM64_INS_MOV && insn.ops(1).reg == CSREG_DART_THR) || 
-		(insn.id() == ARM64_INS_LDR && GetThreadLeafFunction(insn.ops(1).mem.disp) && insn.ops(1).mem.base != CSREG_DART_PP && insn.ops(1).mem.disp > dart::Thread::AllocateHandle_entry_point_offset()))
+		(insn.id() == ARM64_INS_LDR && GetThreadLeafFunction(insn.ops(1).mem.disp) && insn.ops(1).mem.base != CSREG_DART_PP && insn.ops(1).mem.disp > TargetThreadOffset(dart::Thread::AllocateHandle_entry_point_offset())))
 	{
 		InsnMarker marker(insn);
 
@@ -735,7 +758,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 		bool save_to_vm_tag = false;
 		if (insn.id() == ARM64_INS_STR) {
 			INSN_ASSERT(insn.ops(0).reg == call_target_reg);
-			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_vm_tag_offset));
 			++insn;
 			save_to_vm_tag = true;
 		}
@@ -752,7 +775,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 
 			INSN_ASSERT(insn.id() == ARM64_INS_STR);
 			INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
-			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == AOT_Thread_vm_tag_offset);
+			INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_vm_tag_offset));
 			++insn;
 		}
 
@@ -1579,7 +1602,7 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 	++insn;
 
 	INSN_ASSERT(insn.id() == ARM64_INS_B);
-	const auto contAddr = insn.ops(0).reg;
+	const auto contAddr = insn.ops(0).imm;
 	++insn;
 
 	// else
@@ -1624,24 +1647,34 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 		++insn;
 
 		const auto objPoolInstr = getObjectPoolInstruction(insn);
+		INSN_ASSERT(objPoolInstr.IsSet());
 		INSN_ASSERT(objPoolInstr.item.ValueTypeId() == dart::kTypeArgumentsCid);
 		// TODO: make this function type parameter to extends from this value
 		//objPoolInstr.item.Get<VarTypeArgument>();
 		fnInfo->State()->ClearRegister(objPoolInstr.dstReg);
 
-		INSN_ASSERT(insn.IsBranch());
-		const auto contAddr = insn.ops(0).imm;
-		++insn;
+		if (insn.address() == elseAddr) {
+			// Register allocation can put both values in the same register,
+			// eliminating the branch and move at the join. The CBNZ skips
+			// only the default pool load, preserving the supplied arguments.
+			INSN_ASSERT(objPoolInstr.dstReg == A64::Register{ typeArgReg });
+			fnInfo->typeArgumentReg = typeArgReg;
+		}
+		else {
+			INSN_ASSERT(insn.IsBranch());
+			const auto joinAddr = insn.ops(0).imm;
+			++insn;
 
-		INSN_ASSERT(elseAddr == insn.address());
-		INSN_ASSERT(insn.id() == ARM64_INS_MOV);
-		INSN_ASSERT(insn.ops(1).reg == typeArgReg);
-		const auto finalTypeArgReg = A64::Register{ insn.ops(0).reg };
-		INSN_ASSERT(finalTypeArgReg == objPoolInstr.dstReg);
-		++insn;
+			INSN_ASSERT(elseAddr == insn.address());
+			INSN_ASSERT(insn.id() == ARM64_INS_MOV);
+			INSN_ASSERT(insn.ops(1).reg == typeArgReg);
+			const auto finalTypeArgReg = A64::Register{ insn.ops(0).reg };
+			INSN_ASSERT(finalTypeArgReg == objPoolInstr.dstReg);
+			++insn;
 
-		INSN_ASSERT(contAddr == insn.address());
-		fnInfo->typeArgumentReg = finalTypeArgReg;
+			INSN_ASSERT(joinAddr == insn.address());
+			fnInfo->typeArgumentReg = finalTypeArgReg;
+		}
 	}
 
 	// as of now, track only function parameters, so clear the type argument register as if it is freed
@@ -2001,7 +2034,26 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 
 	// PrologueBuilder::BuildClosureContextHandling()
 	// closure context handling
-	if (dartFn->IsClosure() && insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Closure_context_offset - dart::kHeapObjectTag) {
+	intptr_t closureContextOffset = 0;
+	intptr_t delayedTypeArgumentsOffset = 0;
+	bool hasDelayedTypeArguments = false;
+	if (dartFn->IsClosure()) {
+#ifdef VARIABLE_CLOSURE_LAYOUT
+		const auto& function = dart::Function::Handle(dartFn->Ptr());
+		hasDelayedTypeArguments = dart::Closure::HasDelayedTypeArgumentsField(function);
+		const auto contextIndex = dart::UntaggedClosure::ContextIndex(
+			hasDelayedTypeArguments,
+			dart::Closure::HasInstantiatorTypeArgumentsField(function),
+			dart::Closure::HasFunctionTypeArgumentsField(function));
+		closureContextOffset = AOT_Closure_elements_start_offset + contextIndex * dart::kCompressedWordSize;
+		delayedTypeArgumentsOffset = AOT_Closure_elements_start_offset;
+#else
+		closureContextOffset = AOT_Closure_context_offset;
+		delayedTypeArgumentsOffset = AOT_Closure_delayed_type_arguments_offset;
+		hasDelayedTypeArguments = true;
+#endif
+	}
+	if (dartFn->IsClosure() && insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == closureContextOffset - dart::kHeapObjectTag) {
 		const auto arg1Reg = [&] {
 			if (fnInfo->params.numFixedParam > 0) {
 				return fnInfo->params[0].valReg;
@@ -2039,7 +2091,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 		handleInitialization();
 
 	// closure delayed type arguments
-	if (dartFn->IsClosure()) {
+	if (dartFn->IsClosure() && hasDelayedTypeArguments) {
 		const auto save_ins = insn.Current();
 
 		const auto arg1Reg = [&] {
@@ -2050,7 +2102,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 				a1reg = insn.ops(0).reg;
 				++insn;
 			}
-			if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Closure_delayed_type_arguments_offset - dart::kHeapObjectTag) {
+			if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == delayedTypeArgumentsOffset - dart::kHeapObjectTag) {
 				if (a1reg != ARM64_REG_INVALID) {
 					// TODO: calculate a number of function parameter
 					return A64::Register{ a1reg };
@@ -3324,8 +3376,8 @@ std::unique_ptr<WriteBarrierInstr> FunctionAnalyzer::processWriteBarrierInstr(As
 			isArray = true;
 		}
 		else {
-			const auto existed = std::find(std::begin(AOT_Thread_write_barrier_wrappers_thread_offset),
-				std::end(AOT_Thread_write_barrier_wrappers_thread_offset), insn.ops(1).mem.disp) != std::end(AOT_Thread_write_barrier_wrappers_thread_offset);
+			const auto existed = std::find_if(std::begin(AOT_Thread_write_barrier_wrappers_thread_offset),
+				std::end(AOT_Thread_write_barrier_wrappers_thread_offset), [&](auto offset) { return offset >= 0 && TargetThreadOffset(offset) == insn.ops(1).mem.disp; }) != std::end(AOT_Thread_write_barrier_wrappers_thread_offset);
 			INSN_ASSERT(existed);
 			isArray = false;
 		}

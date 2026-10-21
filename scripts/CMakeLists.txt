@@ -38,7 +38,8 @@ if (NOT "${TARGET_ARCH}" MATCHES "^(arm64|x64)$")
 endif()
 
 set(SRCDIR "runtime")
-set(LIBNAME "dartvm${DART_VERSION}_${TARGET_OS}_${TARGET_ARCH}")
+set(SDK_HEADER_NAME "dartvmSDK_KEY_PLACE_HOLDER")
+set(LIBNAME "${SDK_HEADER_NAME}_${TARGET_OS}_${TARGET_ARCH}")
 
 set(CMAKE_DEBUG_POSTFIX "_d")
 
@@ -82,6 +83,10 @@ set(defines ${target_arch} ${target_os}
 	_HAS_EXCEPTIONS=0 DART_TARGET_OS_WINDOWS_UWP
 )
 # Dart header can detect DART_HOST_OS_xxx value
+option(BLUTTER_SHOREBIRD_3C9C "Reader for the verified Shorebird 3c9c snapshot" OFF)
+if (BLUTTER_SHOREBIRD_3C9C)
+	list(APPEND defines BLUTTER_SHOREBIRD_3C9C)
+endif()
 
 if (MSVC)
 	# remove compiler exception handler options
@@ -107,7 +112,7 @@ target_compile_options(${LIBNAME} PRIVATE ${cc_opts})
 target_include_directories(${LIBNAME} PRIVATE "${SRCDIR}" "${ICU_INCLUDE_DIRS}")
 target_include_directories(${LIBNAME} INTERFACE
 							$<BUILD_INTERFACE:${SRCDIR}>
-							$<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+							$<INSTALL_INTERFACE:include/${SDK_HEADER_NAME}>
 						)
 
 if (MSVC)
@@ -128,7 +133,7 @@ install(TARGETS ${LIBNAME}
 
 # install include files (all target OS and architecture uses same header files)
 install(DIRECTORY "${SRCDIR}/"
-	DESTINATION "include/${PROJECT_NAME}"
+	DESTINATION "include/${SDK_HEADER_NAME}"
 	FILES_MATCHING
 	PATTERN "*.h"
 	PATTERN "bin*" EXCLUDE

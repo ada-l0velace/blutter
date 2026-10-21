@@ -1,0 +1,89 @@
+--- a/runtime/vm/app_snapshot.cc
++++ b/runtime/vm/app_snapshot.cc
+@@ -728,6 +728,11 @@
+   }
+
+   ObjectPtr Ref(intptr_t index) const {
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++    if (index <= 0 || index > num_objects_) {
++      FATAL("Shorebird reference index out of range: %" Pd, index);
++    }
++#endif
+     ASSERT(index > 0);
+     ASSERT(index <= num_objects_);
+     return refs_->untag()->element(index);
+@@ -766,6 +771,18 @@
+     ReadDispatchTable(&stream_, /*deferred=*/false, InstructionsTable::Handle(),
+                       -1, -1);
+   }
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++  void ReadShorebirdIndirectStaticCallTable() {
++    // The matching analyzer reads one unsigned count after the dispatch table.
++    // This reader supports only an empty table. Nonempty tables require entry
++    // decoding and relocation support before they can be accepted.
++    const intptr_t length = ReadUnsigned();
++    if (length != 0) {
++      FATAL("Unsupported nonempty Shorebird indirect static call table: %" Pd,
++            length);
++    }
++  }
++#endif
+   void ReadDispatchTable(ReadStream* stream,
+                          bool deferred,
+                          const InstructionsTable& root_instruction_table,
+@@ -7534,6 +7551,9 @@
+
+     // Deserialize dispatch table (when applicable)
+     d->ReadDispatchTable();
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++    d->ReadShorebirdIndirectStaticCallTable();
++#endif
+   }
+
+   void PostLoad(Deserializer* d, const Array& refs) override {
+--- a/runtime/vm/stub_code_list.h
++++ b/runtime/vm/stub_code_list.h
+@@ -26,9 +26,35 @@
+
+ #define PROBE_POINT_STUBS_LIST(V) V(AllocationProbePoint)
+
++// Experimental reader for snapshot 3c9c63bc42bff27a9fd51d020f3771ec.
++// Ordering recovered from the matching analyzer's StubCode::StubNames and
++// independently checked against the Android engine's ordered name strings.
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++#define SHOREBIRD_FIRST_STUB(V) V(GetCStackPointer)
++#define SHOREBIRD_TRANSITION_STUBS(V)                                          \
++  V(CallClangCodeWithSimulatorArgs)                                           \
++  V(CallSimulatorFromFfiTrampoline)                                          \
++  V(SimulatorCallToRuntime)                                                   \
++  V(SimulatorCallNoScopeNative)                                               \
++  V(SimulatorCallAutoScopeNative)                                             \
++  V(SimulatorCallBootstrapNative)                                             \
++  V(SimulatorCallNativeThroughSafepoint)                                      \
++  V(TransitionDartToCpuIfNeeded)                                              \
++  V(TransitionDartToSimulatorIfNeeded)                                        \
++  V(RunDartOnCPU)                                                             \
++  V(ResumeOnCPU)                                                              \
++  V(ResumeOnSimulator)                                                        \
++  V(SimulatorEnterSafepoint)                                                  \
++  V(SimulatorExitSafepoint)
++#else
++#define SHOREBIRD_FIRST_STUB(V)
++#define SHOREBIRD_TRANSITION_STUBS(V)
++#endif
++
+ // List of stubs created in the VM isolate, these stubs are shared by different
+ // isolates running in this dart process.
+ #define VM_STUB_CODE_LIST(V)                                                   \
++  SHOREBIRD_FIRST_STUB(V)                                                      \
+   V(JumpToFrame)                                                               \
+   V(RunExceptionHandler)                                                       \
+   V(RunExceptionHandlerUnbox)                                                  \
+@@ -193,6 +219,7 @@
+   V(CheckIsolateFieldAccess)                                                   \
+   V(CheckedStoreIntoShared)                                                    \
+   V(EnsureDeeplyImmutable)                                                     \
++  SHOREBIRD_TRANSITION_STUBS(V)                                                \
+   V(UnknownDartCode)
+
+ }  // namespace dart

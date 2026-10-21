@@ -12,16 +12,52 @@ from elftools.elf.enums import ENUM_E_MACHINE
 from elftools.elf.sections import SymbolTableSection
 
 # TODO: support both ELF and Mach-O file
+# Newer Flutter engines merge the VM/isolate snapshots under new symbols:
+#   old: _kDartVmSnapshotData / _kDartVmSnapshotInstructions
+#   new: _kDartSnapshotData   / _kDartSnapshotText
+SNAPSHOT_SYMBOL_NAMES = [
+    '_kDartVmSnapshotData',
+    '_kDartSnapshotData',
+]
+
+
+def find_snapshot_symbol(dynsym):
+    if dynsym is None:
+        return None
+    for name in SNAPSHOT_SYMBOL_NAMES:
+        syms = dynsym.get_symbol_by_name(name)
+        if syms:
+            return syms[0]
+    # Snapshot text and unrelated objects are not snapshot data. Do not guess.
+    return None
+
+
 def extract_snapshot_hash_flags(libapp_file):
     with open(libapp_file, 'rb') as f:
         elf = ELFFile(f)
-        # find "_kDartVmSnapshotData" symbol
+        # find the Dart snapshot data symbol (old or new naming)
         dynsym = elf.get_section_by_name('.dynsym')
-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
-        #section = elf.get_section(sym['st_shndx'])
-        assert sym['st_size'] > 128
-        f.seek(sym['st_value']+20)
+        sym = find_snapshot_symbol(dynsym)
+        if sym is None:
+            raise RuntimeError(
+                'No supported Dart snapshot data symbol in .dynsym; expected '
+                + ' or '.join(SNAPSHOT_SYMBOL_NAMES))
+        print('using snapshot symbol:', sym.name, hex(sym['st_value']), sym['st_size'])
+        if sym['st_size'] <= 128:
+            raise RuntimeError('Dart snapshot data symbol is too small')
+        # ELF virtual addresses need not equal file offsets.
+        for segment in elf.iter_segments():
+            if (segment['p_type'] == 'PT_LOAD' and
+                    segment['p_vaddr'] <= sym['st_value'] and
+                    sym['st_value'] + 52 <= segment['p_vaddr'] + segment['p_filesz']):
+                snapshot_offset = segment['p_offset'] + sym['st_value'] - segment['p_vaddr']
+                break
+        else:
+            raise RuntimeError('Dart snapshot data is outside file-backed ELF segments')
+        f.seek(snapshot_offset+20)
         snapshot_hash = f.read(32).decode()
+        if re.fullmatch('[0-9a-f]{32}', snapshot_hash) is None:
+            raise RuntimeError('Invalid Dart snapshot version hash')
         data = f.read(256) # should be enough
         flags = data[:data.index(b'\0')].decode().strip().split(' ')
     

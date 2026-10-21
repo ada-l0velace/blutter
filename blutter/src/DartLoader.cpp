@@ -25,10 +25,17 @@ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapsho
 	Dart_InitializeParams init_params;
 	memset(&init_params, 0, sizeof(init_params));
 	init_params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
-	init_params.vm_snapshot_data = vm_snapshot_data;
-	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
 	init_params.start_kernel_isolate = false;
 	// other params are no needed if snapshot is not run
+#if defined(kVmSnapshotDataAsmSymbol) && !defined(kSnapshotDataAsmSymbol)
+	// Legacy engines: snapshots are handed to the VM during initialization.
+	init_params.vm_snapshot_data = vm_snapshot_data;
+	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
+#endif
+	// Merged-snapshot SDKs dropped these fields: the single merged snapshot
+	// pair is passed to Dart_CreateIsolateGroup() instead (see load_isolate).
+	(void)vm_snapshot_data;
+	(void)vm_snapshot_instructions;
 	error = Dart_Initialize(&init_params);
 	if (error) {
 		throw std::runtime_error(error);

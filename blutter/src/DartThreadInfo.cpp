@@ -73,6 +73,19 @@ static void initThreadOffsetNames()
 	leafFunctionMap.emplace(std::make_pair(dart::Thread::name##_entry_point_offset(), LeafFunctionInfo{#returntype, #__VA_ARGS__}));
 	LEAF_RUNTIME_ENTRY_LIST(DEFINE_LEFT_FN_INFO);
 #undef DEFINE_LEFT_FN_INFO
+
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	decltype(threadOffsetNames) targetNames;
+	for (const auto& [offset, name] : threadOffsetNames)
+		targetNames.emplace(TargetThreadOffset(offset), name);
+	targetNames.emplace(0x290, "shorebird_resume_on_simulator_entry_point");
+	targetNames.emplace(0x298, "shorebird_resume_on_cpu_entry_point");
+	threadOffsetNames = std::move(targetNames);
+	decltype(leafFunctionMap) targetLeafFunctions;
+	for (const auto& [offset, info] : leafFunctionMap)
+		targetLeafFunctions.emplace(TargetThreadOffset(offset), info);
+	leafFunctionMap = std::move(targetLeafFunctions);
+#endif
 }
 
 const std::string& GetThreadOffsetName(intptr_t offset)

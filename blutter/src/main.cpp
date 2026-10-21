@@ -42,6 +42,10 @@ int main(int argc, char** argv)
 #endif
 
 		DartDumper dumper{ app };
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
+			dumper.DumpCoverageAudit(audit);
+#endif
 		std::cout << "Dumping Object Pool\n";
 		dumper.DumpObjectPool((outDir / "pp.txt").string().c_str());
 		dumper.DumpObjects((outDir / "objs.txt").string().c_str());
@@ -75,6 +79,7 @@ int main(int argc, char** argv)
 	}
 	catch (std::exception& e) {
 		std::cerr << "exception: " << e.what() << "\n";
+		return 1;
 	}
 
 	return 0;

@@ -77,9 +77,9 @@ def extract_libs_from_apk(apk_file: str, out_dir: str):
         flutter_file = os.path.join(out_dir, flutter_info.filename)
         return app_file, flutter_file
 
-def find_compat_macro(dart_version: str, no_analysis: bool):
+def find_compat_macro(dart_version: str, no_analysis: bool, sdk_key=None):
     macros = []
-    include_path = os.path.join(PKG_INC_DIR, f'dartvm{dart_version}')
+    include_path = os.path.join(PKG_INC_DIR, f'dartvm{sdk_key or dart_version}')
     vm_path = os.path.join(include_path, 'vm')
     with open(os.path.join(vm_path, 'class_id.h'), 'rb') as f:
         mm = mmap.mmap(f.fileno(), 0, access = mmap.ACCESS_READ)
@@ -129,6 +129,14 @@ def find_compat_macro(dart_version: str, no_analysis: bool):
         # https://github.com/dart-lang/sdk/commit/84fd647969f0d74ab63f0994d95b5fc26cac006a
         if mm.find(b'AsTruncatedInt64Value()') == -1:
             macros.append('-DUNIFORM_INTEGER_ACCESS=1')
+
+    # Extracted offsets are C++ constants, not preprocessor macros. Detect the
+    # actual SDK layout instead of overriding legacy offsets with #ifndef.
+    with open(os.path.join(vm_path, 'compiler', 'runtime_offsets_extracted.h'), 'rb') as f:
+        offsets = f.read()
+        if (b'AOT_Closure_elements_start_offset' in offsets and
+                b'AOT_Closure_context_offset' not in offsets):
+            macros.append('-DVARIABLE_CLOSURE_LAYOUT=1')
     
     if no_analysis:
         macros.append('-DNO_CODE_ANALYSIS=1')
@@ -139,7 +147,7 @@ def cmake_blutter(input: BlutterInput):
     blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
     builddir = os.path.join(BUILD_DIR, input.blutter_name)
     
-    macros = find_compat_macro(input.dart_info.version, input.no_analysis)
+    macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key)
     my_env = None
     if platform.system() == 'Darwin':
         mac_ver = int(platform.mac_ver()[0].split('.', 1)[0])
@@ -162,7 +170,14 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     print('flags: ' + ' '.join(flags))
 
     has_compressed_ptrs = 'compressed-pointers' in flags
-    return DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+    info = DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+    if info.reader_profile:
+        from extract_dart_info import extract_libflutter_info
+        from reader_profiles import verify_engine_profile
+        engine_ids, _, _, _ = extract_libflutter_info(libflutter_path)
+        verify_engine_profile(info.reader_profile, engine_ids, flags)
+        print(f'Reader profile: {info.reader_profile} (experimental runtime profile)')
+    return info
 
 def build_and_run(input: BlutterInput):
     if not os.path.isfile(input.blutter_file) or input.rebuild_blutter:
@@ -180,7 +195,7 @@ def build_and_run(input: BlutterInput):
 
     # creating Visual Studio solution overrides building
     if input.create_vs_sln:
-        macros = find_compat_macro(input.dart_info.version, input.no_analysis)
+        macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key)
         blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
         dbg_output_path = os.path.abspath(os.path.join(input.outdir, 'out'))
         dbg_cmd_args = f'-i {input.libapp_path} -o {dbg_output_path}'

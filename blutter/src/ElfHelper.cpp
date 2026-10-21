@@ -86,8 +86,12 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 			// we want only .dynstr for .dynsym
 			const char* strtab = (const char*)elf + section->file_offset;
 			const char* last = strtab + section->file_size;
+#if defined(kSnapshotDataAsmSymbol)
+			const char* s_first = kSnapshotDataAsmSymbol;
+#else
 			const char* s_first = kVmSnapshotDataAsmSymbol;
-			const char* s_last = s_first + strlen(kVmSnapshotDataAsmSymbol) + 1;
+#endif
+			const char* s_last = s_first + strlen(s_first) + 1;
 			//if (memmem(strtab, section->s_size, kVmSnapshotDataAsmSymbol, strlen(kVmSnapshotDataAsmSymbol))) {
 			if (std::search(strtab, last, s_first, s_last) != last) {
 				// found it
@@ -105,6 +109,9 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 	}
 
 	// find the required symbol addresses
+	// NOTE: The new naming merges the VM and isolate snapshots into a
+	// single pair: _kDartSnapshotData (data) + _kDartSnapshotText (instructions).
+	// Older engines used four separate symbols. Support both layouts.
 	const uint8_t* vm_snapshot_data = nullptr;
 	const uint8_t* vm_snapshot_instructions = nullptr;
 	const uint8_t* isolate_snapshot_data = nullptr;
@@ -115,6 +122,8 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 
 		const char* name = dynstr + dynsym->name;
 		// Note: sym_size is no needed for dart VM (its blob contains size)
+		// Legacy engines exported four separate snapshot symbols.
+#if defined(kVmSnapshotDataAsmSymbol) && !defined(kSnapshotDataAsmSymbol)
 		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) {
 			vm_snapshot_data = elf + dynsym->value;
 		}
@@ -127,6 +136,17 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) {
 			isolate_snapshot_instructions = elf + dynsym->value;
 		}
+#else
+		// Merged-snapshot engines: one data + one text blob shared by VM and isolate.
+		if (strcmp(name, kSnapshotDataAsmSymbol) == 0) {
+			vm_snapshot_data = elf + dynsym->value;
+			isolate_snapshot_data = elf + dynsym->value;
+		}
+		else if (strcmp(name, kSnapshotTextAsmSymbol) == 0) {
+			vm_snapshot_instructions = elf + dynsym->value;
+			isolate_snapshot_instructions = elf + dynsym->value;
+		}
+#endif
 	}
 
 	if (vm_snapshot_data == nullptr)
