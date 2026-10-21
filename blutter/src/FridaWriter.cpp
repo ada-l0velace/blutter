@@ -27,6 +27,7 @@ void FridaWriter::Create(const char* filename)
 	of << "const CidString = " << dart::kOneByteStringCid << ";\n";
 	of << "const CidTwoByteString = " << dart::kTwoByteStringCid << ";\n";
 	of << "const CidArray = " << dart::kArrayCid << ";\n";
+	of << "const CidImmutableArray = " << dart::kImmutableArrayCid << ";\n";
 	of << "const CidGrowableArray = " << dart::kGrowableObjectArrayCid << ";\n";
 	of << "const CidSet = " << dart::kSetCid << ";\n";
 	of << "const CidMap = " << dart::kMapCid << ";\n";
@@ -81,8 +82,9 @@ void FridaWriter::Create(const char* filename)
 				of << "dataOffset:" << AOT_TwoByteString_data_offset << "},\n";
 				break;
 			case dart::kArrayCid:
+			case dart::kImmutableArrayCid:
 				of << "{id:" << dartCls->Id() << ",";
-				of << "name:\"List\",";
+				of << "name:" << Util::Quote(dartCls->Id() == dart::kArrayCid ? "List" : "_ImmutableList") << ",";
 				//dart::Array::kBytesPerElement is same as a compressed pointer size
 				of << "lenOffset:" << AOT_Array_length_offset << ",";
 				of << "dataOffset:" << AOT_Array_data_offset << ",";

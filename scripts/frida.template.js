@@ -58,7 +58,7 @@ function getDartBool(ptr, cls) {
 }
 
 function getDartMint(ptr, cls) {
-    return ptr.add(cls.valOffset).readU64();
+    return ptr.add(cls.valOffset).readS64();
 }
 
 function getDartDouble(ptr, cls) {
@@ -189,6 +189,7 @@ function getObjectValue(ptr, cls, depthLeft = MaxDepth) {
     case CidDouble:
         return getDartDouble(ptr, cls);
     case CidArray:
+    case CidImmutableArray:
         return getDartArray(ptr, cls, depthLeft);
     case CidGrowableArray:
         return getDartGrowableArray(ptr, cls, depthLeft);
