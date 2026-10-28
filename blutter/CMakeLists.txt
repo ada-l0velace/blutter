@@ -122,15 +122,6 @@ if(BLUTTER_BUILD_TESTS)
 	if(NO_CODE_ANALYSIS)
 		message(FATAL_ERROR "Analyzer tests require code analysis to be enabled")
 	endif()
-	add_executable(arm64_analyzer_test
-		../tests/integration/arm64_analyzer_test.cpp
-		src/Arm64GdtAnalysis.cpp
-		src/Disassembler.cpp
-		src/Disassembler_arm64.cpp
-		src/VarValue.cpp)
-	target_include_directories(arm64_analyzer_test PRIVATE src)
-	target_link_libraries(arm64_analyzer_test PRIVATE ${DARTLIB} capstone)
-	target_compile_definitions(arm64_analyzer_test PRIVATE ${defines})
-	target_compile_options(arm64_analyzer_test PRIVATE ${cc_opts})
-	target_precompile_headers(arm64_analyzer_test PRIVATE src/pch.h)
+	enable_testing()
+	add_subdirectory(../tests tests)
 endif()

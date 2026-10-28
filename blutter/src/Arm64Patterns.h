@@ -46,6 +46,30 @@ struct GdtCallMatch {
 	bool usesTemporary;
 };
 
+// An unclaimed load/call through the reserved dispatch-table register is still a dispatch,
+// even when its preceding index arithmetic is not supported by GdtCall.
+inline bool IsDispatchCall(std::span<const cs_insn> insns, arm64_reg tableReg)
+{
+	if (insns.empty() || !insns[0].detail || insns[0].size != 4 || insns[0].id != ARM64_INS_LDR)
+		return false;
+	const auto& load = insns[0].detail->arm64;
+	if (load.op_count != 2 || load.operands[0].type != ARM64_OP_REG ||
+		load.operands[0].reg != ARM64_REG_X30 || load.operands[1].type != ARM64_OP_MEM ||
+		load.operands[1].mem.base != tableReg)
+		return false;
+	size_t call = 1;
+	if (call < insns.size() && insns[call].id == ARM64_INS_NOP && insns[call].size == 4 &&
+		insns[call].address == insns[0].address + 4)
+		++call;
+	if (call >= insns.size() || !insns[call].detail || insns[call].size != 4 ||
+		insns[0].address > std::numeric_limits<uint64_t>::max() - call * 4 ||
+		insns[call].address != insns[0].address + call * 4 || insns[call].id != ARM64_INS_BLR)
+		return false;
+	const auto& branch = insns[call].detail->arm64;
+	return branch.op_count == 1 && branch.operands[0].type == ARM64_OP_REG &&
+		branch.operands[0].reg == ARM64_REG_X30;
+}
+
 // Bounded recognition only: unproven sequences stay in the raw assembly stream.
 inline std::optional<GdtCallMatch> GdtCall(std::span<const cs_insn> insns,
 	arm64_reg classIdReg, arm64_reg tableReg, arm64_reg tmpReg, std::optional<int64_t> tmpValue = std::nullopt)
@@ -67,6 +91,11 @@ inline std::optional<GdtCallMatch> GdtCall(std::span<const cs_insn> insns,
 		return std::nullopt;
 	bool temporary = false;
 	auto offset = ImmediateDelta(insns[0], ARM64_REG_X30, classIdReg);
+	const auto& first = insns[0].detail->arm64;
+	if (!offset && insns[0].id == ARM64_INS_MOV && first.op_count == 2 && !first.update_flags &&
+		first.operands[0].type == ARM64_OP_REG && first.operands[0].reg == ARM64_REG_X30 &&
+		first.operands[1].type == ARM64_OP_REG && first.operands[1].reg == classIdReg)
+		offset = 0;
 	if (!offset) {
 		const auto& op = insns[0].detail->arm64;
 		if (!tmpValue || insns[0].id != ARM64_INS_ADD || op.op_count != 3 || op.update_flags ||

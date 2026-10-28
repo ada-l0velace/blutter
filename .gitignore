@@ -29,6 +29,7 @@ pyrightconfig.json
 **/ida_script/
 **/blutter_frida.js
 **/snapshot_*.json
+**/analysis_status.json
 # Keep local notes out of source commits; CMake files are build inputs.
 *.md
 *.rst

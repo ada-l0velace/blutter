@@ -65,6 +65,7 @@ protected:
 class UnknownInstr : public ILInstr {
 public:
 	UnknownInstr(cs_insn* insn, AsmText& asm_text) : ILInstr(Unknown, insn), asm_text(asm_text) {}
+	UnknownInstr(AddrRange range, AsmText& asm_text) : ILInstr(Unknown, range), asm_text(asm_text) {}
 	UnknownInstr() = delete;
 	UnknownInstr(UnknownInstr&&) = delete;
 	UnknownInstr& operator=(const UnknownInstr&) = delete;

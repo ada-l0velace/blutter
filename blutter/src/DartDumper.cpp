@@ -642,6 +642,12 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 				auto instructions = disassembler.Disasm(
 					reinterpret_cast<const uint8_t*>(app.base() + cursor), limit - cursor, cursor);
 				if (instructions.Count() == 0) {
+					const AnalysisIssue issue("undecoded-snapshot-instruction", cursor,
+						"Snapshot payload contains a word the ARM64 decoder cannot decode.");
+					if (diagnostics)
+						diagnostics->Report(issue);
+					else
+						throw issue;
 					const auto word = *reinterpret_cast<const uint32_t*>(app.base() + cursor);
 					assembly << std::format("    // {:#x}: .word {:#010x} ; undecoded word\n", cursor, word);
 					cursor += 4;

@@ -8,7 +8,9 @@ PRAGMA_WARNING(push, 0)
 #endif
 PRAGMA_WARNING(pop)
 #include <algorithm>
+#include <cerrno>
 #include <stdexcept>
+#include <system_error>
 #if defined(_WIN32) || defined(WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -36,21 +38,36 @@ static void* load_map_file(const char* path)
 {
 	HANDLE hFile = CreateFileA(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) {
-		printf("\nCannot find %s\n", path);
-		return NULL;
+		throw std::system_error(GetLastError(), std::system_category(), "Cannot open input file");
+	}
+	LARGE_INTEGER size;
+	if (!GetFileSizeEx(hFile, &size)) {
+		const auto error = GetLastError();
+		CloseHandle(hFile);
+		throw std::system_error(error, std::system_category(), "Cannot stat input file");
+	}
+	if (size.QuadPart < sizeof(ElfHeader)) {
+		CloseHandle(hFile);
+		throw std::invalid_argument("Input file is too short for a header");
 	}
 
 	// because Dart API requires only snapshot buffer addresses (no relative access across snapshot),
 	//   so we can just mapping a whole file and find address of snapshots
 	HANDLE hMapFile = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-	if (hMapFile == INVALID_HANDLE_VALUE)
-		return NULL;
+	if (hMapFile == NULL) {
+		const auto error = GetLastError();
+		CloseHandle(hFile);
+		throw std::system_error(error, std::system_category(), "Cannot map input file");
+	}
 
 	// need RW because dart initialization need writing data in BSS
 	void* mem = MapViewOfFile(hMapFile, FILE_MAP_COPY, 0, 0, 0);
+	const auto error = mem ? 0 : GetLastError();
 	CloseHandle(hMapFile);
 
 	CloseHandle(hFile);
+	if (!mem)
+		throw std::system_error(error, std::system_category(), "Cannot map input file");
 	return mem;
 }
 #else
@@ -58,12 +75,24 @@ static void* load_map_file(const char* path)
 {
 	// need RW because dart initialization need writing data in BSS
 	int fd = open(path, O_RDONLY);
+	if (fd == -1)
+		throw std::system_error(errno, std::generic_category(), "Cannot open input file");
 	struct stat st;
-
-	fstat(fd, &st);
+	if (fstat(fd, &st) == -1) {
+		const auto error = errno;
+		close(fd);
+		throw std::system_error(error, std::generic_category(), "Cannot stat input file");
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size < sizeof(ElfHeader)) {
+		close(fd);
+		throw std::invalid_argument("Input file is not a regular file or is too short for a header");
+	}
 	void* mem = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	const auto error = errno;
 
 	close(fd);
+	if (mem == MAP_FAILED)
+		throw std::system_error(error, std::generic_category(), "Cannot map input file");
 	return mem;
 }
 #endif

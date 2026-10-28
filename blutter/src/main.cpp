@@ -5,6 +5,17 @@
 #include "FridaWriter.h"
 #include "args.hxx"
 #include <filesystem>
+#include <fstream>
+
+static bool writeAnalysisStatus(const std::filesystem::path& directory, const char* status, size_t errors)
+{
+	if (directory.empty())
+		return false;
+	std::ofstream file(directory / "analysis_status.json");
+	file << "{\"status\":\"" << status << "\",\"analysis_errors\":" << errors << "}\n";
+	file.close();
+	return !file.fail();
+}
 
 int main(int argc, char** argv)
 {
@@ -13,18 +24,22 @@ int main(int argc, char** argv)
 	args::Group reqGrp(parser, "Required arguments", args::Group::Validators::All);
 	args::ValueFlag<std::string> infile(reqGrp, "infile", "libapp file", { 'i', "in" });
 	args::ValueFlag<std::string> outdir(reqGrp, "outdir", "out path", { 'o', "out"});
+	AnalysisDiagnostics diagnostics(std::cerr);
+	std::filesystem::path outDir;
 
 	try {
 		parser.ParseCLI(argc, argv);
 
 		auto& libappPath = args::get(infile);
 
-		std::filesystem::path outDir{ args::get(outdir) };
+		outDir = args::get(outdir);
 		std::error_code ec;
 		if (!std::filesystem::create_directory(outDir, ec) && ec.value() != 0) {
 			std::cerr << "Failed to create output directory: " << ec.message() << "\n";
 			return 1;
 		}
+		if (!writeAnalysisStatus(outDir, "running", 0))
+			throw std::runtime_error("Cannot write analysis status");
 
 		DartApp app{ libappPath.c_str() };
 		std::cout << std::format("libapp is loaded at {:#x}\n", app.base());
@@ -37,11 +52,11 @@ int main(int argc, char** argv)
 		app.EnterScope();
 #ifndef NO_CODE_ANALYSIS
 		std::cout << "Analyzing the application\n";
-		CodeAnalyzer analyzer{ app };
+		CodeAnalyzer analyzer{ app, diagnostics };
 		analyzer.AnalyzeAll();
 #endif
 
-		DartDumper dumper{ app };
+		DartDumper dumper{ app, &diagnostics };
 #if defined(BLUTTER_SHOREBIRD_3C9C)
 		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
 			dumper.DumpCoverageAudit(audit);
@@ -62,6 +77,13 @@ int main(int argc, char** argv)
 		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
 
 		app.ExitScope();
+		if (!writeAnalysisStatus(outDir, diagnostics.ErrorCount() ? "partial" : "complete", diagnostics.ErrorCount()))
+			throw std::runtime_error("Cannot write analysis status");
+		if (diagnostics.ErrorCount())
+			return diagnostics.Finish(outDir.string());
+#ifndef NO_CODE_ANALYSIS
+		std::cout << "Analysis finished: 0 reported errors.\n";
+#endif
 	}
 	catch (args::Help&) {
 		std::cout << parser;
@@ -77,7 +99,13 @@ int main(int argc, char** argv)
 		std::cerr << parser;
 		return 1;
 	}
+	catch (const AnalysisStopped& e) {
+		writeAnalysisStatus(outDir, "failed", diagnostics.ErrorCount());
+		std::cerr << e.what() << '\n';
+		return 1;
+	}
 	catch (std::exception& e) {
+		writeAnalysisStatus(outDir, "failed", diagnostics.ErrorCount());
 		std::cerr << "exception: " << e.what() << "\n";
 		return 1;
 	}

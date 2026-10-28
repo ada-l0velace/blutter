@@ -1,6 +1,7 @@
 #pragma once
 #include "Disassembler.h"
 #include "il.h"
+#include "AnalysisDiagnostics.h"
 #include <array>
 
 // forward declaration
@@ -205,7 +206,7 @@ private:
 class CodeAnalyzer
 {
 public:
-	CodeAnalyzer(DartApp& app) : app(app) {};
+	CodeAnalyzer(DartApp& app, AnalysisDiagnostics& diagnostics) : app(app), diagnostics(diagnostics) {};
 
 	void AnalyzeAll();
 
@@ -216,4 +217,5 @@ private:
 	void asm2il(DartFunction* dartFn, AsmInstructions& asm_insns);
 
 	DartApp& app;
+	AnalysisDiagnostics& diagnostics;
 };

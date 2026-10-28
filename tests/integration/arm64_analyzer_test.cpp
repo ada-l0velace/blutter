@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "Arm64GdtAnalysis.h"
 #include "CodeAnalyzer.h"
+#include "AnalysisDiagnostics.h"
+#include "RawAssembly.h"
 #include <stdexcept>
 
 static size_t checks = 0;
@@ -180,9 +182,57 @@ static void FallbackScan()
 	}
 }
 
-int main()
+static void UnsupportedDispatchPreservesState()
+{
+	Fixture fixture({MoveTemporary, AddTemporary, Load(), Call}, 2);
+	fixture.SeedConstant();
+	auto* savedCursor = fixture.cursor.Current();
+	auto* savedLoad = fixture.il.back().get();
+	bool reported = false;
+	try { fixture.Try(); }
+	catch (const AnalysisIssue& issue) {
+		reported = true;
+		Check(issue.code == "unsupported-gdt-index", "unsupported dispatch has a stable reason code");
+		Check(issue.address == Base + 8, "unsupported dispatch reports the lookup address");
+	}
+	Check(reported, "an unclaimed dispatch load/call must report an issue");
+	Check(fixture.cursor.Current() == savedCursor, "unsupported dispatch preserves cursor");
+	Check(fixture.il.size() == 2 && fixture.il.back().get() == savedLoad, "unsupported dispatch preserves preceding IL");
+	Check(fixture.destroyed == 0, "unsupported dispatch preserves constant ownership");
+}
+
+static int DispatchFailureProbe()
+{
+	Fixture fixture({AddTemporary, Load(), Call}, 1);
+	AnalysisDiagnostics diagnostics(std::cerr);
+	try { fixture.Try(); }
+	catch (const AnalysisIssue& issue) { diagnostics.Report(issue, "SyntheticSample.dispatch"); }
+	return diagnostics.Finish("synthetic-output");
+}
+
+static void RawExportPreservesUndecodableWords()
+{
+	const uint8_t bytes[]{0xc0, 0x03, 0x5f, 0xd6, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x03, 0x5f, 0xd6};
+	auto raw = DisassembleRawWords(bytes, Base);
+	Check(raw.Data().size() == 3, "raw export retains words after a decode gap");
+	Check(std::string(raw.Data()[0].text).starts_with("ret"), "raw export retains decoded prefix");
+	Check(std::string(raw.Data()[1].text).find(".word") == 0 &&
+		std::string(raw.Data()[1].text).find("0xffffffff") != std::string::npos, "raw export preserves undecodable bytes");
+	Check(std::string(raw.Data()[2].text).starts_with("ret"), "raw export retains decoded suffix");
+	for (size_t i = 0; i < raw.Data().size(); ++i)
+		Check(raw.Data()[i].addr == Base + i * 4 && raw.Data()[i].dataType == AsmText::None,
+			"raw words retain exact addresses without semantic annotations");
+	bool rejected = false;
+	try { DisassembleRawWords({}, Base); }
+	catch (const std::invalid_argument&) { rejected = true; }
+	Check(rejected, "empty raw export is invalid");
+}
+
+int main(int argc, char** argv)
 {
 	try {
+		if (argc == 2 && std::string(argv[1]) == "--probe-gdt")
+			return DispatchFailureProbe();
 		for (bool split : {false, true})
 			for (bool temporary : {false, true})
 				for (bool trailingNop : {false, true})
@@ -234,10 +284,16 @@ int main()
 			Check(match->Start() == Base + 4, "unused constant excluded from call range");
 		}
 		FallbackScan();
+		UnsupportedDispatchPreservesState();
+		RawExportPreservesUndecodableWords();
+	}
+	catch (const AnalysisStopped& error) {
+		std::cerr << error.what() << '\n';
+		return 1;
 	}
 	catch (const std::exception& error) {
 		std::cerr << "ARM64 analyzer check failed: " << error.what() << '\n';
-		return 1;
+		return 2;
 	}
 	std::cout << "ARM64 analyzer checks passed: " << checks << '\n';
 	return 0;

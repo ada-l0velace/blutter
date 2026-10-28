@@ -64,6 +64,8 @@ int main()
 		gdt("legacy subtract", { Add(30, 0, 0x200, true), Load(), Call() }, -0x200);
 		gdt("legacy add", { Add(30, 0, 0x100), Load(), Call() }, 0x100);
 		gdt("zero offset", { Add(30, 0, 0), Load(), Call() }, 0);
+		gdt("zero offset register move", { 0xaa0003fe, Load(), Call() }, 0);
+		gdt("wrong zero offset source", { 0xaa0103fe, Load(), Call() }, std::nullopt);
 		gdt("shifted immediate", { Add(30, 0, 2, false, true), Load(), Call() }, 0x2000);
 		gdt("split immediate", { Add(30, 0, 0x200, true), Add(30, 30, 0x40), Load(), Call() }, -0x1c0);
 		gdt("signed index extension", { Add(30, 0, 0x200, true), Load(30, 21, 30, 7), Call() }, -0x200);
@@ -95,6 +97,14 @@ int main()
 		bounded.insert(bounded.begin() + 1, Add(30, 30, 1));
 		gdt("excess arithmetic", bounded, std::nullopt);
 		Decoded ordinary(handle, { Add(30, 0, 1), Load(), Call() });
+		Check(arm64_patterns::IsDispatchCall(ordinary.Span().subspan(1), ARM64_REG_X21), "dispatch suffix identified independently");
+		Check(!arm64_patterns::IsDispatchCall(ordinary.Span(), ARM64_REG_X21), "arithmetic alone is not a dispatch suffix");
+		Check(!arm64_patterns::IsDispatchCall(ordinary.Span().subspan(1), ARM64_REG_X20), "ordinary other-base load is not a dispatch");
+		Check(!arm64_patterns::IsDispatchCall(ordinary.Span().subspan(1, 1), ARM64_REG_X21), "load alone does not prove a dispatch");
+		Decoded withNop(handle, { Load(), 0xd503201f, Call() });
+		Check(arm64_patterns::IsDispatchCall(withNop.Span(), ARM64_REG_X21), "dispatch suffix can contain a NOP");
+		Decoded otherCall(handle, { Load(), Call(16) });
+		Check(!arm64_patterns::IsDispatchCall(otherCall.Span(), ARM64_REG_X21), "unrelated indirect call is not a dispatch");
 		Check(!arm64_patterns::GdtCall({}, ARM64_REG_X0, ARM64_REG_X21, ARM64_REG_X17), "empty input");
 		ordinary.insns[1].address += 4;
 		Check(!arm64_patterns::GdtCall(ordinary.Span(), ARM64_REG_X0, ARM64_REG_X21, ARM64_REG_X17), "address gap");

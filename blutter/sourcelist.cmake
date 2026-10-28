@@ -1,4 +1,6 @@
 set(SRCS 
+    AnalysisDiagnostics.h
+    RawAssembly.h
     Arm64GdtAnalysis.cpp
     Arm64GdtAnalysis.h
     Arm64Patterns.h

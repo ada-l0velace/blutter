@@ -265,8 +265,9 @@ struct StoreLocalResult {
 class FunctionAnalyzer
 {
 public:
-	FunctionAnalyzer(AnalyzedFnData* fnInfo, DartFunction* dartFn, AsmInstructions& asm_insns, DartApp& app)
-		: fnInfo{ fnInfo }, dartFn{ dartFn }, asm_insns{ asm_insns }, app{ app } {}
+	FunctionAnalyzer(AnalyzedFnData* fnInfo, DartFunction* dartFn, AsmInstructions& asm_insns, DartApp& app,
+		AnalysisDiagnostics& diagnostics)
+		: fnInfo{ fnInfo }, dartFn{ dartFn }, asm_insns{ asm_insns }, app{ app }, diagnostics{ diagnostics } {}
 
 	void asm2il();
 
@@ -340,11 +341,14 @@ private:
 
 	ObjectPoolInstr getObjectPoolInstruction(AsmIterator& insn);
 	void printInsnException(InsnException& e);
+	void reportIssue(const AnalysisIssue& issue);
+	std::string instructionContext(uint64_t address);
 
 	AnalyzedFnData* fnInfo;
 	DartFunction* dartFn;
 	AsmInstructions& asm_insns;
 	DartApp& app;
+	AnalysisDiagnostics& diagnostics;
 };
 
 typedef std::unique_ptr<ILInstr>(FunctionAnalyzer::* AsmMatcherFn)(AsmIterator& insn);
@@ -397,7 +401,8 @@ FunctionAnalyzer::ObjectPoolInstr FunctionAnalyzer::getObjectPoolInstruction(Asm
 			auto value = arm64_patterns::NullBoolean(*insn.Current(), CSREG_DART_NULL,
 				dart::kTrueOffsetFromNull, dart::kFalseOffsetFromNull);
 			if (!value)
-				return {};
+				throw AnalysisIssue("unsupported-null-relative-value", insn.address(),
+					"Addition from the null register is not a recognized boolean constant load.");
 			const bool val = *value;
 			auto b = new VarBoolean(val);
 			setAsmTextDataBoolean(marker.Take(), val);
@@ -484,23 +489,29 @@ FunctionAnalyzer::ObjectPoolInstr FunctionAnalyzer::getObjectPoolInstruction(Asm
 
 void FunctionAnalyzer::printInsnException(InsnException& e)
 {
-	std::cerr << "Analysis error at line " << e.location.line()
-		<< " `" << e.location.function_name() << "`: " << e.cond << '\n';
-	const uint64_t fn_addr = fnInfo->dartFn.Address();
+	reportIssue(AnalysisIssue("instruction-mismatch", e.insn->address,
+		std::format("Expected `{}` in {} (line {}).", e.cond, e.location.function_name(), e.location.line())));
+}
 
-	auto ins = e.insn;
-	for (int i = 0; ins->address > fn_addr && i < 4; i++) {
-		--ins;
-	}
-	while (ins != e.insn) {
-		std::cerr << std::format("    {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
-		++ins;
-	}
-	std::cerr << std::format("  * {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
-	if (ins->address + ins->size < fnInfo->dartFn.AddressEnd()) {
-		++ins;
-		std::cerr << std::format("    {:#x}: {} {}\n", ins->address, &ins->mnemonic[0], &ins->op_str[0]);
-	}
+std::string FunctionAnalyzer::instructionContext(uint64_t address)
+{
+	auto* first = asm_insns.FirstPtr();
+	auto* end = first + asm_insns.Count();
+	auto* at = std::lower_bound(first, end, address,
+		[](const cs_insn& instruction, uint64_t value) { return instruction.address < value; });
+	auto* begin = first + std::max<int64_t>(0, (at - first) - 4);
+	std::string text;
+	for (auto* instruction = begin; instruction != end && instruction <= at + (at != end); ++instruction)
+		text += std::format("  {} {:#x}: {} {}\n", instruction->address == address ? '*' : ' ',
+			instruction->address, instruction->mnemonic, instruction->op_str);
+	if (at == end)
+		text += std::format("  * {:#x}: <end of function>\n", address);
+	return text;
+}
+
+void FunctionAnalyzer::reportIssue(const AnalysisIssue& issue)
+{
+	diagnostics.Report(issue, fnInfo->dartFn.FullName(), instructionContext(issue.address));
 }
 
 std::unique_ptr<EnterFrameInstr> FunctionAnalyzer::processEnterFrameInstr(AsmIterator& insn)
@@ -675,6 +686,7 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 		(insn.id() == ARM64_INS_LDR && GetThreadLeafFunction(insn.ops(1).mem.disp) && insn.ops(1).mem.base != CSREG_DART_PP && insn.ops(1).mem.disp > TargetThreadOffset(dart::Thread::AllocateHandle_entry_point_offset())))
 	{
 		InsnMarker marker(insn);
+		const bool provenThreadBase = insn.id() == ARM64_INS_MOV || insn.ops(1).mem.base == CSREG_DART_THR;
 
 		if (insn.id() == ARM64_INS_MOV) {
 			const auto tmp_reg = insn.ops(0).reg;
@@ -705,6 +717,9 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 				}
 				else {
 					// An offset alone does not prove this is a runtime call.
+					if (provenThreadBase)
+						throw AnalysisIssue("unsupported-leaf-runtime-call", insn.address(),
+							"Runtime entry loaded through the thread register, but the call frame is not recognized.");
 					return nullptr;
 				}
 			}
@@ -882,6 +897,9 @@ void FunctionAnalyzer::handlePrologue(AsmIterator& insn, uint64_t endPrologueAdd
 		}
 		catch (InsnException& e) {
 			printInsnException(e);
+		}
+		catch (const AnalysisIssue& issue) {
+			reportIssue(issue);
 		}
 		fnInfo->DestroyState();
 		fnInfo->DestroyVars();
@@ -2796,7 +2814,8 @@ std::unique_ptr<LoadClassIdInstr> FunctionAnalyzer::processLoadClassIdInstr(AsmI
 			insn.ops(0).reg != cidReg || insn.ops(1).reg != cidReg ||
 			insn.ops(2).imm != kUntaggedObjectClassIdTagPos ||
 			insn.ops(3).imm != dart::UntaggedObject::kClassIdTagSize)
-			return nullptr;
+			throw AnalysisIssue("unsupported-object-tag-extraction", insn.address(),
+				"Object tag loaded, but the expected class-ID extraction is not recognized.");
 		++insn;
 
 		return std::make_unique<LoadClassIdInstr>(insn.Wrap(marker.Take()), objReg, A64::Register{cidReg});
@@ -2873,7 +2892,8 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 			++insn;
 
 			if (!insn.IsBranch(ARM64_CC_EQ))
-				return nullptr;
+				throw AnalysisIssue("unsupported-integer-boxing", insn.address(),
+					"Integer boxing prefix identified, but its overflow branch is not recognized.");
 			const auto contAddr = insn.ops(0).imm;
 			++insn;
 
@@ -3614,6 +3634,9 @@ void FunctionAnalyzer::asm2il()
 		catch (InsnException& e) {
 			printInsnException(e);
 		}
+		catch (const AnalysisIssue& issue) {
+			reportIssue(issue);
+		}
 
 		if (!ok) {
 			// unhandle case
@@ -3626,7 +3649,7 @@ void FunctionAnalyzer::asm2il()
 
 void CodeAnalyzer::asm2il(DartFunction* dartFn, AsmInstructions& asm_insns)
 {
-	FunctionAnalyzer analyzer{ dartFn->GetAnalyzedData(), dartFn, asm_insns, app };
+	FunctionAnalyzer analyzer{ dartFn->GetAnalyzedData(), dartFn, asm_insns, app, diagnostics };
 	analyzer.asm2il();
 }
 	

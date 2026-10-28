@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Arm64GdtAnalysis.h"
 #include "Arm64Patterns.h"
+#include "AnalysisDiagnostics.h"
 
 #ifndef NO_CODE_ANALYSIS
 
@@ -35,8 +36,13 @@ std::unique_ptr<GdtCallInstr> TryGdtCall(AsmIterator& insn, AsmInstructions& ins
 		std::span<const cs_insn>(current, instructions.LastPtr() - current + 1),
 		ToCapstoneReg(dart::DispatchTableNullErrorABI::kClassIdReg), CSREG_DART_DISPATCH_TABLE,
 		CSREG_DART_TMP2, tmpValue);
-	if (!match)
+	if (!match) {
+		if (arm64_patterns::IsDispatchCall(
+			std::span<const cs_insn>(current, instructions.LastPtr() - current + 1), CSREG_DART_DISPATCH_TABLE))
+			throw AnalysisIssue("unsupported-gdt-index", insn.address(),
+				"Dispatch-table call identified, but its index construction is not recognized.");
 		return nullptr;
+	}
 	const auto start = match->usesTemporary ? previousLoad->Start() : insn.address();
 	if (match->usesTemporary)
 		il.pop_back();

@@ -1,11 +1,12 @@
 #pragma once
 #include "DartApp.h"
+#include "AnalysisDiagnostics.h"
 #include <filesystem>
 
 class DartDumper
 {
 public:
-	DartDumper(DartApp& app) : app(app) {};
+	DartDumper(DartApp& app, AnalysisDiagnostics* diagnostics = nullptr) : app(app), diagnostics(diagnostics) {};
 
 	void Dump4Ida(std::filesystem::path outDir);
 
@@ -37,6 +38,7 @@ private:
 	const std::string& getQuoteString(dart::Object& obj);
 
 	DartApp& app;
+	AnalysisDiagnostics* diagnostics;
 	// map for object ptr to unescape string with quote
 	std::unordered_map<intptr_t, std::string> quoteStringCache;
 };
