@@ -4,6 +4,7 @@
 #include "VarValue.h"
 #include "DartThreadInfo.h"
 #include "Arm64Patterns.h"
+#include "Arm64GdtAnalysis.h"
 #include <source_location>
 #include <unordered_set>
 
@@ -2640,40 +2641,7 @@ std::unique_ptr<CallInstr> FunctionAnalyzer::processCallInstr(AsmIterator& insn)
 
 std::unique_ptr<GdtCallInstr> FunctionAnalyzer::processGdtCallInstr(AsmIterator& insn)
 {
-	// Fold only proven index arithmetic and commit iterator/IL changes after the full call matches.
-	auto* current = insn.Current();
-	std::optional<int64_t> tmpValue;
-	LoadValueInstr* previousLoad = nullptr;
-	if (!fnInfo->il_insns.empty() && current > asm_insns.FirstPtr()) {
-		auto* previousAsm = current - 1;
-		if (previousAsm->id == ARM64_INS_NOP && previousAsm > asm_insns.FirstPtr())
-			--previousAsm;
-		auto* previous = fnInfo->LastIL();
-		// A store currently shares the LoadValue kind; require a constant-producing opcode before casting.
-		const bool constantWriter = previousAsm->id == ARM64_INS_MOV || previousAsm->id == ARM64_INS_MOVZ ||
-			previousAsm->id == ARM64_INS_MOVK || previousAsm->id == ARM64_INS_MOVN ||
-			previousAsm->id == ARM64_INS_ORR || previousAsm->id == ARM64_INS_EOR;
-		if (constantWriter && previous->Kind() == ILInstr::LoadValue && previous->End() == insn.address()) {
-			auto* load = static_cast<LoadValueInstr*>(previous);
-			if (load->dstReg == A64::TMP2_REG && load->val.Storage().IsImmediate() && load->val.Value() &&
-				load->val.Value()->RawTypeId() == dart::kIntegerCid && load->val.Value()->HasValue()) {
-				tmpValue = load->val.Get<VarInteger>()->Value();
-				previousLoad = load;
-			}
-		}
-	}
-	auto match = arm64_patterns::GdtCall(
-		std::span<const cs_insn>(current, asm_insns.LastPtr() - current + 1),
-		ToCapstoneReg(dart::DispatchTableNullErrorABI::kClassIdReg), CSREG_DART_DISPATCH_TABLE,
-		CSREG_DART_TMP2, tmpValue);
-	if (!match)
-		return nullptr;
-	const auto start = match->usesTemporary ? previousLoad->Start() : insn.address();
-	if (match->usesTemporary)
-		fnInfo->RemoveLastIL();
-	insn.SetCurrent(current + match->callIndex);
-	++insn;
-	return std::make_unique<GdtCallInstr>(insn.Wrap(start), match->offset);
+	return arm64_analysis::TryGdtCall(insn, asm_insns, fnInfo->il_insns);
 }
 
 std::unique_ptr<ReturnInstr> FunctionAnalyzer::processReturnInstr(AsmIterator& insn)
