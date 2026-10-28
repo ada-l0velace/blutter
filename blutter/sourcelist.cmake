@@ -1,8 +1,11 @@
 set(SRCS 
     AnalysisDiagnostics.h
     RawAssembly.h
+    ReadUnaligned.h
     Arm64GdtAnalysis.cpp
     Arm64GdtAnalysis.h
+    Arm64ClassIdAnalysis.cpp
+    Arm64ClassIdAnalysis.h
     Arm64Patterns.h
     Arm64Boxing.h
     Arm64Constants.h
@@ -23,6 +26,7 @@ set(SRCS
     DartFunction.h
     DartLibrary.cpp
     DartLibrary.h
+    DartNames.h
     DartLoader.cpp
     DartLoader.h
     DartStub.cpp
@@ -41,6 +45,7 @@ set(SRCS
     FridaWriter.h
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
+    SnapshotCodeRanges.h
     HtArrayIterator.h
     Util.cpp
     Util.h

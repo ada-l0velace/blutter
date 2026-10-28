@@ -10,6 +10,21 @@
 
 namespace arm64_patterns {
 
+inline bool IsRegisterMove(const cs_insn& insn, arm64_reg source)
+{
+	if (insn.id != ARM64_INS_MOV || !insn.detail) return false;
+	const auto& op = insn.detail->arm64;
+	return op.op_count == 2 && op.operands[0].type == ARM64_OP_REG &&
+		op.operands[1].type == ARM64_OP_REG && op.operands[1].reg == source;
+}
+
+inline const cs_arm64_op* MemoryOperand(const cs_insn& insn, size_t index)
+{
+	if (!insn.detail || index >= insn.detail->arm64.op_count ||
+		insn.detail->arm64.operands[index].type != ARM64_OP_MEM) return nullptr;
+	return &insn.detail->arm64.operands[index];
+}
+
 inline std::optional<int64_t> ImmediateDelta(const cs_insn& insn, arm64_reg dst, arm64_reg src)
 {
 	if (!insn.detail || insn.size != 4 || (insn.id != ARM64_INS_ADD && insn.id != ARM64_INS_SUB))

@@ -3,6 +3,7 @@ set(BLUTTER_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src")
 add_executable(arm64_analyzer_test
     integration/arm64_analyzer_test.cpp
     "${BLUTTER_SOURCE_DIR}/Arm64GdtAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/Arm64ClassIdAnalysis.cpp"
     "${BLUTTER_SOURCE_DIR}/Disassembler.cpp"
     "${BLUTTER_SOURCE_DIR}/Disassembler_arm64.cpp"
     "${BLUTTER_SOURCE_DIR}/VarValue.cpp")
@@ -28,6 +29,11 @@ target_link_libraries(arm64_patterns_test PRIVATE capstone)
 add_executable(analysis_diagnostics_test unit/analysis_diagnostics_test.cpp)
 target_include_directories(analysis_diagnostics_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 
+add_executable(snapshot_code_ranges_test unit/snapshot_code_ranges_test.cpp)
+target_include_directories(snapshot_code_ranges_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+add_executable(read_unaligned_test unit/read_unaligned_test.cpp)
+target_include_directories(read_unaligned_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+
 add_test(NAME arm64_analyzer COMMAND arm64_analyzer_test)
 add_test(NAME arm64_decoder COMMAND arm64_decoder_test)
 add_executable(arm64_boxing_test integration/arm64_boxing_test.cpp
@@ -41,6 +47,8 @@ target_precompile_headers(arm64_boxing_test PRIVATE "${BLUTTER_SOURCE_DIR}/pch.h
 add_test(NAME arm64_boxing COMMAND arm64_boxing_test)
 add_test(NAME arm64_patterns COMMAND arm64_patterns_test)
 add_test(NAME analysis_diagnostics COMMAND analysis_diagnostics_test)
+add_test(NAME snapshot_code_ranges COMMAND snapshot_code_ranges_test)
+add_test(NAME read_unaligned COMMAND read_unaligned_test)
 
 function(expect_analysis_failure name target mode issue summary)
     add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
@@ -60,3 +68,8 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     "-DTEST_EXECUTABLE=$<TARGET_FILE:${BINNAME}>"
     "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/invalid-input-control"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
+
+foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
+        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test)
+    blutter_instrument_test_target(${target})
+endforeach()

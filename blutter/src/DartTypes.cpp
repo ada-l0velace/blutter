@@ -169,7 +169,7 @@ DartType* DartTypeDb::FindOrAdd(dart::TypePtr typePtr)
 	auto dartCls = classes[type.type_class_id()];
 	ASSERT(dartCls);
 	// Add it to DB first. the type arguments might be many recursive calls
-	auto dartType = new DartType(type.IsNullable(), *dartCls, &DartTypeArguments::Null);
+	auto dartType = OwnType(new DartType(type.IsNullable(), *dartCls, &DartTypeArguments::Null));
 	typesMap[ptr] = dartType;
 
 	dartType->args = FindOrAdd(type.arguments());
@@ -206,7 +206,7 @@ DartRecordType* DartTypeDb::FindOrAdd(dart::RecordTypePtr recordTypePtr)
 		fieldNames.push_back(name.ToCString());
 	}
 
-	auto dartRecordType = new DartRecordType(recordType.IsNullable(), std::move(fieldNames));
+	auto dartRecordType = OwnType(new DartRecordType(recordType.IsNullable(), std::move(fieldNames)));
 	typesMap[ptr] = dartRecordType;
 
 	const auto num_fields = recordType.NumFields();
@@ -228,7 +228,7 @@ DartTypeParameter* DartTypeDb::FindOrAdd(dart::TypeParameterPtr typeParamPtr)
 
 	const auto& typeParam = dart::TypeParameter::Handle(typeParamPtr);
 	// Add it to DB first. the bound might be many recursive calls
-	auto dartTypeParam = new DartTypeParameter(typeParam.IsNullable(), (uint16_t)typeParam.base(), (uint16_t)typeParam.index(), typeParam.IsClassTypeParameter());
+	auto dartTypeParam = OwnType(new DartTypeParameter(typeParam.IsNullable(), (uint16_t)typeParam.base(), (uint16_t)typeParam.index(), typeParam.IsClassTypeParameter()));
 	typesMap[ptr] = dartTypeParam;
 
 	// Removing TypeRef also replaces TypeParameter.bound with TypeParameter.owner
@@ -265,7 +265,7 @@ DartFunctionType* DartTypeDb::FindOrAdd(dart::FunctionTypePtr fnTypePtr)
 		const intptr_t base = fnType.NumParentTypeArguments();
 		const bool kIsClassTypeParameter = false;
 		for (intptr_t i = 0; i < num_type_params; i++) {
-			auto dartTypeParam = new DartTypeParameter(false, (uint16_t)base, (uint16_t)(base + i), kIsClassTypeParameter);
+			auto dartTypeParam = OwnType(new DartTypeParameter(false, (uint16_t)base, (uint16_t)(base + i), kIsClassTypeParameter));
 			dartTypeParam->bound = FindOrAdd(type_params.BoundAt(i));
 			// Note: there might be defaults to
 
@@ -274,7 +274,7 @@ DartFunctionType* DartTypeDb::FindOrAdd(dart::FunctionTypePtr fnTypePtr)
 	}
 
 	// Add it to DB first. the bound might be many recursive calls
-	auto dartFnType = new DartFunctionType(fnType.IsNullable(), fnType.num_implicit_parameters() != 0, fnType.HasOptionalNamedParameters(), std::move(typeParams));
+	auto dartFnType = OwnType(new DartFunctionType(fnType.IsNullable(), fnType.num_implicit_parameters() != 0, fnType.HasOptionalNamedParameters(), std::move(typeParams)));
 	typesMap[ptr] = dartFnType;
 
 	dartFnType->resultType = FindOrAdd(fnType.result_type());
@@ -318,7 +318,7 @@ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
 	case dart::kTypeRefCid: {
 		auto typePtr = dart::TypeRef::RawCast(abTypePtr)->untag()->type();
 		ASSERT(typePtr.GetClassId() == dart::kTypeCid);
-		return new DartTypeRef(*FindOrAdd(dart::Type::RawCast(typePtr)));
+		return OwnType(new DartTypeRef(*FindOrAdd(dart::Type::RawCast(typePtr))));
 	}
 #endif
 	case dart::kTypeParameterCid:
@@ -346,7 +346,7 @@ const DartTypeArguments* DartTypeDb::FindOrAdd(dart::TypeArgumentsPtr typeArgsPt
 	std::vector<DartAbstractType*> args(typeArgsLen);
 
 	// Add it to DB first. the bound might be many recursive calls
-	auto dartTypeArgs = new DartTypeArguments(std::move(args));
+	auto dartTypeArgs = OwnArguments(new DartTypeArguments(std::move(args)));
 	typeArgsMap[ptr] = dartTypeArgs;
 
 	for (auto i = 0; i < typeArgsLen; i++) {
@@ -368,7 +368,7 @@ DartType* DartTypeDb::FindOrAdd(DartClass& dartCls, const dart::TypeArgumentsPtr
 		return dtype->args == args;
 	});
 	if (it == types.end()) {
-		dartType = new DartType{ false, dartCls, args };
+		dartType = OwnType(new DartType{ false, dartCls, args });
 		types.push_back(dartType);
 	}
 	else {
@@ -396,7 +396,7 @@ DartType* DartTypeDb::FindOrAdd(uint32_t cid, const DartTypeArguments* typeArgs)
 		if (type->args == typeArgs)
 			return type;
 	}
-	auto dartType = new DartType{ false, *classes[cid], typeArgs };
+	auto dartType = OwnType(new DartType{ false, *classes[cid], typeArgs });
 	typesByCid[cid].push_back(dartType);
 	return dartType;
 }

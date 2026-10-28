@@ -12,7 +12,7 @@
 // place static member because no DartFnBase source file
 intptr_t DartFnBase::lib_base;
 
-#if defined(kSnapshotDataAsmSymbol)
+#if defined(kSnapshotDataAsmSymbol) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 // A discarded Code is replaced by the shared UnknownDartCode stub. Its size
 // describes that stub, while Function::entry_point still identifies the real
 // function. Recover only discarded entries with a next table boundary.
@@ -125,7 +125,7 @@ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFn
 		//std::cout << std::format("Fn: {}, payload: {:#x}, ep_addr: {:#x}, ep: {:#x}\n", name.c_str(), payload_addr, ep_addr, ep);
 	}
 
-#if defined(kSnapshotDataAsmSymbol)
+#if defined(kSnapshotDataAsmSymbol) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	if (code.IsUnknownDartCode() && ep_addr != code.EntryPoint() - lib_base) {
 		const auto [start, end] = discardedFunctionRange(func.entry_point());
 		payload_addr = start - lib_base;

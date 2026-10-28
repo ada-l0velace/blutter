@@ -102,6 +102,15 @@ int main()
 		bounded.insert(bounded.begin() + 1, Add(30, 30, 1));
 		gdt("excess arithmetic", bounded, std::nullopt);
 		Decoded ordinary(handle, { Add(30, 0, 1), Load(), Call() });
+		Decoded memoryOperands(handle, {Load(), 0x35012340u, Add(4, 22, 0x40)});
+		Check(arm64_patterns::MemoryOperand(memoryOperands.insns[0], 1) != nullptr, "a decoded load has a memory operand");
+		Check(!arm64_patterns::MemoryOperand(memoryOperands.insns[1], 1), "a branch target immediate is not a memory base register");
+		Check(!arm64_patterns::MemoryOperand(memoryOperands.insns[2], 1), "an arithmetic register operand is not memory");
+		Check(!arm64_patterns::MemoryOperand(memoryOperands.insns[0], 7), "missing memory operand is refused");
+		Decoded registerMoves(handle, {0xaa1a03e0u, 0xd2824680u, 0xaa1903e0u}); // mov x0, #0x1234
+		Check(arm64_patterns::IsRegisterMove(registerMoves.insns[0], ARM64_REG_X26), "thread register move is recognized");
+		Check(!arm64_patterns::IsRegisterMove(registerMoves.insns[1], ARM64_REG_X26), "a move immediate is not a thread register");
+		Check(!arm64_patterns::IsRegisterMove(registerMoves.insns[2], ARM64_REG_X26), "another register is not the thread register");
 		Check(arm64_patterns::IsDispatchCall(ordinary.Span().subspan(1), ARM64_REG_X21), "dispatch suffix identified independently");
 		Check(!arm64_patterns::IsDispatchCall(ordinary.Span(), ARM64_REG_X21), "arithmetic alone is not a dispatch suffix");
 		Check(!arm64_patterns::IsDispatchCall(ordinary.Span().subspan(1), ARM64_REG_X20), "ordinary other-base load is not a dispatch");
@@ -111,6 +120,13 @@ int main()
 		Decoded otherCall(handle, { Load(), Call(16) });
 		Check(!arm64_patterns::IsDispatchCall(otherCall.Span(), ARM64_REG_X21), "unrelated indirect call is not a dispatch");
 		Check(!arm64_patterns::GdtCall({}, ARM64_REG_X0, ARM64_REG_X21, ARM64_REG_X17), "empty input");
+		cs_insn withoutDetails{};
+		Check(!arm64_patterns::GdtCall(std::span<const cs_insn>(&withoutDetails, 1),
+			ARM64_REG_X0, ARM64_REG_X21, ARM64_REG_X17), "missing metadata cannot prove a dispatch");
+		Decoded invalidShift(handle, {Add(4, 22, 0x40)});
+		invalidShift.insns[0].detail->arm64.operands[2].shift.value = 16;
+		Check(!arm64_patterns::ImmediateDelta(invalidShift.insns[0], ARM64_REG_X4, ARM64_REG_X22),
+			"defensive rejection of invalid decoded immediate shift");
 		ordinary.insns[1].address += 4;
 		Check(!arm64_patterns::GdtCall(ordinary.Span(), ARM64_REG_X0, ARM64_REG_X21, ARM64_REG_X17), "address gap");
 		auto boolean = [&](uint32_t word, std::optional<bool> expected) {
@@ -217,6 +233,11 @@ int main()
 			}
 		};
 		computed("frame argument", {Add(8, 29, 0x80, true), Add(8, 8, 0x91), load(8)}, 0x10);
+		computed("truncated address construction is not a load", {Add(8, 29, 0x80)}, std::nullopt);
+		std::vector<uint32_t> longAddress(10, Add(8, 8, 1));
+		longAddress[0] = Add(8, 29, 0x80);
+		longAddress.push_back(load(8));
+		computed("address construction respects its work bound", longAddress, std::nullopt);
 		computed("thread slot", {Add(8, 26, 0x100), Add(8, 8, 0xb7, true), load(8)}, 0x48, ARM64_REG_X26);
 		computed("stack load", {Add(8, 15, 0x20), Add(8, 8, 7, true), load(8)}, 0x18, ARM64_REG_X15);
 		const uint32_t index = 0x8b200000u | (3 << 16) | (6 << 13) | (2 << 10) | (8 << 5) | 8;

@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 
 // forward declaration
 class DartClass;
@@ -30,6 +31,7 @@ public:
 	};
 
 	explicit DartAbstractType(Kind kind, bool nullable) : kind(kind), nullable(nullable) {}
+	virtual ~DartAbstractType() = default;
 	DartAbstractType() = delete;
 
 	bool IsNullable() const { return nullable; }
@@ -206,8 +208,6 @@ protected:
 
 class DartTypeDb {
 public:
-	//~DartTypeDb();
-
 	DartType* Get(uint32_t cid);
 
 	DartType* FindOrAdd(dart::TypePtr typePtr);
@@ -226,6 +226,21 @@ public:
 
 protected:
 	DartTypeDb(std::vector<DartClass*>& classes) : classes(classes) { typesByCid.resize(classes.size()); }
+
+	// Lookup tables and recursive type edges borrow these stable heap objects.
+	// Each allocation has one owner even when several caches reference it.
+	template<typename T> T* OwnType(T* type) {
+		std::unique_ptr<DartAbstractType> owner(type);
+		ownedTypes.push_back(std::move(owner));
+		return type;
+	}
+	DartTypeArguments* OwnArguments(DartTypeArguments* args) {
+		std::unique_ptr<DartTypeArguments> owner(args);
+		ownedArguments.push_back(std::move(owner));
+		return args;
+	}
+	std::vector<std::unique_ptr<DartAbstractType>> ownedTypes;
+	std::vector<std::unique_ptr<DartTypeArguments>> ownedArguments;
 
 	std::unordered_map<intptr_t, DartAbstractType*> typesMap; // map dart ptr to the type
 	std::vector<std::vector<DartType*>> typesByCid;

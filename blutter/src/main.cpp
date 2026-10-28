@@ -57,7 +57,7 @@ int main(int argc, char** argv)
 #endif
 
 		DartDumper dumper{ app, &diagnostics };
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
 			dumper.DumpCoverageAudit(audit);
 #endif

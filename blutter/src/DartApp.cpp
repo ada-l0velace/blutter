@@ -2,6 +2,7 @@
 #include "DartApp.h"
 #include "ElfHelper.h"
 #include "DartLoader.h"
+#include "ReadUnaligned.h"
 PRAGMA_WARNING(push, 0)
 #include <vm/stub_code.h>
 #include <vm/heap/safepoint.h>
@@ -394,7 +395,7 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
 public:
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	std::vector<dart::FunctionPtr> functionPtrs;
 #endif
 	explicit HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs) : codePtrs(codePtrs) {}
@@ -404,7 +405,7 @@ public:
 	virtual void VisitObject(dart::ObjectPtr obj) {
 		if (obj->IsCode())
 			codePtrs.push_back(dart::Code::RawCast(obj));
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 		if (obj->IsFunction())
 			functionPtrs.push_back(dart::Function::RawCast(obj));
 #endif
@@ -414,7 +415,7 @@ private:
 	std::vector<dart::CodePtr>& codePtrs;
 };
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 static bool hasInstructionsEntry(uintptr_t entry);
 #endif
 
@@ -522,6 +523,7 @@ void DartApp::findFunctionInHeap()
 				// no function, can only make it into top class of native library
 				if (!nativeLib.topClass) {
 					nativeLib.topClass = new DartClass(nativeLib);
+					nativeLib.classes.push_back(nativeLib.topClass);
 				}
 				auto dartFn = nativeLib.topClass->AddFunction(code);
 				functions[dartFn->Address()] = dartFn;
@@ -534,7 +536,7 @@ void DartApp::findFunctionInHeap()
 			//throw std::runtime_error(msg);
 		}
 	}
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	for (const auto ptr : visitor.functionPtrs) {
 		const auto& function = dart::Function::Handle(zone, ptr);
 		const auto entry = function.entry_point();
@@ -544,7 +546,7 @@ void DartApp::findFunctionInHeap()
 #endif
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 // The VM can retain a Function while discarding its Code object. Such
 // functions are invisible to a Code-only heap scan and to pruned class lists.
 // Keep their real names/owners rather than recovering them as anonymous code.
@@ -634,7 +636,7 @@ void DartApp::finalizeFunctionsInfo()
 	auto& func = dart::Function::Handle();
 	for (auto& [_, dartFn] : functions) {
 		func = dartFn->ptr;
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 		// Anonymous retained Code objects have no Function metadata.
 		if (func.IsNull()) continue;
 #endif
@@ -759,17 +761,17 @@ void DartApp::walkObject(dart::Object& obj)
 			if (dart::kCompressedWordSize == 4) {
 				RELEASE_ASSERT(bitmap.Get((offset + dart::kCompressedWordSize) / dart::kCompressedWordSize));
 			}
-			auto p = reinterpret_cast<uint64_t*>(ptr + offset);
+			const auto bits = ReadUnaligned64(reinterpret_cast<const void*>(ptr + offset));
 			// it is rare to find integer that larger than 0x1000_0000_0000_0000
 			//   while double is very common because of exponent value
 			// to know exact type (int or double), we have to check from register type in assembly
-			if (*p <= 0x1000000000000000 || *p >= 0xffffffffffff0000) {
+			if (bits <= 0x1000000000000000 || bits >= 0xffffffffffff0000) {
 				dartCls->AddField(offset, typeDb->Get(dart::kMintCid));
 			}
 			else {
 				dartCls->AddField(offset, typeDb->Get(dart::kDoubleCid));
 			}
-			//std::cout << std::format("    offset_{:x} : int({:#x})\n", offset, *p);
+			//std::cout << std::format("    offset_{:x} : int({:#x})\n", offset, bits);
 			offset += dart::kCompressedWordSize * 2;
 		}
 		else {

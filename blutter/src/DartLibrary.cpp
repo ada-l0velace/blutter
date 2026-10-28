@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "DartLibrary.h"
 #include "DartClass.h"
+#include "DartNames.h"
 #include <filesystem>
 
 DartLibrary::DartLibrary(const dart::Library& lib) : ptr(lib.ptr()), topClass(NULL)
@@ -56,28 +57,7 @@ DartLibrary::~DartLibrary()
 
 std::string DartLibrary::GetName()
 {
-	// name is empty for non-internal dart lib
-	std::string out;
-	if (url.starts_with("package:")) {
-		//out = url.substr(8, url.find('/', 8) - 8);
-		out = url.substr(8);
-	}
-	else if (url.starts_with("file:")) {
-		auto offset = url.rfind('/');
-		offset = url.rfind('/', offset - 1);
-		out = url.substr(offset + 1);
-	}
-	else {
-		// expect "dart:*"
-		out = url;
-		out[4] = '_';
-	}
-
-	if (out.ends_with(".dart"))
-		out.erase(out.length() - 5);
-	std::replace(out.begin(), out.end(), '/', '$');
-
-	return out;
+	return LibraryDisplayName(url);
 }
 
 DartClass* DartLibrary::AddClass(const dart::Class& cls)

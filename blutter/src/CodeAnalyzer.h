@@ -190,10 +190,10 @@ public:
 	int32_t typeArgumentLocalOffset{ 0 };
 
 	void InitState() { state = std::make_unique<AnalyzingState>(stackSize); }
-	void DestroyState() { state.release(); }
+	void DestroyState() { state.reset(); }
 	AnalyzingState* State() const { return state.get(); }
 	void InitVars() { vars = std::make_unique<AnalyzingVars>(); }
-	void DestroyVars() { vars.release(); }
+	void DestroyVars() { vars.reset(); }
 	AnalyzingVars* Vars() const { return vars.get(); }
 
 private:

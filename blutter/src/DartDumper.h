@@ -13,7 +13,7 @@ public:
 	std::vector<std::pair<intptr_t, std::string>> DumpStructHeaderFile(std::string outFile);
 
 	void DumpCode(const char* out_dir);
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	void DumpCoverageAudit(const char* filename);
 #endif
 
@@ -23,7 +23,7 @@ public:
 	std::string ObjectToString(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
 
 private:
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	void DumpSnapshotCode(const char* asm_dir);
 	std::vector<std::pair<uint64_t, uint64_t>> snapshotCodeRanges;
 	std::vector<std::pair<uint64_t, uint64_t>> recoveredCodeRanges;

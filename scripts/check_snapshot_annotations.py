@@ -13,10 +13,53 @@ import json
 from pathlib import Path
 import re
 import struct
+from dataclasses import dataclass
 
 import capstone as cs
 from capstone import arm64 as a
 from elftools.elf.elffile import ELFFile
+from check_blutter_output import unprivileged_load_mnemonic
+
+
+@dataclass
+class RecoveredLoad:
+    instruction: object
+    id: int
+    mnemonic: str
+    bytes: bytes
+
+    def __getattr__(self, name):
+        return getattr(self.instruction, name)
+
+
+def decode_payload(decoder, raw, start):
+    instructions = list(decoder.disasm(raw, start))
+    # Capstone 5 rejects allocated unprivileged loads when base == destination.
+    # Validate their original encoding, then obtain only equivalent operands
+    # and register effects from LDUR. Keep the original opcode and instruction ID.
+    for offset in range(len(instructions) * 4, len(raw), 4):
+        word = raw[offset:offset + 4]
+        assert len(word) == 4
+        address = start + offset
+        insn = next(decoder.disasm(word, address), None)
+        if insn is None:
+            mnemonic = unprivileged_load_mnemonic(word)
+            assert mnemonic, f'Unrecognized original instruction at {address:#x}'
+            proxy = (int.from_bytes(word, 'little') & ~0xc00).to_bytes(4, 'little')
+            insn = next(decoder.disasm(proxy, address), None)
+            assert insn and insn.mnemonic == mnemonic.replace('ldtr', 'ldur', 1)
+            insn = RecoveredLoad(insn, getattr(a, 'ARM64_INS_' + mnemonic.upper()), mnemonic, word)
+        instructions.append(insn)
+    return instructions
+
+
+def folded_immediate_bits(description, load_base):
+    target = re.match(r'^(0x[0-9a-f]{1,16}) - ', description)
+    assert target, 'Expected the folded UnlinkedCall immediate representation'
+    # The older pool renderer subtracts the mapping base from every adjacent
+    # immediate, including VM code values and numeric bits. Undo it exactly;
+    # this does not establish that the value is a callable target.
+    return (int(target[1], 16) + load_base) & ((1 << 64) - 1)
 
 
 def signed(value, bits):
@@ -121,7 +164,7 @@ def main():
     proof_checks = 0
     for node in nodes:
         start, end = node['start'], node['end']
-        instructions = list(md.disasm(read(start, end - start), start))
+        instructions = decode_payload(md, read(start, end - start), start)
         assert len(instructions) * 4 == end - start
         def reg(number):
             name = md.reg_name(number)
@@ -232,6 +275,9 @@ def main():
             value = previous.removeprefix('UnlinkedCall: ')
             if slot['kind'] == 'text_address_value':
                 assert int(slot['description'].rsplit(' ', 1)[1], 16) == int(re.match(r'0x[0-9a-f]+', value)[0], 16)
+                continue
+            if slot['kind'] == 'immediate':
+                assert folded_immediate_bits(value, load_base) == int(slot['description'].split('bits: ')[1], 16)
                 continue
         elif slot['kind'] == 'text_address_value':
             assert value.startswith('IMM:')

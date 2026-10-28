@@ -22,7 +22,7 @@ std::unique_ptr<GdtCallInstr> TryGdtCall(AsmIterator& insn, AsmInstructions& ins
 		if (previousAsm->id == ARM64_INS_NOP && previousAsm > instructions.FirstPtr())
 			--previousAsm;
 		auto* previous = il.back().get();
-		// A store currently shares the LoadValue kind; require a constant-producing opcode before casting.
+		// Require a constant-producing opcode as well as a typed load model.
 		const bool constantWriter = previousAsm->id == ARM64_INS_MOV || previousAsm->id == ARM64_INS_MOVZ ||
 			previousAsm->id == ARM64_INS_MOVK || previousAsm->id == ARM64_INS_MOVN ||
 			previousAsm->id == ARM64_INS_ORR || previousAsm->id == ARM64_INS_EOR;

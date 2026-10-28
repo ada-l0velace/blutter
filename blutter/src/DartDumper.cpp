@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "DartDumper.h"
+#include "ReadUnaligned.h"
+#include <bit>
 #include <fstream>
 #include <format>
 #include <set>
@@ -7,9 +9,10 @@
 #include <iostream>
 #include <sstream>
 #include <numeric>
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 #include <vm/heap/safepoint.h>
 #include "SnapshotCodeAnalysis.h"
+#include "SnapshotCodeRanges.h"
 #endif
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
@@ -47,7 +50,7 @@ static std::string pythonString(const std::string& value)
 	return result + '"';
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 // Optional numerical VM metadata audit, independent of IDA/asm exports.
 void DartDumper::DumpCoverageAudit(const char* filename)
 {
@@ -139,7 +142,7 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 	if (OP_MAP.contains(fnName)) {
 		return prefix + "op_" + OP_MAP[fnName];
 	}
-	const auto last = fnName.back();
+	const auto last = fnName.empty() ? '\0' : fnName.back();
 	if (last == '=') {
 		fnName.pop_back();
 		return prefix + fnName + "_assign";
@@ -157,7 +160,7 @@ static std::string getFunctionName4Ida(const DartFunction& dartFn, const std::st
 	case DartFunction::CONSTRUCTOR: {
 		std::string name = dartFn.IsStatic() ? "factory_ctor" : "ctor";
 		ASSERT(fnName.starts_with(cls_prefix));
-		if (fnName[cls_prefix.length()] == '.') {
+		if (fnName.starts_with(cls_prefix) && fnName.size() > cls_prefix.size() && fnName[cls_prefix.size()] == '.') {
 			name += '_';
 			name += &fnName[cls_prefix.length() + 1];
 		}
@@ -188,7 +191,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 			for (auto dartFn : cls->Functions()) {
 				const auto ep = dartFn->Address();
 				auto name = getFunctionName4Ida(*dartFn, cls_prefix);
-#if !defined(BLUTTER_SHOREBIRD_3C9C)
+#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 				const auto fnSize = dartFn->Size();
 				if (fnSize > 0) {
 					of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + fnSize);
@@ -222,17 +225,29 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 		std::replace(name.begin(), name.end(), ' ', '_');
 		of << std::format("idaapi.set_name({:#x}, {})\n", ep,
 			pythonString(std::format("{}_{:x}", name, ep)));
-#if !defined(BLUTTER_SHOREBIRD_3C9C)
+#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 		// UnknownDartCode can have a negative size sentinel. Keep its name,
 		// but do not emit a backwards IDA range for an unavailable size.
 		if (stub->Size() <= 0)
 			continue;
 		of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + stub->Size());
+#else
+		// Older snapshots store VM stubs in a separate image. They are outside
+		// the application's canonical table and must keep their existing ranges.
+		if (app.vm_snapshot_instructions && app.vm_snapshot_instructions != app.isolate_snapshot_instructions && stub->Size() > 0) {
+			const auto vmStart = reinterpret_cast<uintptr_t>(app.vm_snapshot_instructions) - app.base();
+			const auto vmSize = *reinterpret_cast<const uintptr_t*>(app.vm_snapshot_instructions);
+			if (ep >= vmStart && ep - vmStart < vmSize) {
+				if (static_cast<uint64_t>(stub->Size()) > vmSize - (ep - vmStart))
+					throw std::runtime_error("VM stub range exceeds its instructions image");
+				of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + stub->Size());
+			}
+		}
 #endif
 	}
 
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	// Export each VM payload exactly once, including checked-entry prefixes.
 	// Avoid guessed sizes and overlapping duplicate ranges from metadata aliases.
 	for (const auto& [start, end] : snapshotCodeRanges)
@@ -510,12 +525,12 @@ void DartDumper::DumpCode(const char* out_dir)
 			dartCls->PrintFoot(of);
 		}
 	}
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 	DumpSnapshotCode(out_dir);
 #endif
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 void DartDumper::DumpSnapshotCode(const char* asm_dir)
 {
 	// A VM instructions-table entry is a native payload boundary. It does not
@@ -545,8 +560,12 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	const auto imageStart = reinterpret_cast<uintptr_t>(app.isolate_snapshot_instructions);
 	const auto imageSize = *reinterpret_cast<const uintptr_t*>(imageStart);
 	const auto imageEnd = imageStart + imageSize;
-	if (imageSize < 128 || imageEnd < imageStart)
+	// The section header is rounded by the matched SDK. Its alignment changed
+	// across releases; a fixed byte count would exclude valid older images.
+	const auto codeOffset = dart::kObjectStartAlignment + dart::InstructionsSection::HeaderSize();
+	if (imageSize <= static_cast<uintptr_t>(codeOffset) || imageEnd < imageStart)
 		throw std::runtime_error("Invalid instructions image size");
+	const auto codeStart = imageStart + codeOffset;
 	auto* thread = dart::Thread::Current();
 	const auto& tables = dart::GrowableObjectArray::Handle(thread->zone(),
 		thread->isolate_group()->object_store()->instructions_tables());
@@ -558,15 +577,23 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	if (!rootTable.rodata() || rootTable.rodata()->length == 0 || !rootTable.ContainsPc(imageEnd - 1))
 		throw std::runtime_error("Unsupported or missing root instructions table");
 	std::vector<SnapshotAnalysis::Payload> payloads;
-	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i) {
-		const auto start = rootTable.EntryPointAt(i);
-		const auto end = i + 1 < rootTable.rodata()->length ? rootTable.EntryPointAt(i + 1) : imageEnd;
-		if (start < imageStart + 128 || end <= start || end > imageEnd || start % 4 || end % 4)
-			throw std::runtime_error("Invalid instructions-table boundary");
+	if (rootTable.rodata()->length > (imageEnd - codeStart) / 4)
+		throw std::runtime_error("Instructions table exceeds the code image");
+	std::vector<uint64_t> entries;
+	entries.reserve(rootTable.rodata()->length);
+	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i)
+		entries.push_back(rootTable.EntryPointAt(i));
+	const auto inventory = SnapshotCodeRanges(imageStart, codeStart, imageEnd, entries);
+	for (const auto& [start, end] : inventory) {
 		payloads.push_back({start - app.base(), end - app.base(), {}, ""});
 	}
 	const auto& pool = app.GetObjectPool();
-	SnapshotAnalysis::Profile profile{"shorebird_3c9c", ARM64_REG_X27, ARM64_REG_X26,
+#if defined(BLUTTER_SHOREBIRD_3C9C)
+	const std::string profileName = "shorebird_3c9c";
+#else
+	const std::string profileName = "dart_aot";
+#endif
+	SnapshotAnalysis::Profile profile{profileName, ARM64_REG_X27, ARM64_REG_X26,
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
 	for (const auto& [offset, name] : GetThreadOffsetsMap())
 		if (!name.empty()) profile.threadFields.emplace(offset, name);
@@ -622,7 +649,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		for (uint32_t i = 0; i < length; ++i) {
 			const auto start = table.EntryPointAt(i);
 			const auto end = i + 1 < length ? table.EntryPointAt(i + 1) : imageEnd;
-			if (start < imageStart + 128 || end <= start || end > imageEnd ||
+			if (start < codeStart || end <= start || end > imageEnd ||
 				(start % 4) != 0 || (end % 4) != 0)
 				throw std::runtime_error("Invalid instructions-table boundary");
 			const auto address = start - app.base();
@@ -1053,13 +1080,13 @@ std::string DartDumper::dumpInstanceFields(dart::Object& obj, DartClass& dartCls
 			// integer (4/8 bytes) or double (8 bytes)
 			if (dart::kCompressedWordSize == 4)
 				RELEASE_ASSERT(bitmap.Get((offset + dart::kCompressedWordSize) / dart::kCompressedWordSize));
-			auto p = reinterpret_cast<uint64_t*>(ptr + offset);
+			const auto bits = ReadUnaligned64(reinterpret_cast<const void*>(ptr + offset));
 			// it is rare to find integer that larger than 0x1000_0000_0000_0000
-			if (*p <= 0x1000000000000000 || *p >= 0xffffffffffff0000) {
-				txtField = std::format("off_{:x}: int({:#x})", offset, *p);
+			if (bits <= 0x1000000000000000 || bits >= 0xffffffffffff0000) {
+				txtField = std::format("off_{:x}: int({:#x})", offset, bits);
 			}
 			else {
-				txtField = std::format("off_{:x}: double({})", offset, *((double*)p));
+				txtField = std::format("off_{:x}: double({})", offset, std::bit_cast<double>(bits));
 			}
 			offset += dart::kCompressedWordSize;
 		}
@@ -1130,7 +1157,7 @@ std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleFor
 			return std::format("[pp+{:#x}] IMM: {:#x}", offset, imm);
 		}
 		else {
-			return std::format("[pp+{:#x}] IMM: double({}) from {:#x}", offset, *((double*)&imm), imm);
+			return std::format("[pp+{:#x}] IMM: double({}) from {:#x}", offset, std::bit_cast<double>(imm), imm);
 		}
 	}
 	else if (objType == dart::ObjectPool::EntryType::kNativeFunction) {

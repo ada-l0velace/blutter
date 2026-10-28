@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Arm64GdtAnalysis.h"
+#include "Arm64ClassIdAnalysis.h"
 #include "CodeAnalyzer.h"
 #include "AnalysisDiagnostics.h"
 #include "RawAssembly.h"
@@ -45,6 +46,46 @@ struct TrackedInteger : VarInteger {
 	~TrackedInteger() override { ++destroyed; }
 	int& destroyed;
 };
+
+struct TrackedType : DartAbstractType {
+	explicit TrackedType(int& destroyed) : DartAbstractType(Kind::TypeParam, false), destroyed(destroyed) {}
+	~TrackedType() override { ++destroyed; }
+	std::string ToString() const override { return "authored_type"; }
+	int& destroyed;
+	TrackedType* borrowed = nullptr;
+};
+
+class TypeOwners : public DartTypeDb {
+public:
+	explicit TypeOwners(std::vector<DartClass*>& classes) : DartTypeDb(classes) {}
+	using DartTypeDb::OwnType;
+	using DartTypeDb::OwnArguments;
+	void Alias(DartAbstractType* type) { typesMap[1] = type; typesMap[2] = type; }
+};
+
+static void TypeOwnershipChecks()
+{
+	std::vector<DartClass*> classes;
+	int destroyed = 0;
+	{
+		TypeOwners owner(classes);
+		auto* first = owner.OwnType(new TrackedType(destroyed));
+		owner.Alias(first);
+		for (int i = 0; i < 64; ++i) owner.OwnType(new TrackedType(destroyed));
+		first->borrowed = first; // Recursive type edges are references, not owners.
+		auto* arguments = owner.OwnArguments(new DartTypeArguments({first, first}));
+		Check(arguments->Length() == 2 && first->borrowed == first && destroyed == 0,
+			"cached aliases and recursive type edges keep stable addresses");
+	}
+	Check(destroyed == 65, "each cached type is destroyed exactly once through its abstract owner");
+	try {
+		TypeOwners owner(classes);
+		owner.OwnType(new TrackedType(destroyed));
+		throw std::runtime_error("authored interrupted construction");
+	}
+	catch (const std::runtime_error&) {}
+	Check(destroyed == 66, "cached types are released when construction is interrupted");
+}
 
 struct Fixture {
 	int destroyed = 0;
@@ -255,6 +296,64 @@ static void MaskedDispatchConstant()
 	RejectUnchanged(joined, "masked constant cannot cross an incoming branch");
 }
 
+static void TaggedClassIdChecks()
+{
+	constexpr uint32_t Shift = 0xd37ff884; // lsl x4, x4, #1
+	for (size_t history = 0; history < 3; ++history) {
+		Fixture fixture({Nop, Nop, Nop, Shift, Ret}, 3);
+		fixture.il.clear();
+		for (size_t i = 0; i < history; ++i)
+			fixture.il.push_back(std::make_unique<ReturnInstr>(AddrRange{Base + i * 4, Base + (i + 1) * 4}));
+		auto* cursor = fixture.cursor.Current();
+		Check(!arm64_analysis::TryTaggedClassId(fixture.cursor, fixture.il), "short IL history cannot form a tagged class-ID combination");
+		Check(fixture.cursor.Current() == cursor && fixture.il.size() == history, "short-history refusal preserves state");
+	}
+	for (int defect = 0; defect < 10; ++defect) {
+		// Seed authored IL facts; the combiner consumes the decoded shift only.
+		Fixture fixture({Nop, Nop, Nop, defect == 7 ? Shift ^ 1u : Shift, Ret}, 3);
+		if (defect == 3)
+			fixture.il.push_back(std::make_unique<StoreObjectPoolInstr>(AddrRange{Base, Base + 4}, A64::Register{ARM64_REG_X4}, 16));
+		else if (defect == 6)
+			fixture.SeedLoad(new VarExpression("authored unknown integer", dart::kIntegerCid), A64::Register{ARM64_REG_X4});
+		else {
+			auto* value = new TrackedInteger(fixture.destroyed);
+			value->val = dart::Smi::RawValue(dart::kSmiCid) + (defect == 4 ? 1 : 0);
+			fixture.SeedLoad(value, A64::Register{ARM64_REG_X4}, VarStorage::NewImmediate(), defect == 2 ? Base : Base + 4);
+		}
+		if (defect == 9)
+			fixture.il.push_back(std::make_unique<ReturnInstr>(AddrRange{Base + 4, Base + 8}));
+		else
+			fixture.il.push_back(std::make_unique<BranchIfSmiInstr>(AddrRange{Base + 4, Base + 8},
+				A64::Register{defect == 5 ? ARM64_REG_X2 : ARM64_REG_X0}, Base + (defect == 1 ? 20 : 16)));
+		fixture.il.push_back(std::make_unique<LoadClassIdInstr>(AddrRange{Base + 8, Base + 12},
+			A64::Register{ARM64_REG_X0}, A64::Register{defect == 8 ? ARM64_REG_X3 : ARM64_REG_X4}));
+		std::vector<ILInstr*> before;
+		for (const auto& node : fixture.il) before.push_back(node.get());
+		auto* cursor = fixture.cursor.Current();
+		bool reported = false;
+		std::unique_ptr<LoadTaggedClassIdMayBeSmiInstr> result;
+		try { result = arm64_analysis::TryTaggedClassId(fixture.cursor, fixture.il); }
+		catch (const AnalysisIssue& issue) {
+			reported = true;
+			Check(issue.code == "instruction-mismatch", "inconsistent proven class-ID inputs remain diagnosed");
+		}
+		if (defect == 0) {
+			Check(result && !reported, "complete tagged class-ID combination is recognized");
+			Check(result->Start() == Base && result->End() == Base + 16, "composite covers exactly its authored input range");
+			Check(fixture.il.size() == 1 && fixture.il[0].get() == before[0], "unrelated preceding IL is preserved");
+			Check(fixture.cursor.address() == Base + 16 && fixture.destroyed == 0, "success transfers ownership and advances once");
+			result.reset();
+			Check(fixture.destroyed == 1, "transferred constant is destroyed exactly once");
+		}
+		else {
+			Check(!result && reported == (defect >= 3 && defect <= 6), "incomplete joins refuse; inconsistent input facts report");
+			Check(fixture.cursor.Current() == cursor && fixture.il.size() == before.size(), "failed combination preserves cursor and IL count");
+			for (size_t i = 0; i < before.size(); ++i)
+				Check(fixture.il[i].get() == before[i], "failed combination preserves every owned node");
+		}
+	}
+}
+
 int main(int argc, char** argv)
 {
 	try {
@@ -293,7 +392,8 @@ int main(int argc, char** argv)
 		{
 			Fixture fixture({0xf9000371, AddTemporary, Load(), Call}, 1); // str x17, [x27]
 			fixture.il.push_back(std::make_unique<StoreObjectPoolInstr>(AddrRange{Base, Base + 4}, A64::TMP2_REG, 16));
-			RejectUnchanged(fixture, "store sharing the load IL kind");
+			Check(fixture.il.back()->Kind() != ILInstr::LoadValue, "a pool store is not a constant-producing load");
+			RejectUnchanged(fixture, "pool store cannot seed a dispatch constant");
 		}
 		{
 			Fixture fixture({MoveTemporary, Nop, AddTemporary, Load(20), Call}, 2);
@@ -314,6 +414,8 @@ int main(int argc, char** argv)
 		UnsupportedDispatchPreservesState();
 		RawExportPreservesUndecodableWords();
 		MaskedDispatchConstant();
+		TaggedClassIdChecks();
+		TypeOwnershipChecks();
 	}
 	catch (const AnalysisStopped& error) {
 		std::cerr << error.what() << '\n';

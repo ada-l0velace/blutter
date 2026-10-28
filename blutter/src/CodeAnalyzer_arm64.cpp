@@ -5,6 +5,7 @@
 #include "DartThreadInfo.h"
 #include "Arm64Patterns.h"
 #include "Arm64GdtAnalysis.h"
+#include "Arm64ClassIdAnalysis.h"
 #include "Arm64Boxing.h"
 #include "Arm64Memory.h"
 #include <source_location>
@@ -706,8 +707,10 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 	}
 	// weird case
 	// it should be easier to detect THR register if varaible tracking is fully implemented
-	else if ((insn.id() == ARM64_INS_MOV && insn.ops(1).reg == CSREG_DART_THR) || 
-		(insn.id() == ARM64_INS_LDR && GetThreadLeafFunction(insn.ops(1).mem.disp) && insn.ops(1).mem.base != CSREG_DART_PP && insn.ops(1).mem.disp > TargetThreadOffset(dart::Thread::AllocateHandle_entry_point_offset())))
+	else if (arm64_patterns::IsRegisterMove(*insn.Current(), CSREG_DART_THR) ||
+		(insn.id() == ARM64_INS_LDR && arm64_patterns::MemoryOperand(*insn.Current(), 1) &&
+		GetThreadLeafFunction(insn.ops(1).mem.disp) && insn.ops(1).mem.base != CSREG_DART_PP &&
+		insn.ops(1).mem.disp > TargetThreadOffset(dart::Thread::AllocateHandle_entry_point_offset())))
 	{
 		InsnMarker marker(insn);
 		const bool provenThreadBase = insn.id() == ARM64_INS_MOV || insn.ops(1).mem.base == CSREG_DART_THR;
@@ -2003,7 +2006,7 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 				argsDescReg = CSREG_ARGS_DESC;
 			}
 
-			if (insn.id() == ARM64_INS_MOV && insn.ops(1).reg == CSREG_ARGS_DESC) {
+			if (arm64_patterns::IsRegisterMove(*insn.Current(), CSREG_ARGS_DESC)) {
 				// some function might use ARM64_REG_X1 even ARM64_REG_X0 is free
 				argsDescReg = insn.ops(0).reg;
 				//INSN_ASSERT(argsDescReg == ARM64_REG_X0 || argsDescReg == ARM64_REG_X1);
@@ -2617,7 +2620,8 @@ std::unique_ptr<MoveRegInstr> FunctionAnalyzer::processMoveRegInstr(AsmIterator&
 
 std::unique_ptr<DecompressPointerInstr> FunctionAnalyzer::processDecompressPointerInstr(AsmIterator& insn)
 {
-	if (insn.id() == ARM64_INS_ADD && insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32) {
+	if (insn.id() == ARM64_INS_ADD && insn.op_count() == 3 && insn.ops(2).type == ARM64_OP_REG &&
+		insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32) {
 		INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg);
 		const auto reg = A64::Register{ insn.ops(0).reg };
 		const auto ins0_addr = insn.address();
@@ -2891,41 +2895,7 @@ std::unique_ptr<LoadClassIdInstr> FunctionAnalyzer::processLoadClassIdInstr(AsmI
 
 std::unique_ptr<LoadTaggedClassIdMayBeSmiInstr> FunctionAnalyzer::processLoadTaggedClassIdMayBeSmiInstr(AsmIterator& insn)
 {
-	//   cidReg = SmiTaggedClassId
-	//   branchIfSmi(objReg, branchAddr)
-	//   cidReg = LoadClassIdInstr(objReg)
-	//   lsl  cidReg, cidReg, #1
-	// branchAddr:
-	auto& il = fnInfo->il_insns.back();
-	if (insn.id() == ARM64_INS_LSL && insn.ops(0).reg == insn.ops(1).reg && insn.ops(2).imm == dart::kSmiTagSize && il->Kind() == ILInstr::LoadClassId && fnInfo->il_insns.size() >= 3) {
-		auto il_loadClassId = reinterpret_cast<LoadClassIdInstr*>(il.get());
-		if (il_loadClassId->cidReg == A64::Register{ insn.ops(0).reg }) {
-			auto& il2 = fnInfo->il_insns[fnInfo->il_insns.size() - 2];
-			if (il2->Kind() == ILInstr::BranchIfSmi) {
-				auto il_branchIfSmi = reinterpret_cast<BranchIfSmiInstr*>(il2.get());
-				INSN_ASSERT(il_branchIfSmi->objReg == il_loadClassId->objReg);
-				auto& il3 = fnInfo->il_insns[fnInfo->il_insns.size() - 3];
-				INSN_ASSERT(il3->Kind() == ILInstr::LoadValue);
-				auto il_loadImm = reinterpret_cast<LoadValueInstr*>(il3.get());
-				INSN_ASSERT(il_loadImm->dstReg == il_loadClassId->cidReg);
-				INSN_ASSERT(il_loadImm->val.Storage().IsImmediate());
-				INSN_ASSERT(il_loadImm->val.ValueTypeId() == dart::kIntegerCid);
-				INSN_ASSERT(il_loadImm->val.Get<VarInteger>()->Value() == dart::Smi::RawValue(dart::kSmiCid));
-
-				// everything is OK, release all IL to cast to specific IL. Then, put them into a new IL
-				il.release();
-				il2.release();
-				il3.release();
-				++insn;
-				auto il_new = std::make_unique<LoadTaggedClassIdMayBeSmiInstr>(insn.Wrap(il_loadImm->Start()),
-					std::unique_ptr<LoadValueInstr>(il_loadImm), std::unique_ptr<BranchIfSmiInstr>(il_branchIfSmi),
-					std::unique_ptr<LoadClassIdInstr>(il_loadClassId));
-				fnInfo->il_insns.resize(fnInfo->il_insns.size() - 3);
-				return std::move(il_new);
-			}
-		}
-	}
-	return nullptr;
+	return arm64_analysis::TryTaggedClassId(insn, fnInfo->il_insns);
 }
 
 std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterator& insn)
@@ -3619,6 +3589,8 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 			++insn;
 
 			// array offset for index as register always be start of payload
+			if (insn.IsEnd() || !arm64_patterns::MemoryOperand(*insn.Current(), 1))
+				return nullptr;
 			const auto arr_data_offset = insn.ops(1).mem.disp;
 			if (insn.ops(1).mem.base != tmpReg || arr_data_offset < 8)
 				return nullptr;
@@ -3661,7 +3633,8 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 		}
 	}
 
-	if (insn.ops(1).mem.base != CSREG_DART_FP && insn.ops(1).mem.disp != 0) {
+	const auto* memory = insn.IsEnd() ? nullptr : arm64_patterns::MemoryOperand(*insn.Current(), 1);
+	if (memory && memory->mem.base != CSREG_DART_FP && memory->mem.disp != 0) {
 		// load/store with fixed offset
 		const auto arrayOp = getArrayOp(insn, insn.ops(1).mem.disp);
 		if (arrayOp.IsArrayOp()) {

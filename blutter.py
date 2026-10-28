@@ -77,10 +77,31 @@ def extract_libs_from_apk(apk_file: str, out_dir: str):
         flutter_file = os.path.join(out_dir, flutter_info.filename)
         return app_file, flutter_file
 
+def has_instructions_table_rodata(vm_path):
+    """Select the supported table/image API independently of snapshot names."""
+    with open(os.path.join(vm_path, 'object.h'), 'rb') as source:
+        objects = source.read()
+    with open(os.path.join(vm_path, 'raw_object.h'), 'rb') as source:
+        layout = source.read()
+    image_header = os.path.join(vm_path, 'image_snapshot.h')
+    if not os.path.isfile(image_header):
+        return False
+    with open(image_header, 'rb') as source:
+        image = source.read()
+    return b'kHeaderSize = kObjectStartAlignment;' in image and all(token in objects for token in (
+        b'UntaggedInstructionsTable::Data', b'rodata() const', b'EntryPointAt(',
+    )) and all(token in layout for token in (
+        b'struct DataEntry', b'uint32_t pc_offset;', b'uint32_t stack_map_offset;',
+        b'uint32_t first_entry_with_code;',
+    ))
+
+
 def find_compat_macro(dart_version: str, no_analysis: bool, sdk_key=None):
     macros = []
     include_path = os.path.join(PKG_INC_DIR, f'dartvm{sdk_key or dart_version}')
     vm_path = os.path.join(include_path, 'vm')
+    if has_instructions_table_rodata(vm_path):
+        macros.append('-DHAS_INSTRUCTIONS_TABLE_RODATA=1')
     with open(os.path.join(vm_path, 'class_id.h'), 'rb') as f:
         mm = mmap.mmap(f.fileno(), 0, access = mmap.ACCESS_READ)
         # Rename the default implementation classes of Map and Set https://github.com/dart-lang/sdk/commit/a2de36e708b8a8e15d3bd49eef2cede57e649436

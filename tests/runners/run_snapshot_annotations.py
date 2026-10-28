@@ -7,6 +7,7 @@ import shlex
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -22,7 +23,7 @@ def main():
         flags = shlex.split(subprocess.check_output(
             ['pkg-config', '--cflags', '--libs', 'capstone'], text=True))
         subprocess.run([os.environ.get('CXX', 'g++'), '-std=c++20', '-O1', '-g',
-                        '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                        '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-fno-sanitize-recover=all',
                         '-I' + str(root / 'blutter/src'),
                         str(root / 'tests/unit/snapshot_annotations_test.cpp'),
                         str(root / 'blutter/src/SnapshotCodeAnalysis.cpp'),
@@ -50,7 +51,9 @@ def main():
                 binary = temp / (str(address) + '.bin')
                 binary.write_bytes(code)
                 command.extend([hex(address), str(binary)])
-            subprocess.run(command, check=True, env=dict(os.environ, ASAN_OPTIONS='detect_leaks=1'))
+            leaks = '1' if sys.platform.startswith('linux') else '0'
+            subprocess.run(command, check=True, env=dict(os.environ,
+                ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
             passed.append(name)
             return result

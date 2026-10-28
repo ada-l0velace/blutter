@@ -41,6 +41,7 @@ public:
 		StoreStaticField,
 		WriteBarrier,
 		TestType,
+		StoreObjectPool,
 	};
 
 	ILInstr(const ILInstr&) = delete;
@@ -186,7 +187,7 @@ public:
 
 class StoreObjectPoolInstr : public ILInstr {
 public:
-	StoreObjectPoolInstr(AddrRange addrRange, A64::Register srcReg, int64_t offset) : ILInstr(LoadValue, addrRange), srcReg(srcReg), offset(offset) {}
+	StoreObjectPoolInstr(AddrRange addrRange, A64::Register srcReg, int64_t offset) : ILInstr(StoreObjectPool, addrRange), srcReg(srcReg), offset(offset) {}
 	StoreObjectPoolInstr() = delete;
 	StoreObjectPoolInstr(StoreObjectPoolInstr&&) = delete;
 	StoreObjectPoolInstr& operator=(const StoreObjectPoolInstr&) = delete;
