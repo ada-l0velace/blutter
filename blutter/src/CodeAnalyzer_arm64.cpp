@@ -5,6 +5,8 @@
 #include "DartThreadInfo.h"
 #include "Arm64Patterns.h"
 #include "Arm64GdtAnalysis.h"
+#include "Arm64Boxing.h"
+#include "Arm64Memory.h"
 #include <source_location>
 #include <unordered_set>
 
@@ -290,6 +292,7 @@ public:
 	std::unique_ptr<CheckStackOverflowInstr> processCheckStackOverflowInstr(AsmIterator& insn);
 	std::unique_ptr<CallLeafRuntimeInstr> processCallLeafRuntime(AsmIterator& insn);
 	std::unique_ptr<ILInstr> processObjectPoolInstr(AsmIterator& insn);
+	std::unique_ptr<LoadValueInstr> processComputedMemoryLoad(AsmIterator& insn);
 	std::unique_ptr<LoadValueInstr> processLoadValueNoObjectPoolInstr(AsmIterator& insn);
 	std::unique_ptr<LoadValueInstr> processLoadValueInstr(AsmIterator& insn);
 	std::unique_ptr<ClosureCallInstr> processClosureCallInstr(AsmIterator& insn);
@@ -343,12 +346,14 @@ private:
 	void printInsnException(InsnException& e);
 	void reportIssue(const AnalysisIssue& issue);
 	std::string instructionContext(uint64_t address);
+	const std::vector<uint64_t>& knownBranchTargets();
 
 	AnalyzedFnData* fnInfo;
 	DartFunction* dartFn;
 	AsmInstructions& asm_insns;
 	DartApp& app;
 	AnalysisDiagnostics& diagnostics;
+	std::optional<std::vector<uint64_t>> branchTargets;
 };
 
 typedef std::unique_ptr<ILInstr>(FunctionAnalyzer::* AsmMatcherFn)(AsmIterator& insn);
@@ -358,6 +363,7 @@ static const AsmMatcherFn matcherFns[] = {
 	(AsmMatcherFn) &FunctionAnalyzer::processAllocateStackInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processCheckStackOverflowInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processCallLeafRuntime,
+	(AsmMatcherFn) &FunctionAnalyzer::processComputedMemoryLoad,
 	(AsmMatcherFn) &FunctionAnalyzer::processObjectPoolInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processLoadValueNoObjectPoolInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processDecompressPointerInstr,
@@ -398,16 +404,25 @@ FunctionAnalyzer::ObjectPoolInstr FunctionAnalyzer::getObjectPoolInstruction(Asm
 		// special case from ARM64 because true and false are loaded from NULL instead of Object Pool
 		if (insn.ops(1).reg == CSREG_DART_NULL) {
 			// In Assembler::LoadObjectHelper() of arm64 only. load true and false from null
-			auto value = arm64_patterns::NullBoolean(*insn.Current(), CSREG_DART_NULL,
+			auto* start = insn.Current();
+			const auto remaining = std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1);
+			auto match = arm64_patterns::NullBooleanLoad(remaining, CSREG_DART_NULL,
 				dart::kTrueOffsetFromNull, dart::kFalseOffsetFromNull);
-			if (!value)
+			if (match && match->lastIndex &&
+				(app.HasFunctionAt(start[match->lastIndex].address) ||
+				 !arm64_patterns::NullBooleanLoad(remaining, CSREG_DART_NULL,
+					dart::kTrueOffsetFromNull, dart::kFalseOffsetFromNull, knownBranchTargets())))
+				match.reset();
+			if (!match)
 				throw AnalysisIssue("unsupported-null-relative-value", insn.address(),
 					"Addition from the null register is not a recognized boolean constant load.");
-			const bool val = *value;
+			const bool val = match->value;
 			auto b = new VarBoolean(val);
-			setAsmTextDataBoolean(marker.Take(), val);
+			setAsmTextDataBoolean(start[match->lastIndex].address, val);
 			dstReg = A64::Register{ insn.ops(0).reg };
+			insn.SetCurrent(start + match->lastIndex);
 			++insn;
+			marker.Take();
 			return ObjectPoolInstr{ dstReg, VarItem{ VarStorage::NewImmediate(), b } };
 		}
 
@@ -485,6 +500,15 @@ FunctionAnalyzer::ObjectPoolInstr FunctionAnalyzer::getObjectPoolInstruction(Asm
 	setAsmTextDataPool(marker.Take(), offset);
 	auto val = getPoolObject(app, offset, dstReg);
 	return ObjectPoolInstr{ dstReg, VarItem{VarStorage::NewPool((int)offset), val}, isWrite };
+}
+
+const std::vector<uint64_t>& FunctionAnalyzer::knownBranchTargets()
+{
+	if (!branchTargets) {
+		branchTargets = arm64_patterns::DirectBranchTargets(
+			std::span<const cs_insn>(asm_insns.FirstPtr(), asm_insns.Count()));
+	}
+	return *branchTargets;
 }
 
 void FunctionAnalyzer::printInsnException(InsnException& e)
@@ -2409,6 +2433,37 @@ std::unique_ptr<SetupParametersInstr> FunctionAnalyzer::processPrologueParameter
 	return std::make_unique<SetupParametersInstr>(insn.Wrap(marker.Take()), &fnInfo->params);
 }
 
+std::unique_ptr<LoadValueInstr> FunctionAnalyzer::processComputedMemoryLoad(AsmIterator& insn)
+{
+	auto* start = insn.Current();
+	const std::array<arm64_reg, 3> bases{CSREG_DART_SP, CSREG_DART_FP, CSREG_DART_THR};
+	const auto match = arm64_patterns::ComputedBaseLoad(
+		std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1), bases);
+	if (!match) return nullptr;
+	const auto& targets = knownBranchTargets();
+	if (!arm64_patterns::ComputedBaseLoad(std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1), bases, targets))
+		return nullptr;
+	for (size_t i = 1; i <= match->lastIndex; ++i)
+		if (app.HasFunctionAt(start[i].address))
+			return nullptr;
+	std::string address = match->base == CSREG_DART_THR ? "THR" : match->base == CSREG_DART_FP ? "fp" : "SP";
+	if (match->index != ARM64_REG_INVALID)
+		address += std::format(" + {}({}) * {}", match->extension == ARM64_EXT_SXTW ? "SignExtend32" : "ZeroExtend32",
+			A64::Register{match->index}.Name(), uint64_t{1} << match->shift);
+	if (match->offset)
+		address += std::format(" {} {:#x}", match->offset < 0 ? '-' : '+', match->offset < 0 ? -match->offset : match->offset);
+	if (match->base == CSREG_DART_THR && match->index == ARM64_REG_INVALID && !GetThreadOffsetName(match->offset).empty()) {
+		auto& text = fnInfo->asmTexts.AtAddr(start[match->lastIndex].address);
+		text.dataType = AsmText::ThreadOffset;
+		text.threadOffset = match->offset;
+	}
+	const auto first = insn.address();
+	insn.SetCurrent(start + match->lastIndex);
+	++insn;
+	return std::make_unique<LoadValueInstr>(insn.Wrap(first), A64::Register{match->destination},
+		VarItem{VarStorage::Immediate, new VarExpression(std::format("LoadMemory({})", address))});
+}
+
 std::unique_ptr<ILInstr> FunctionAnalyzer::processObjectPoolInstr(AsmIterator& insn)
 {
 	const auto ins0_addr = insn.address();
@@ -2459,7 +2514,9 @@ std::unique_ptr<LoadValueInstr> FunctionAnalyzer::processLoadValueNoObjectPoolIn
 		dstReg = insn.ops(0).reg;
 		++insn;
 	}
-	else if (insn.id() == ARM64_INS_EOR && insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == insn.ops(2).reg) {
+	else if (insn.id() == ARM64_INS_EOR && insn.op_count() == 3 &&
+		insn.ops(0).type == ARM64_OP_REG && insn.ops(1).type == ARM64_OP_REG && insn.ops(2).type == ARM64_OP_REG &&
+		insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == insn.ops(2).reg) {
 		dstReg = insn.ops(0).reg;
 		++insn;
 		if (dstReg.IsDecimal()) {
@@ -2659,7 +2716,7 @@ std::unique_ptr<CallInstr> FunctionAnalyzer::processCallInstr(AsmIterator& insn)
 
 std::unique_ptr<GdtCallInstr> FunctionAnalyzer::processGdtCallInstr(AsmIterator& insn)
 {
-	return arm64_analysis::TryGdtCall(insn, asm_insns, fnInfo->il_insns);
+	return arm64_analysis::TryGdtCall(insn, asm_insns, fnInfo->il_insns, &app);
 }
 
 std::unique_ptr<ReturnInstr> FunctionAnalyzer::processReturnInstr(AsmIterator& insn)
@@ -2873,6 +2930,49 @@ std::unique_ptr<LoadTaggedClassIdMayBeSmiInstr> FunctionAnalyzer::processLoadTag
 
 std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterator& insn)
 {
+	const auto startIndex = static_cast<size_t>(insn.Current() - asm_insns.FirstPtr());
+	DartFnBase* allocator = nullptr;
+	const arm64_patterns::BoxingAbi boxingAbi{CSREG_DART_SP, CSREG_DART_FP, CSREG_DART_LR,
+		CSREG_DART_PP, ToCapstoneReg(dart::AllocateMintABI::kResultReg),
+		static_cast<uint32_t>(dart::kDartAvailableCpuRegs) & ~(uint32_t{1} << dart::AllocateMintABI::kResultReg) &
+			~(uint32_t{1} << dart::AllocateMintABI::kTempReg),
+		AOT_Code_entry_point_offset[(int)dart::CodeEntryKind::kNormal] - dart::kHeapObjectTag,
+		dart::Mint::value_offset() - dart::kHeapObjectTag, dart::kSmiTagSize};
+	auto inverted = arm64_patterns::InvertedBoxInt64(
+		std::span<const cs_insn>(asm_insns.FirstPtr(), asm_insns.Count()), startIndex, boxingAbi,
+		[&](const arm64_patterns::BoxingCall& call) {
+			uint64_t target;
+			if (call.target) target = *call.target;
+			else if (call.poolOffset) {
+				auto& pool = app.GetObjectPool();
+				const auto first = dart::ObjectPool::OffsetFromIndex(0) + dart::kHeapObjectTag;
+				if (*call.poolOffset < first || (*call.poolOffset - first) % dart::kWordSize) return false;
+				const auto index = (*call.poolOffset - first) / dart::kWordSize;
+				if (index >= pool.Length() || pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject) return false;
+				auto& object = dart::Object::Handle(pool.ObjectAt(index));
+				if (!object.IsCode()) return false;
+				target = dart::Code::Cast(object).EntryPoint() - app.base();
+			}
+			else return false;
+			if (!app.HasFunctionAt(target)) return false;
+			auto* fn = app.GetFunction(target);
+			if (!fn || !fn->IsStub()) return false;
+			const auto kind = static_cast<DartStub*>(fn)->kind;
+			if (kind != DartStub::AllocateMintSharedWithoutFPURegsStub && kind != DartStub::AllocateMintSharedWithFPURegsStub) return false;
+			allocator = fn;
+			return true;
+		}, [&](uint64_t address) { return app.HasFunctionAt(address); });
+	if (inverted) {
+		const auto start = insn.address();
+		setAsmTextDataCall(asm_insns.Ptr(inverted->call.instruction)->address, allocator->Address());
+		if (inverted->call.poolOffset)
+			setAsmTextDataPool(asm_insns.Ptr(inverted->call.poolLoad)->address, *inverted->call.poolOffset);
+		insn.SetCurrent(asm_insns.Ptr(inverted->endIndex - 1));
+		++insn;
+		return std::make_unique<BoxInt64Instr>(insn.Wrap(start),
+			A64::Register{inverted->result}, A64::Register{inverted->source});
+	}
+
 	// From BoxInt64Instr::EmitNativeCode()
 	// Note: without compressed pointer, start instruction is "adds"
 	// 0x21c5e8: sbfiz  x0, x2, #1, #0x1f

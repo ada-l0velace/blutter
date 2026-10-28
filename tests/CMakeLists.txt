@@ -30,6 +30,15 @@ target_include_directories(analysis_diagnostics_test PRIVATE "${BLUTTER_SOURCE_D
 
 add_test(NAME arm64_analyzer COMMAND arm64_analyzer_test)
 add_test(NAME arm64_decoder COMMAND arm64_decoder_test)
+add_executable(arm64_boxing_test integration/arm64_boxing_test.cpp
+    "${BLUTTER_SOURCE_DIR}/Disassembler.cpp"
+    "${BLUTTER_SOURCE_DIR}/Disassembler_arm64.cpp")
+target_include_directories(arm64_boxing_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(arm64_boxing_test PRIVATE ${DARTLIB} capstone)
+target_compile_definitions(arm64_boxing_test PRIVATE ${defines})
+target_compile_options(arm64_boxing_test PRIVATE ${cc_opts})
+target_precompile_headers(arm64_boxing_test PRIVATE "${BLUTTER_SOURCE_DIR}/pch.h")
+add_test(NAME arm64_boxing COMMAND arm64_boxing_test)
 add_test(NAME arm64_patterns COMMAND arm64_patterns_test)
 add_test(NAME analysis_diagnostics COMMAND analysis_diagnostics_test)
 

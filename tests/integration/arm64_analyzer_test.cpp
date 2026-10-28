@@ -228,6 +228,33 @@ static void RawExportPreservesUndecodableWords()
 	Check(rejected, "empty raw export is invalid");
 }
 
+static void MaskedDispatchConstant()
+{
+	const uint64_t value = static_cast<uint64_t>(int64_t{-32});
+	const auto masked = value ^ 0x00ff00ff00ff00ffULL ^ 0x0000ffff0000ffffULL;
+	std::vector<uint32_t> words;
+	for (unsigned half = 0; half < 4; ++half)
+		words.push_back((half ? 0xf2800000u : 0xd2800000u) | (half << 21) |
+			(static_cast<uint32_t>((masked >> (half * 16)) & 0xffff) << 5) | 17);
+	words.insert(words.end(), {0xd2009e31, 0xd2003e31, Add(30, 0, 0x80),
+		0x8b1103de, Add(30, 30, 0x80, true), Load(), Call, Ret});
+	Fixture fixture(words, 6);
+	for (size_t i = 0; i < 6; ++i)
+		fixture.il.push_back(std::make_unique<UnknownInstr>(fixture.instructions.Ptr(i), fixture.texts[i]));
+	auto match = fixture.Try();
+	Check(match && match->Start() == Base && match->End() == Base + 44, "masked constant included in proven dispatch span");
+	Check(match->ToString().find("-0x20") != std::string::npos, "masked dispatch index value");
+	Check(fixture.il.size() == 1 && fixture.il.front()->End() == Base, "only consumed constant IL removed");
+	Check(fixture.cursor.address() == Base + 44, "masked dispatch commits the complete call");
+
+	// A known branch into the consumer must preserve every producer node and the cursor.
+	words.insert(words.begin(), 0x14000007);
+	Fixture joined(words, 7);
+	for (size_t i = 0; i < 7; ++i)
+		joined.il.push_back(std::make_unique<UnknownInstr>(joined.instructions.Ptr(i), joined.texts[i]));
+	RejectUnchanged(joined, "masked constant cannot cross an incoming branch");
+}
+
 int main(int argc, char** argv)
 {
 	try {
@@ -286,6 +313,7 @@ int main(int argc, char** argv)
 		FallbackScan();
 		UnsupportedDispatchPreservesState();
 		RawExportPreservesUndecodableWords();
+		MaskedDispatchConstant();
 	}
 	catch (const AnalysisStopped& error) {
 		std::cerr << error.what() << '\n';

@@ -4,6 +4,9 @@ set(SRCS
     Arm64GdtAnalysis.cpp
     Arm64GdtAnalysis.h
     Arm64Patterns.h
+    Arm64Boxing.h
+    Arm64Constants.h
+    Arm64Memory.h
     CodeAnalyzer.cpp
     CodeAnalyzer.h
     CodeAnalyzer_arm64.cpp

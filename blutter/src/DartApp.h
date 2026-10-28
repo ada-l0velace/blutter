@@ -23,6 +23,8 @@ public:
 
 	DartClass* GetClass(intptr_t cid);
 	DartFnBase* GetFunction(uint64_t addr);
+	// Exact registered entries only; this query never splits an existing stub range.
+	bool HasFunctionAt(uint64_t addr) const { return functions.contains(addr) || stubs.contains(addr); }
 	DartField* GetStaticField(intptr_t offset) { return staticFields.at(offset); }
 
 	dart::ObjectPool& GetObjectPool() { return *ppool; }
