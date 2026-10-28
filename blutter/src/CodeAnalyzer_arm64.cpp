@@ -3,6 +3,7 @@
 #include "DartApp.h"
 #include "VarValue.h"
 #include "DartThreadInfo.h"
+#include "Arm64Patterns.h"
 #include <source_location>
 #include <unordered_set>
 
@@ -392,18 +393,11 @@ FunctionAnalyzer::ObjectPoolInstr FunctionAnalyzer::getObjectPoolInstruction(Asm
 		// special case from ARM64 because true and false are loaded from NULL instead of Object Pool
 		if (insn.ops(1).reg == CSREG_DART_NULL) {
 			// In Assembler::LoadObjectHelper() of arm64 only. load true and false from null
-			ASSERT(insn.ops(2).type == ARM64_OP_IMM);
-			const auto offset = insn.ops(2).imm;
-			bool val;
-			if (offset == dart::kTrueOffsetFromNull) {
-				val = true;
-			}
-			else if (offset == dart::kFalseOffsetFromNull) {
-				val = false;
-			}
-			else {
-				FATAL("add from NULL_REG");
-			}
+			auto value = arm64_patterns::NullBoolean(*insn.Current(), CSREG_DART_NULL,
+				dart::kTrueOffsetFromNull, dart::kFalseOffsetFromNull);
+			if (!value)
+				return {};
+			const bool val = *value;
 			auto b = new VarBoolean(val);
 			setAsmTextDataBoolean(marker.Take(), val);
 			dstReg = A64::Register{ insn.ops(0).reg };
@@ -709,7 +703,8 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 					continue;
 				}
 				else {
-					INSN_ASSERT(il);
+					// An offset alone does not prove this is a runtime call.
+					return nullptr;
 				}
 			}
 			if (il->srcReg == A64::Register::FP) {
@@ -2645,65 +2640,40 @@ std::unique_ptr<CallInstr> FunctionAnalyzer::processCallInstr(AsmIterator& insn)
 
 std::unique_ptr<GdtCallInstr> FunctionAnalyzer::processGdtCallInstr(AsmIterator& insn)
 {
-	// https://mrale.ph/dartvm/#global-dispatch-table-gdt
-	// FlowGraphCompiler::EmitDispatchTableCall()
-	//     const intptr_t offset = selector_offset - DispatchTable::kOriginElement;
-	//     __ AddImmediate(LR, cid_reg, offset);
-	//   so it might be addition depended on selector offset (but most of them is subtraction)
-	// 0x26de04: sub  x30, x0, #0xfda
-	// 0x26de08: ldr  x30, [x21, x30, lsl #3]
-	// 0x26de0c: blr  x30
-	//   or
-	// 0x220284: movz  x17, #0x1545  ; an extra instruction when offset is larger than 0x1000
-	// 0x220288: add  x30, x0, x17
-	// 0x22028c: ldr  x30, [x21, x30, lsl #3]
-	// 0x220290: blr  x30
-	if (insn.ops(0).reg == CSREG_DART_LR && (insn.id() == ARM64_INS_ADD || insn.id() == ARM64_INS_SUB) &&
-		insn.ops(1).reg == ToCapstoneReg(dart::DispatchTableNullErrorABI::kClassIdReg))
-	{
-		// this is GDT call
-		auto insn0_addr = insn.address();
-		int64_t offset = 0;
-
-		if (insn.ops(2).type == ARM64_OP_IMM) {
-			//cidReg = insn.ops(1).reg;
-			offset = insn.ops(2).imm;
-			if (insn.ops(2).shift.type != ARM64_SFT_INVALID) {
-				ASSERT(insn.ops(2).shift.type == ARM64_SFT_LSL);
-				offset <<= insn.ops(2).shift.value;
+	// Fold only proven index arithmetic and commit iterator/IL changes after the full call matches.
+	auto* current = insn.Current();
+	std::optional<int64_t> tmpValue;
+	LoadValueInstr* previousLoad = nullptr;
+	if (!fnInfo->il_insns.empty() && current > asm_insns.FirstPtr()) {
+		auto* previousAsm = current - 1;
+		if (previousAsm->id == ARM64_INS_NOP && previousAsm > asm_insns.FirstPtr())
+			--previousAsm;
+		auto* previous = fnInfo->LastIL();
+		// A store currently shares the LoadValue kind; require a constant-producing opcode before casting.
+		const bool constantWriter = previousAsm->id == ARM64_INS_MOV || previousAsm->id == ARM64_INS_MOVZ ||
+			previousAsm->id == ARM64_INS_MOVK || previousAsm->id == ARM64_INS_MOVN ||
+			previousAsm->id == ARM64_INS_ORR || previousAsm->id == ARM64_INS_EOR;
+		if (constantWriter && previous->Kind() == ILInstr::LoadValue && previous->End() == insn.address()) {
+			auto* load = static_cast<LoadValueInstr*>(previous);
+			if (load->dstReg == A64::TMP2_REG && load->val.Storage().IsImmediate() && load->val.Value() &&
+				load->val.Value()->RawTypeId() == dart::kIntegerCid && load->val.Value()->HasValue()) {
+				tmpValue = load->val.Get<VarInteger>()->Value();
+				previousLoad = load;
 			}
-			if (insn.id() == ARM64_INS_SUB)
-				offset = -offset;
-			++insn;
 		}
-		else {
-			// from reg
-			INSN_ASSERT(insn.id() == ARM64_INS_ADD);
-			INSN_ASSERT(insn.ops(2).type == ARM64_OP_REG && insn.ops(2).reg == CSREG_DART_TMP2);
-
-			auto il_loadImm = reinterpret_cast<LoadValueInstr*>(fnInfo->LastIL());
-			INSN_ASSERT(il_loadImm->val.Storage().IsImmediate());
-			INSN_ASSERT(il_loadImm->dstReg == A64::TMP2_REG);
-			offset = il_loadImm->val.Get<VarInteger>()->Value();
-			insn0_addr = il_loadImm->Start();
-			fnInfo->RemoveLastIL();
-			++insn;
-		}
-		//const auto selector_offset = dart::DispatchTable::kOriginElement + offset;
-
-		INSN_ASSERT(insn.id() == ARM64_INS_LDR);
-		INSN_ASSERT(insn.ops(0).reg == CSREG_DART_LR);
-		ASSERT(insn.ops(1).mem.base == CSREG_DART_DISPATCH_TABLE && insn.ops(1).mem.index == CSREG_DART_LR && insn.ops(1).shift.value == 3);
-		++insn;
-
-		INSN_ASSERT(insn.id() == ARM64_INS_BLR);
-		INSN_ASSERT(insn.ops(0).reg == CSREG_DART_LR);
-		++insn;
-
-		return std::make_unique<GdtCallInstr>(insn.Wrap(insn0_addr), offset);
 	}
-
-	return nullptr;
+	auto match = arm64_patterns::GdtCall(
+		std::span<const cs_insn>(current, asm_insns.LastPtr() - current + 1),
+		ToCapstoneReg(dart::DispatchTableNullErrorABI::kClassIdReg), CSREG_DART_DISPATCH_TABLE,
+		CSREG_DART_TMP2, tmpValue);
+	if (!match)
+		return nullptr;
+	const auto start = match->usesTemporary ? previousLoad->Start() : insn.address();
+	if (match->usesTemporary)
+		fnInfo->RemoveLastIL();
+	insn.SetCurrent(current + match->callIndex);
+	++insn;
+	return std::make_unique<GdtCallInstr>(insn.Wrap(start), match->offset);
 }
 
 std::unique_ptr<ReturnInstr> FunctionAnalyzer::processReturnInstr(AsmIterator& insn)
@@ -2845,33 +2815,32 @@ std::unique_ptr<BranchIfSmiInstr> FunctionAnalyzer::processBranchIfSmiInstr(AsmI
 
 std::unique_ptr<LoadClassIdInstr> FunctionAnalyzer::processLoadClassIdInstr(AsmIterator& insn)
 {
+	InsnMarker marker(insn);
 	if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == -1 && kUntaggedObjectClassIdTagPos == 12) {
 		// 0x21cb10: ldur  x1, [x0, #-1]  ; load object tag
 		const auto objReg = A64::Register{ insn.ops(1).mem.base };
 		const auto cidReg = insn.ops(0).reg;
-		const auto ins0_addr = insn.address();
 		++insn;
 
 		// Assembler::ExtractClassIdFromTags()
 		// 0x21cb14: ubfx  x1, x1, #0xc, #0x14  ; extract object class id
-		INSN_ASSERT(insn.id() == ARM64_INS_UBFX);
-		INSN_ASSERT(insn.ops(0).reg == cidReg);
-		INSN_ASSERT(insn.ops(1).reg == cidReg);
-		INSN_ASSERT(insn.ops(2).imm == kUntaggedObjectClassIdTagPos);
-		INSN_ASSERT(insn.ops(3).imm == dart::UntaggedObject::kClassIdTagSize);
+		if (insn.id() != ARM64_INS_UBFX || insn.op_count() != 4 ||
+			insn.ops(0).reg != cidReg || insn.ops(1).reg != cidReg ||
+			insn.ops(2).imm != kUntaggedObjectClassIdTagPos ||
+			insn.ops(3).imm != dart::UntaggedObject::kClassIdTagSize)
+			return nullptr;
 		++insn;
 
-		return std::make_unique<LoadClassIdInstr>(insn.Wrap(ins0_addr), objReg, A64::Register{cidReg});
+		return std::make_unique<LoadClassIdInstr>(insn.Wrap(marker.Take()), objReg, A64::Register{cidReg});
 	}
 	else if (insn.id() == ARM64_INS_LDURH && insn.ops(1).mem.disp == 1 && kUntaggedObjectClassIdTagPos == 16) {
 		// https://github.com/dart-lang/sdk/commit/9182d5e5359988703a2b8a88c238f47a5295e18c
 		// 0x5f3900: ldurh  w3, [x0, #1]
 		const auto objReg = A64::Register{ insn.ops(1).mem.base };
 		const auto cidReg = insn.ops(0).reg;
-		const auto ins0_addr = insn.address();
 		++insn;
 
-		return std::make_unique<LoadClassIdInstr>(insn.Wrap(ins0_addr), objReg, A64::Register{cidReg});
+		return std::make_unique<LoadClassIdInstr>(insn.Wrap(marker.Take()), objReg, A64::Register{cidReg});
 	}
 	return nullptr;
 }
@@ -2935,7 +2904,8 @@ std::unique_ptr<BoxInt64Instr> FunctionAnalyzer::processBoxInt64Instr(AsmIterato
 			// branch if integer value is fit in 31 bits
 			++insn;
 
-			INSN_ASSERT(insn.id() == ARM64_INS_B && insn.cc() == ARM64_CC_EQ);
+			if (!insn.IsBranch(ARM64_CC_EQ))
+				return nullptr;
 			const auto contAddr = insn.ops(0).imm;
 			++insn;
 
