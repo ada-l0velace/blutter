@@ -69,6 +69,93 @@ python3 blutter.py path/to/app/lib/arm64-v8a out_dir --rebuild
 - **objs.txt** complete (nested) dump of Object from Object Pool
 - **pp.txt** all Dart objects in Object Pool
 
+On supported instructions-table snapshots, **asm/snapshot_code.asm** contains
+the complete native payload inventory and **snapshot_calls.json** records calls,
+jumps, and pool/thread references. Format 2 adds:
+
+- `via_kind: "pool_code_entry"`: a pool load followed by an entry-field load
+  from a typed Code object. `via_field_offset` identifies the tagged-pointer
+  displacement; `snapshot_target` is the ELF VA from matched SDK metadata.
+  `target` stays null because runtime patching has not been ruled out.
+- `via_kind: "dispatch_table"`: an indexed load from the matched ARM64 dispatch
+  register. `index_register` names the index at the load, scaled by eight;
+  `via_offset` is the byte displacement. The callee remains unresolved.
+- `register_constants`: known physical X-register bit patterns immediately
+  before a call. `bits` is a hexadecimal string, including zero extension from
+  W writes. `proof` lists producer instruction VAs. These observations do not
+  establish argument counts, types, liveness, or stack arguments.
+
+Facts stop at calls, branches, returns, and known incoming targets. Unknown
+writes discard affected values, and constant proofs have a 64-producer bound.
+Missing facts mean unknown, not absence of an argument or call.
+
+Format 3 additionally exports `dispatch_table`, with the SDK's register bias,
+normalized entries, null-error target, and original compressed stream location.
+Dispatch edges contain a `dispatch` record: known signed index, physical table
+index, resolution status, or an unresolved bitfield-plus-offset expression.
+Arithmetic uses ARM64 register widths; facts are captured at the table load.
+Known indices produce a `snapshot_target`, including explicit null-error entries.
+The runtime may patch the table, so the ordinary indirect `target` stays null.
+
+An extracted class-ID bitfield does not establish the receiver's class. Selector
+rows can overlap in Dart's compressed table. Unknown indices remain unresolved;
+the exporter does not enumerate an entire row as possible callees. A captured
+index or extracted value can be queried explicitly:
+
+```
+python3 scripts/query_dispatch.py out_dir/snapshot_calls.json --site 0x1000 --index=-4
+python3 scripts/query_dispatch.py out_dir/snapshot_calls.json --site 0x1000 --extracted-value 42
+```
+
+These are illustrative addresses/values. The query reports that supplied values
+are observations from the caller; it does not modify the graph or validate them.
+
+Focused validation requires a C++20 compiler, Capstone, and LLVM's `llvm-mc`:
+
+```
+python3 tests/runners/run_snapshot_annotations.py
+python3 tests/runners/run_snapshot_annotations.py --memcheck
+python3 scripts/check_snapshot_annotations.py path/to/libapp.so out_dir --log reader.log --vm-audit vm-audit.json
+```
+
+The first command uses ASan/UBSan (and leak checking on Linux); the second uses
+ordinary binaries under Valgrind. The checker validates emitted facts against
+original ELF instructions and separate exports. It does not independently prove
+SDK layouts or runtime behavior.
+For dispatch stream checks, collect `vm-audit.json` by setting
+`BLUTTER_COVERAGE_AUDIT=vm-audit.json` when running the native reader. The checker
+decodes the original root-unit stream and compares every entry; retained Code
+entry points are cross-checked through the separate VM numerical audit. Deferred
+unit dispatch updates are not validated by this checker.
+
+Format 4 adds `static_dispatch`, a separate bounded analysis of the known normal
+control flow. It propagates snapshot pool-object classes, typed allocation-stub
+results, class-ID extraction, constants and register copies. Equality guards can
+refine a class-ID value; a merge keeps a fact only when every incoming path
+supports it. W comparisons do not invent the upper bits of an unknown X value.
+Unknown calls discard register facts, while metadata-identified allocation calls
+define their ABI result class. Unknown memory writes invalidate object/header
+facts. Stack slots, implicit exception entries and interprocedural parameter
+types are not analyzed. Payloads with unknown indirect jumps are skipped.
+
+`receiver_metadata` exports the typed inputs and known entries.
+`receiver_certificates` records block-entry invariants for payloads with a
+resolution. The checker independently checks each incoming edge and original
+instruction against those invariants; it does not repeat the native worklist
+solver. Fact tuples are `[register, kind, value_hex, auxiliary_hex, origin_hex]`.
+Kinds are 0 unknown, 1 exact word, 2 unsigned upper bound, 3 heap-object class,
+4 header class bits, 5 pool address, 6 dispatch address, and 7 loaded dispatch
+target, and 8 managed-stack address. The latter tracks ABI SP/FP aliases and
+bounded frame offsets for store checks, without recovering stack-slot values.
+Register numbers denote X registers. Certificates are normal-flow facts
+under the matched ABI and snapshot metadata, not proofs about runtime patching.
+
+The pass is limited to 16,384 instructions, 1,024 blocks, 1,000,000 transfer
+steps per payload, and 128 supporting instruction addresses per fact. A limit
+or unsupported indirect jump yields no new receiver resolution. No observations
+from runtime traces are used as static inputs. Pool classes and allocation
+contracts are cross-checked through separate VM audit fields.
+
 
 ## Directories
 - **bin** contains blutter executables for each Dart version in "blutter_dartvm\<ver\>\_\<os\>\_\<arch\>" format

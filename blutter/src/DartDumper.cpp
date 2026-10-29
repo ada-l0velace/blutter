@@ -102,8 +102,10 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	class FunctionVisitor : public dart::ObjectVisitor {
 	public:
 		std::vector<dart::FunctionPtr> functions;
+		std::vector<dart::CodePtr> codes;
 		void VisitObject(dart::ObjectPtr object) override {
 			if (object->IsFunction()) functions.push_back(dart::Function::RawCast(object));
+			if (object->IsCode()) codes.push_back(dart::Code::RawCast(object));
 		}
 	} visitor;
 	dart::HeapIterationScope iteration(thread);
@@ -115,6 +117,23 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		const auto& code = dart::Code::Handle(zone, fn.CurrentCode());
 		of << std::format("{{\"entry\":{},\"unknown_code\":{},\"has_code\":{}}}",
 			fn.entry_point() - app.base(), code.IsUnknownDartCode() ? "true" : "false", fn.HasCode() ? "true" : "false");
+	}
+	of << "],\"pool_heap_classes\":[";
+	comma = false;
+	const auto& pool = app.GetObjectPool();
+	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
+		const auto& object = dart::Object::Handle(zone, pool.ObjectAt(i));
+		if (!object.IsSmi()) { if (comma) of << ','; comma = true; of << '[' << i << ',' << object.GetClassId() << ']'; }
+	}
+	of << "],\"class_allocations\":[";
+	comma = false;
+	for (const auto ptr : visitor.codes) {
+		const auto& code = dart::Code::Handle(zone, ptr);
+		const auto& owner = dart::Object::Handle(zone, code.owner());
+		if (owner.IsClass()) {
+			if (comma) of << ','; comma = true;
+			of << '[' << code.EntryPoint() - app.base() << ',' << dart::Class::Cast(owner).id() << ']';
+		}
 	}
 	of << "]}\n";
 }
@@ -595,6 +614,52 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 #endif
 	SnapshotAnalysis::Profile profile{profileName, ARM64_REG_X27, ARM64_REG_X26,
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
+	profile.dispatchRegister = ARM64_REG_X21;
+	profile.dispatchOrigin = dart::DispatchTable::kOriginElement;
+	profile.classIdShift = dart::UntaggedObject::ClassIdTag::shift();
+	profile.classIdBits = dart::UntaggedObject::ClassIdTag::bitsize();
+	profile.headerDisplacement = dart::Object::tags_offset() - dart::kHeapObjectTag;
+	profile.nullRegister = ARM64_REG_X22;
+	profile.nullClassId = dart::kNullCid;
+	profile.poolHeapClass = [&](int64_t index) -> std::optional<uint32_t> {
+		if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject) return {};
+		const auto& object = dart::Object::Handle(pool.ObjectAt(index));
+		if (object.IsSmi()) return {};
+		return static_cast<uint32_t>(object.GetClassId());
+	};
+	static_assert(dart::NULL_REG == dart::R22 && dart::AllocateObjectABI::kResultReg == dart::R0);
+	for (const auto& [entry, stub] : app.stubs) if (stub->kind == DartStub::AllocateUserObjectStub) {
+		const auto& code = dart::Code::Handle(stub->ptr);
+		const auto& owner = dart::Object::Handle(code.owner());
+		if (owner.IsClass() && code.EntryPoint() >= codeStart && code.EntryPoint() < imageEnd)
+			profile.allocationReturns.emplace(entry, static_cast<uint32_t>(dart::Class::Cast(owner).id()));
+	}
+	if (const auto* dispatch = thread->isolate_group()->dispatch_table(); dispatch &&
+		dispatch->length() >= profile.dispatchOrigin && dispatch->length() <= (1 << 24)) {
+		const auto* array = dispatch->ArrayOrigin() - profile.dispatchOrigin;
+		const auto vmStart = reinterpret_cast<uintptr_t>(app.vm_snapshot_instructions);
+		const auto vmSize = vmStart ? *reinterpret_cast<const uintptr_t*>(vmStart) : 0;
+		auto normalize = [&](uintptr_t value) -> std::optional<uint64_t> {
+			if ((value & 3) != 0) return {};
+			if ((value >= codeStart && value < imageEnd) ||
+				(vmSize > codeOffset && vmSize <= UINTPTR_MAX - vmStart && value >= vmStart + codeOffset && value < vmStart + vmSize))
+				return value - app.base();
+			return {};
+		};
+		for (intptr_t i = 0; i < dispatch->length(); ++i)
+			profile.dispatchEntries.push_back(normalize(array[i]));
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+		profile.dispatchNullTarget = normalize(dart::StubCode::DispatchTableNullError().EntryPoint());
+#else
+		profile.dispatchNullTarget = normalize(dart::Code::EntryPointOf(thread->isolate_group()->object_store()->dispatch_table_null_error_stub()));
+#endif
+		const auto snapshot = reinterpret_cast<uintptr_t>(thread->isolate_group()->dispatch_table_snapshot());
+		const auto size = thread->isolate_group()->dispatch_table_snapshot_size();
+		if (snapshot >= app.base() && size > 0 && size <= (1 << 27)) {
+			profile.dispatchSnapshotAddress = snapshot - app.base();
+			profile.dispatchSnapshotSize = size;
+		}
+	}
 	for (const auto& [offset, name] : GetThreadOffsetsMap())
 		if (!name.empty()) profile.threadFields.emplace(offset, name);
 	profile.describePoolSlot = [&](int64_t index) -> SnapshotAnalysis::PoolSlot {
@@ -602,7 +667,29 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		case dart::ObjectPool::EntryType::kTaggedObject: {
 			auto& obj = dart::Object::Handle(pool.ObjectAt(index));
 			if (obj.IsUnlinkedCall()) return {"unlinked_call", "UnlinkedCall: target unresolved"};
-			return {"tagged_object", ObjectToString(obj, false)};
+			// Rendering nested objects reuses its input handle. Keep the typed
+			// snapshot object separate from that mutable presentation scratch.
+			auto& display = dart::Object::Handle(obj.ptr());
+			SnapshotAnalysis::PoolSlot slot{"tagged_object", ObjectToString(display, false)};
+			if (obj.IsCode()) {
+				const auto& code = dart::Code::Cast(obj);
+				auto addEntry = [&](dart::Code::EntryKind kind, uintptr_t address) {
+					// Accept only instruction-image VAs; never export reader heap
+					// pointers or the placeholder at the start of an image.
+					bool inCode = address >= codeStart && address < imageEnd;
+					if (app.vm_snapshot_instructions) {
+						const auto vmStart = reinterpret_cast<uintptr_t>(app.vm_snapshot_instructions);
+						const auto vmSize = *reinterpret_cast<const uintptr_t*>(vmStart);
+						if (vmSize > codeOffset && vmSize <= UINTPTR_MAX - vmStart)
+							inCode |= address >= vmStart + codeOffset && address < vmStart + vmSize;
+					}
+					if (inCode && (address & 3) == 0)
+						slot.entryPoints.emplace(dart::Code::entry_point_offset(kind) - dart::kHeapObjectTag, address - app.base());
+				};
+				addEntry(dart::Code::EntryKind::kNormal, code.EntryPoint());
+				addEntry(dart::Code::EntryKind::kUnchecked, code.UncheckedEntryPoint());
+			}
+			return slot;
 		}
 		case dart::ObjectPool::EntryType::kImmediate: {
 			const auto value = pool.RawValueAt(index);

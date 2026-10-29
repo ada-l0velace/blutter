@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import re
 import struct
+from functools import lru_cache
 from dataclasses import dataclass
 
 import capstone as cs
@@ -78,12 +79,109 @@ def branch(word, pc):
     return None
 
 
+def constant_move(word):
+    """Decode move producers from original words, independently of Capstone aliases."""
+    bits = 64 if word >> 31 else 32
+    mask = (1 << bits) - 1
+    if word & 0x1f800000 == 0x12800000:
+        op, shift, immediate = (word >> 29) & 3, ((word >> 21) & 3) * 16, (word >> 5) & 0xffff
+        if shift >= bits or op == 1:
+            return None
+        value = immediate << shift
+        return ('keep' if op == 3 else 'literal', word & 31, bits,
+                (value, 0xffff << shift) if op == 3 else (~value if op == 0 else value) & mask)
+    if word & 0x7fe0ffe0 == 0x2a0003e0:  # ORR Rd, ZR, Rm (MOV register)
+        return 'copy', word & 31, bits, (word >> 16) & 31
+    if word & 0x7f8003e0 == 0x320003e0:  # ORR Rd, ZR, bitmask (MOV immediate)
+        n, r, s = (word >> 22) & 1, (word >> 16) & 63, (word >> 10) & 63
+        length = ((n << 6) | (~s & 63)).bit_length() - 1
+        if length < 1 or (bits == 32 and n):
+            return None
+        size, levels = 1 << length, (1 << length) - 1
+        r, s = r & levels, s & levels
+        if s == levels:
+            return None
+        element = (1 << (s + 1)) - 1
+        element = ((element >> r) | (element << (size - r))) & ((1 << size) - 1)
+        return 'literal', word & 31, bits, sum(element << shift for shift in range(0, bits, size))
+    return None
+
+
+def integer_operation(word):
+    """Unshifted ADD/SUB and extracting UBFM encodings, from original words."""
+    bits, destination = (64 if word >> 31 else 32), word & 31
+    if word & 0x1f000000 == 0x11000000 and not word & (1 << 29):
+        left = (word >> 5) & 31
+        if left == 31 or destination == 31:  # SP is not a known zero register
+            return None
+        return ('sub' if word & (1 << 30) else 'add', destination, bits,
+                (left, 'immediate', ((word >> 10) & 0xfff) << (12 if word & (1 << 22) else 0)))
+    if word & 0x1f200000 == 0x0b000000 and not word & (1 << 29):
+        if (word >> 22) & 3 or (word >> 10) & 63:
+            return None
+        return ('sub' if word & (1 << 30) else 'add', destination, bits,
+                ((word >> 5) & 31, 'register', (word >> 16) & 31))
+    if word & 0x7f800000 == 0x53000000 and ((word >> 22) & 1) == (bits == 64):
+        lsb, last = (word >> 16) & 63, (word >> 10) & 63
+        if lsb <= last < bits:
+            return 'extract', destination, bits, ((word >> 5) & 31, lsb, last - lsb + 1)
+    return None
+
+
+def decode_dispatch_table(raw, code_entries, null_target, max_entries=1 << 24):
+    """Bounded root-unit Dart dispatch stream reader; no runtime/reader pointers."""
+    cursor = 0
+
+    def integer(marker):
+        nonlocal cursor
+        value = 0
+        for shift in range(0, 70, 7):
+            assert cursor < len(raw), 'Truncated dispatch integer'
+            byte = raw[cursor]
+            cursor += 1
+            if byte >= 128:
+                value |= (byte - marker) << shift
+                assert -(1 << 63) <= value < (1 << 64), 'Dispatch integer overflow'
+                return value
+            value |= byte << shift
+        raise AssertionError('Overlong dispatch integer')
+
+    length = integer(128)
+    assert 0 <= length <= max_entries, 'Dispatch table length limit'
+    if length == 0:
+        assert cursor == len(raw)
+        return []
+    assert integer(128) >= 0  # first Code cluster reference, unused for root indices
+    entries, recent, next_recent, previous = [], [None] * 64, 0, None
+    while len(entries) < length:
+        encoded = integer(192)
+        if encoded == 0:
+            previous = null_target
+        elif encoded < 0:
+            assert 0 <= ~encoded < 64 and recent[~encoded] is not None, 'Invalid recent dispatch entry'
+            previous = recent[~encoded]
+        elif encoded < 64:
+            assert previous is not None and len(entries) + encoded <= length, 'Invalid dispatch repeat'
+            entries.extend([previous] * encoded)
+            continue
+        else:
+            index = encoded - 65  # serialized code index is one-based
+            assert 0 <= index < len(code_entries), 'Invalid dispatch Code index'
+            previous = code_entries[index]
+            recent[next_recent] = previous
+            next_recent = (next_recent + 1) % 64
+        entries.append(previous)
+    assert cursor == len(raw), 'Trailing dispatch data'
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('libapp', type=Path)
     parser.add_argument('output', type=Path)
     parser.add_argument('--log', type=Path, required=True,
                         help='Reader log with load address, used to check relocation normalization')
+    parser.add_argument('--vm-audit', type=Path, help='Separate VM numerical audit for retained Code dispatch entries')
     args = parser.parse_args()
     raw = args.libapp.read_bytes()
     with args.libapp.open('rb') as stream:
@@ -97,15 +195,31 @@ def main():
         raise AssertionError(f'Unmapped span {address:#x}')
 
     graph = json.loads((args.output / 'snapshot_calls.json').read_text())
+    audit_data = json.loads(args.vm_audit.read_text()) if args.vm_audit else None
     load_base = int(re.search(r'^libapp is loaded at (0x[0-9a-f]+)$', args.log.read_text(), re.M)[1], 16)
     manifest = json.loads((args.output / 'snapshot_code.json').read_text())
     nodes, profile = graph['nodes'], graph['profile']
+    pool_catalog = {row['index']: row for row in graph['pool_catalog']}
     count = manifest['table_length']
     records = struct.iter_unpack('<II', read(manifest['table_data_address'] + 16, 8 * count))
     starts = [manifest['image_start'] + pc for pc, _ in records]
     ends = starts[1:] + [manifest['image_end']]
     assert [(n['start'], n['end']) for n in nodes] == list(zip(starts, ends))
     assert all(n['decoded'] for n in nodes), 'Partially decoded payload; cannot claim complete graph'
+    dispatch = graph.get('dispatch_table', {'entries': [], 'origin': 0})
+    if dispatch['entries']:
+        assert args.vm_audit, 'Dispatch validation requires --vm-audit (BLUTTER_COVERAGE_AUDIT)'
+        audit = audit_data['tables']
+        assert len(audit) == 1 and audit[0]['count'] == count
+        code_entries = []
+        for i, entry in enumerate(audit[0]['entries']):
+            assert entry['index'] == i and entry['entry'] == starts[i]
+            code_entries.append(entry.get('code_entry', starts[i]))
+        decoded = decode_dispatch_table(read(dispatch['snapshot_address'], dispatch['snapshot_size']), code_entries, dispatch['null_target'])
+        assert decoded == dispatch['entries'], 'Dispatch entries differ from original compressed stream'
+        assert dispatch['origin'] == 4096, 'Unexpected matched ARM64 dispatch bias'
+        for target in decoded:
+            assert target is None or (target % 4 == 0 and len(read(target, 4)) == 4)
 
     def node_at(address):
         index = bisect.bisect_right(starts, address) - 1
@@ -185,6 +299,8 @@ def main():
         def address_origin(index, register, displacement):
             proof = []
             roots = {profile['pool_register']: 'pool', profile['thread_register']: 'thread'}
+            if profile.get('dispatch_register'):
+                roots[profile['dispatch_register']] = 'dispatch_table'
             cursor = index
             while register not in roots:
                 assert instructions[cursor].address not in entries, 'Alias crosses known entry'
@@ -209,6 +325,93 @@ def main():
             assert register not in roots_written, 'Assumed ABI root is overwritten'
             return roots[register], displacement, list(reversed(proof))
 
+        @lru_cache(maxsize=None)
+        def constant_before(index, register, budget=64):
+            if not budget:
+                return None
+            cursor = index
+            while cursor:
+                if instructions[cursor].address in entries:
+                    return None
+                cursor -= 1
+                ins = instructions[cursor]
+                if any(ins.group(g) for g in (cs.CS_GRP_JUMP, cs.CS_GRP_CALL, cs.CS_GRP_RET)):
+                    return None
+                if register not in writes[cursor]:
+                    continue
+                word = int.from_bytes(ins.bytes, 'little')
+                producer = constant_move(word) or integer_operation(word)
+                if producer is None:
+                    return None
+                kind, destination, bits, value = producer
+                assert register == f'x{destination}'
+                proof = []
+                if kind in ('add', 'sub', 'extract'):
+                    source = value[0]
+                    left = (0, []) if source == 31 else constant_before(cursor, f'x{source}', budget - 1)
+                    if left is None:
+                        return None
+                    old, proof = left
+                    if kind == 'extract':
+                        value = (old >> value[1]) & ((1 << value[2]) - 1)
+                    else:
+                        right = (value[2], []) if value[1] == 'immediate' else (0, []) if value[2] == 31 else constant_before(cursor, f'x{value[2]}', budget - 1)
+                        if right is None:
+                            return None
+                        proof = sorted(set(proof + right[1]))
+                        value = old + right[0] if kind == 'add' else old - right[0]
+                elif kind != 'literal':
+                    source = destination if kind == 'keep' else value
+                    previous = (0, []) if source == 31 else constant_before(cursor, f'x{source}', budget - 1)
+                    if previous is None:
+                        return None
+                    old, proof = previous
+                    value = ((old & ~value[1]) | value[0]) if kind == 'keep' else old
+                if len(proof) >= 64:
+                    return None
+                return value & ((1 << bits) - 1), proof + [ins.address]
+            return None
+
+        @lru_cache(maxsize=None)
+        def index_before(index, register, budget=64):
+            if not budget:
+                return None
+            cursor = index
+            while cursor:
+                if instructions[cursor].address in entries:
+                    return None
+                cursor -= 1
+                ins = instructions[cursor]
+                if any(ins.group(g) for g in (cs.CS_GRP_JUMP, cs.CS_GRP_CALL, cs.CS_GRP_RET)):
+                    return None
+                if register not in writes[cursor]:
+                    continue
+                word = int.from_bytes(ins.bytes, 'little')
+                op = constant_move(word) or integer_operation(word)
+                if not op or op[2] != 64:
+                    return None
+                kind, destination, _, value = op
+                if kind == 'extract' and value[2] <= 32:
+                    return (ins.address, f'x{value[0]}', value[1], value[2], 0, [ins.address])
+                if kind == 'copy':
+                    previous = index_before(cursor, f'x{value}', budget - 1)
+                    right, sign = (0, []), 1
+                elif kind in ('add', 'sub'):
+                    previous = index_before(cursor, f'x{value[0]}', budget - 1)
+                    right = (value[2], []) if value[1] == 'immediate' else (0, []) if value[2] == 31 else constant_before(cursor, f'x{value[2]}')
+                    sign = 1 if kind == 'add' else -1
+                else:
+                    return None
+                if previous is None or right is None:
+                    return None
+                site, source, lsb, size, addend, proof = previous
+                addend += sign * signed(right[0], 64)
+                if not -(1 << 63) <= addend <= (1 << 63) - (1 << size):
+                    return None
+                proof = sorted(set(proof + right[1]))
+                return (site, source, lsb, size, addend, proof + [ins.address]) if len(proof) < 64 else None
+            return None
+
         for ref in references_by_payload[start]:
             index = (ref['site'] - start) // 4
             ins = instructions[index]
@@ -231,11 +434,20 @@ def main():
             proof_checks += 1
 
         for edge in edges_by_payload[start]:
+            constants = edge.get('register_constants', [])
+            assert len({c['register'] for c in constants}) == len(constants)
+            assert not constants or edge['kind'] in ('call', 'indirect_call')
+            for fact in constants:
+                expected = constant_before((edge['site'] - start) // 4, fact['register'])
+                assert expected == (int(fact['bits'], 16), fact['proof']), (hex(edge['site']), fact, expected)
+                proof_checks += 1
             if not edge['via_kind']:
                 assert edge['via_offset'] is None and not edge['proof']
+                assert edge.get('snapshot_target') is None and edge.get('via_field_offset') is None and not edge.get('index_register')
                 continue
             cursor = (edge['site'] - start) // 4
             register, moved = edge['target_register'], []
+            field = None
             while True:
                 assert instructions[cursor].address not in entries
                 cursor -= 1
@@ -250,11 +462,57 @@ def main():
                     register = reg(ins.operands[1].reg)
                     continue
                 assert ins.id in (a.ARM64_INS_LDR, a.ARM64_INS_LDUR, a.ARM64_INS_LDP)
+                if edge['via_kind'] == 'dispatch_table':
+                    assert ins.id == a.ARM64_INS_LDR and len(ins.operands) == 2 and not ins.writeback
+                    op = ins.operands[1]
+                    assert op.type == a.ARM64_OP_MEM and width(ins.operands[0].reg) == width(op.mem.index) == 8
+                    assert op.ext == 0 and op.shift.type == a.ARM64_SFT_LSL and op.shift.value == 3
+                    kind, offset, proof = address_origin(cursor, reg(op.mem.base), op.mem.disp)
+                    assert (edge['via_kind'], edge['via_offset'], edge['index_register'], edge['proof']) == (kind, offset, reg(op.mem.index), proof + [ins.address] + list(reversed(moved)))
+                    access = edge['dispatch']
+                    assert edge['via_field_offset'] is None
+                    constant = constant_before(cursor, reg(op.mem.index))
+                    if access['index'] is not None:
+                        assert constant and (signed(constant[0], 64), constant[1]) == (access['index'], access['proof'])
+                        assert access['expression'] is None
+                        table_index = dispatch['origin'] + offset // 8 + access['index'] if offset % 8 == 0 else None
+                        if table_index is not None and not -(1 << 63) <= table_index < (1 << 63):
+                            table_index = None
+                        assert access['table_index'] == table_index
+                        expected_target = None
+                        resolution = 'misaligned_base' if offset % 8 else 'table_unavailable' if not dispatch['entries'] else 'out_of_bounds'
+                        if offset % 8 == 0 and table_index is not None and 0 <= table_index < len(dispatch['entries']):
+                            expected_target = dispatch['entries'][table_index]
+                            resolution = 'unmapped_entry' if expected_target is None else 'null_error_entry' if expected_target == dispatch['null_target'] else 'snapshot_entry'
+                        assert (edge['snapshot_target'], access['resolution']) == (expected_target, resolution)
+                    else:
+                        assert constant is None and access['table_index'] is None and not access['proof'] and edge['snapshot_target'] is None
+                        assert access['resolution'] == 'unknown_index'
+                        expression = access['expression']
+                        if expression:
+                            assert index_before(cursor, reg(op.mem.index)) == (expression['site'], expression['source_register'], expression['lsb'], expression['width'], expression['addend'], expression['proof'])
+                    break
                 parts = 2 if ins.id == a.ARM64_INS_LDP else 1
                 part = next(n for n in range(parts) if reg(ins.operands[n].reg) == register)
                 base, displacement, size = memory(ins, part)
                 assert size == 8
+                if edge['via_kind'] == 'pool_code_entry' and field is None:
+                    assert parts == 1
+                    field = displacement
+                    moved.append(ins.address)
+                    register = base
+                    continue
                 kind, offset, proof = address_origin(cursor, base, displacement)
+                if field is not None:
+                    assert kind == 'pool' and edge['via_field_offset'] == field
+                    relative = offset - profile['pool_data_offset']
+                    assert relative >= 0 and relative % profile['pool_slot_size'] == 0
+                    slot = pool_catalog[relative // profile['pool_slot_size']]
+                    assert {e['field_offset']: e['target'] for e in slot['entry_points']}[field] == edge['snapshot_target']
+                    kind = 'pool_code_entry'
+                else:
+                    assert edge.get('snapshot_target') is None and edge.get('via_field_offset') is None
+                assert not edge.get('index_register')
                 assert (edge['via_kind'], edge['via_offset'], edge['proof']) == (kind, offset, proof + [ins.address] + list(reversed(moved)))
                 break
             proof_checks += 1
@@ -295,15 +553,32 @@ def main():
         else:
             assert slot['kind'] == 'native_function' and value.startswith('NativeFn:')
             assert slot['description'] == 'runtime native binding; target unresolved'
+        if slot.get('entry_points'):
+            assert slot['kind'] == 'tagged_object' and slot['description'].startswith(('Code:', 'Stub:'))
+            normal = int(re.search(r'\((0x[0-9a-f]+)\)$', slot['description'])[1], 16)
+            # The renderer independently exports the normal Code entry. Other
+            # SDK-selected entry fields have only instruction/export checks here.
+            assert normal in {entry['target'] for entry in slot['entry_points']}
+            for entry in slot['entry_points']:
+                assert entry['target'] % 4 == 0 and len(read(entry['target'], 4)) == 4
+    from check_receiver_analysis import check_receivers
+    receiver_checks = check_receivers(graph, read, lambda raw, start: decode_payload(md, raw, start), audit_data)
     print(json.dumps({'status': 'PASSED', 'sample_sha256': hashlib.sha256(raw).hexdigest(),
                       'payloads': len(nodes), 'edges_checked_from_machine_words': len(graph['edges']),
                       'edge_kinds': dict(Counter(e['kind'] for e in graph['edges'])),
                       'references_checked_backwards': len(graph['references']),
                       'reference_kinds': dict(Counter(r['kind'] for r in graph['references'])),
                       'reference_and_indirect_provenance_checks': proof_checks,
+                      'snapshot_code_entry_edges': sum(e['via_kind'] == 'pool_code_entry' and e.get('snapshot_target') is not None for e in graph['edges']),
+                      'indexed_dispatch_edges': sum(e['via_kind'] == 'dispatch_table' for e in graph['edges']),
+                      'dispatch_table_entries_checked_from_stream': len(dispatch['entries']),
+                      'dispatch_exact_snapshot_targets': sum(e['via_kind'] == 'dispatch_table' and e.get('snapshot_target') is not None for e in graph['edges']),
+                      'dispatch_index_expressions': sum(bool(e.get('dispatch', {}).get('expression')) for e in graph['edges'] if e.get('dispatch')),
+                      'constant_register_observations': sum(len(e.get('register_constants', [])) for e in graph['edges']),
                       'pool_values_cross_checked': len(used_slots),
                       'thread_fields_consistent_with_ida_export': len(thread_catalog),
-                      'limits': 'Checks instruction facts and export consistency. Does not independently prove all Thread ABI names, indirect targets, source types or Dart semantics.'}, indent=2))
+                      **receiver_checks,
+                      'limits': 'Checks instruction facts and export consistency. Constant producers are decoded from original machine words. Does not independently prove SDK field layouts, runtime indirect targets, argument liveness, source types or Dart semantics.'}, indent=2))
 
 
 if __name__ == '__main__':

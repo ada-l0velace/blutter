@@ -25,6 +25,9 @@ struct Payload {
 struct PoolSlot {
 	std::string kind;
 	std::string description;
+	// Tagged-pointer field displacement -> original ELF VA. Snapshot metadata,
+	// not a promise that the runtime has not patched this entry.
+	std::map<int64_t, uint64_t> entryPoints;
 };
 struct Profile {
 	std::string name;
@@ -35,6 +38,20 @@ struct Profile {
 	int64_t poolLength;
 	std::map<int64_t, std::string> threadFields;
 	std::function<PoolSlot(int64_t)> describePoolSlot;
+	arm64_reg dispatchRegister = ARM64_REG_INVALID;
+	int64_t dispatchOrigin = 0;
+	std::vector<std::optional<uint64_t>> dispatchEntries;
+	std::optional<uint64_t> dispatchSnapshotAddress;
+	uint64_t dispatchSnapshotSize = 0;
+	std::optional<uint64_t> dispatchNullTarget;
+	unsigned classIdShift = 0;
+	unsigned classIdBits = 0; // Zero disables receiver inference for an unconfigured ABI.
+	int64_t headerDisplacement = -1;
+	arm64_reg nullRegister = ARM64_REG_INVALID;
+	uint32_t nullClassId = 0;
+	arm64_reg allocationResultRegister = ARM64_REG_X0;
+	std::map<uint64_t, uint32_t> allocationReturns;
+	std::function<std::optional<uint32_t>(int64_t)> poolHeapClass;
 };
 struct Reference {
 	uint64_t site;
@@ -48,6 +65,33 @@ struct Reference {
 	std::string fieldName;
 	std::vector<uint64_t> proof;
 };
+struct RegisterConstant {
+	std::string reg;
+	uint64_t bits;
+	std::vector<uint64_t> proof;
+};
+struct IndexExpression {
+	uint64_t site;
+	std::string sourceRegister;
+	unsigned lsb;
+	unsigned width;
+	int64_t addend;
+	std::vector<uint64_t> proof;
+};
+struct DispatchAccess {
+	std::optional<int64_t> index;
+	std::optional<int64_t> tableIndex;
+	std::optional<IndexExpression> expression;
+	std::vector<uint64_t> proof;
+	std::string resolution = "unknown_index";
+};
+struct StaticDispatch {
+	uint64_t load;
+	int64_t index;
+	uint64_t tableIndex;
+	uint64_t snapshotTarget;
+	std::vector<uint64_t> proof;
+};
 struct Edge {
 	uint64_t site;
 	uint64_t source;
@@ -59,6 +103,13 @@ struct Edge {
 	std::string viaKind;
 	std::optional<int64_t> viaOffset;
 	std::vector<uint64_t> proof;
+	std::optional<int64_t> viaFieldOffset;
+	std::string indexRegister;
+	std::optional<uint64_t> snapshotTarget;
+	std::vector<RegisterConstant> registerConstants;
+	std::optional<DispatchAccess> dispatch;
+	// A separate normal-flow CFG inference; original local facts stay unchanged.
+	std::optional<StaticDispatch> staticDispatch;
 };
 
 class Analyzer {
@@ -79,5 +130,8 @@ private:
 	std::vector<Reference> references;
 	std::vector<Edge> edges;
 	std::set<uint64_t> entries;
+	std::set<uint64_t> receiverEntries;
+	std::vector<std::string> receiverCertificates;
+	std::map<int64_t, uint32_t> receiverPoolClasses;
 };
 }

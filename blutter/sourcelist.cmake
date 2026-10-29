@@ -45,6 +45,8 @@ set(SRCS
     FridaWriter.h
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
+	ReceiverAnalysis.cpp
+	ReceiverAnalysis.h
     SnapshotCodeRanges.h
     HtArrayIterator.h
     Util.cpp
