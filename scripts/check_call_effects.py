@@ -80,9 +80,15 @@ def check_call_effects(graph, read, decode, trusted, audit):
     masks = dict(graph['receiver_metadata'].get('preserved_call_registers', []))
     result_reg = int(graph['receiver_metadata']['allocation_result_register'][1:])
     assert 0 <= result_reg < 31
+    return_register = graph['receiver_metadata'].get('word_return_register')
+    assert return_register is None or graph.get('format', 4) >= 12 and return_register == 'x0' and audit.get('word_return_register') == 'x0'
+    input_aliases = return_register == 'x0'
 
     def alias(kind, offset, *bounds):
-        assert type(kind) is int and type(offset) is int and 1 <= kind <= (8 if bodies_enabled else 6)
+        assert type(kind) is int and type(offset) is int and 1 <= kind <= (9 if input_aliases else 8 if bodies_enabled else 6)
+        if kind == 9:
+            assert not bounds and 0 <= offset <= 248 and offset % 8 == 0
+            return kind, offset
         if kind == 7:
             assert len(bounds) == 2 and all(type(v) is int for v in bounds)
             assert abs(offset) <= 1 << 20 and 7 <= bounds[0] <= bounds[1] <= 1 << 20
@@ -103,6 +109,10 @@ def check_call_effects(graph, read, decode, trusted, audit):
         code = decode(read(start, end - start), start)
         assert len(code) * 4 == end - start and all(i.address == start + n * 4 and i.size == 4 for n, i in enumerate(code))
         by_site = {i.address: i for i in code}
+        leaf_inputs = input_aliases and not any(i.group(cs.CS_GRP_CALL) or i.group(cs.CS_GRP_INT) for i in code)
+        returned_input = certificate.get('return_input')
+        if returned_input is not None:
+            assert leaf_inputs and type(returned_input) is int and 0 <= returned_input <= 248 and returned_input % 8 == 0
         all_writes = {number(i, r) for i in code for r in i.regs_access()[1]}
         assert not all_writes & {21, 22, 26, 27, 28}, 'Callee changes reserved Dart registers'
         pool_fixed = graph['profile']['pool_register'] == 'x27' and 27 not in all_writes
@@ -206,6 +216,8 @@ def check_call_effects(graph, read, decode, trusted, audit):
             elif word & 0xfffffc1f == 0xd65f0000:  # RET Xn: only the original LR qualifies.
                 assert (word >> 5) & 31 == 30
                 assert old[15] == (1, 0) and old[29] == (2, 0) and old[30] == (3, 0)
+                if returned_input is not None:
+                    assert old[0] == (9, returned_input), 'Result does not forward the claimed entry input on every return'
                 returns += 1
                 continue
             elif ins.id in (a.ARM64_INS_BRK, a.ARM64_INS_HLT):
@@ -260,6 +272,8 @@ def check_call_effects(graph, read, decode, trusted, audit):
                             r = number(ins, ops[part].reg)
                             if r >= 0 and at+part*8 in slots:
                                 state[r] = slots[at+part*8]
+                            elif r >= 0 and leaf_inputs and 0 <= at+part*8 <= 248 and (at+part*8) % 8 == 0:
+                                state[r] = (9, at+part*8)
                     elif not ins.writeback and not op.mem.index and ins.mnemonic in ('ldr', 'ldur') and size(ins, ops[0].reg) == 8 and base >= 0 and number(ins, ops[0].reg) >= 0:
                         source, dst = old[base], number(ins, ops[0].reg)
                         if source[0] == 4 and graph['profile']['pool_slot_size'] == 8:
@@ -309,6 +323,8 @@ def check_call_effects(graph, read, decode, trusted, audit):
                                 state[dst] = word_value(value[1]+change, bits)
                             elif bits == 64 and value[0] in (1, 4, 7):
                                 state[dst] = (value[0], value[1]+change, *value[2:])
+            if len(slots) > 128:
+                slots = {k: v for k, v in slots.items() if v[0] != 9}
             assert state[15][0] == 1 and -(1 << 20) <= state[15][1] <= 0 and len(slots) <= 128
             assert all(v[0] not in (1, 4, 7) or abs(v[1]) <= 1 << 20 for v in state)
             slots = {k: v for k, v in slots.items() if k >= state[15][1]}

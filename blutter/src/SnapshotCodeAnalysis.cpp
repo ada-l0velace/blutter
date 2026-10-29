@@ -100,6 +100,14 @@ void Proof(std::ostream& out, const std::vector<uint64_t>& proof)
 	for (size_t i = 0; i < proof.size(); ++i) { if (i) out << ','; out << proof[i]; }
 	out << ']';
 }
+void Forwarded(std::ostream& out, const ForwardedReturn& value, std::optional<uint64_t> site = {})
+{
+	out << '{';
+	if (site) out << "\"site\":" << *site << ',';
+	out << "\"callee\":" << value.callee << ",\"input_sp_offset\":" << value.inputSpOffset
+		<< ",\"register\":\"x0\",\"class_id\":" << value.classId << ",\"proof\":";
+	Proof(out, value.proof); out << '}';
+}
 struct Origin {
 	std::string kind;
 	int64_t offset;
@@ -296,6 +304,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 	if (!callEffectsPrepared) {
 		const auto effects = AnalyzeCallEffects(contextBytes, profile);
 		callEffectCertificates = effects.certificates;
+		profile.forwardedReturnInputs = effects.forwardedInputs;
 		callEffectAttempts = effects.attempted; callEffectSteps = effects.steps;
 		for (const auto& [entry, certificate] : effects.certificates) profile.frameSafeCallees.insert(entry);
 		callEffectsPrepared = true;
@@ -553,6 +562,12 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 			}
 		}
 		entryStackLoads.insert(entryStackLoads.end(), receiver.entryStackLoads.begin(), receiver.entryStackLoads.end());
+		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.forwardedReturns.find(edges[n].site); found != receiver.forwardedReturns.end()) {
+			edges[n].forwardedReturn = found->second;
+			auto& comment = comments[edges[n].site];
+			if (!comment.empty()) comment += " | ";
+			comment += std::format("x0 forwards callee entry SP+{:#x} (heap class {:#x})", found->second.inputSpOffset, found->second.classId);
+		}
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
 	}
@@ -599,13 +614,13 @@ void Analyzer::Write(const std::string& filename) const
 		auto analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &remainingSteps);
 		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();)
 			if (globallyResolved.contains(it->first) && globallyResolved.at(it->first) == it->second.snapshotTarget) it = analysis.resolutions.erase(it); else ++it;
-		if (analysis.resolutions.empty()) continue;
+		if (analysis.resolutions.empty() && analysis.forwardedReturns.empty()) continue;
 		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
 		contexts.push_back({payload, callers, std::move(inputs), std::move(analysis)});
 	}
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":11,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":12,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -674,7 +689,9 @@ void Analyzer::Write(const std::string& filename) const
 				<< ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << ",\"proof\":";
 			Proof(out, value.proof); out << '}';
 		}
-		out << "]}";
+		out << "],\"forwarded_return\":";
+		if (edge.forwardedReturn) Forwarded(out, *edge.forwardedReturn); else out << "null";
+		out << '}';
 	}
 	out << "],\"entry_stack_loads\":[";
 	for (size_t n = 0; n < entryStackLoads.size(); ++n) {
@@ -728,7 +745,8 @@ void Analyzer::Write(const std::string& filename) const
 		<< ",\"null_class_id\":" << profile.nullClassId << ",\"allocation_result_register\":" << Quoted(RegName(profile.allocationResultRegister)) << ",\"pool_classes\":[";
 	bool first = true;
 	for (const auto& [slot, cid] : checkedPoolClasses) { if (!first) out << ','; first = false; out << '[' << slot << ',' << cid << ']'; }
-	out << "],\"allocation_returns\":["; first = true;
+	out << "],\"word_return_register\":" << (profile.wordReturnRegister == ARM64_REG_X0 ? "\"x0\"" : "null");
+	out << ",\"allocation_returns\":["; first = true;
 	for (const auto& [address, cid] : profile.allocationReturns) { if (!first) out << ','; first = false; out << '[' << address << ',' << cid << ']'; }
 	out << "],\"thread_heap_classes\":["; first = true;
 	for (const auto& [offset, cid] : profile.threadHeapClasses) { if (!first) out << ','; first = false; out << '[' << offset << ',' << cid << ']'; }
@@ -768,11 +786,16 @@ void Analyzer::Write(const std::string& filename) const
 			out << "{\"site\":" << site << ",\"load\":" << value.load << ",\"index\":" << value.index << ",\"table_index\":" << value.tableIndex
 				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":"; Proof(out, value.proof); out << '}';
 		}
+		out << "],\"forwarded_returns\":["; bool firstReturn = true;
+		for (const auto& [site, value] : context.analysis.forwardedReturns) {
+			if (!firstReturn) out << ','; firstReturn = false;
+			Forwarded(out, value, site);
+		}
 		out << "],\"certificate\":" << context.analysis.certificate << '}';
 	}
 	out << "],\"context_analysis\":{\"candidate_groups\":" << groups.size() << ",\"attempted_groups\":" << attempted
 		<< ",\"transfer_steps\":" << 20000000 - remainingSteps << ",\"cached_bytes\":" << contextBytesSize
 		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"cache_limit\":33554432}";
-	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not working registers, return types or heap contents. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
+	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not general working registers, source return types or heap contents. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

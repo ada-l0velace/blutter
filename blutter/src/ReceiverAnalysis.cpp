@@ -245,7 +245,36 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		result.poolClasses[index] = *cid;
 		return cid;
 	};
+	auto forwardedAt = [&](const State& state, const cs_insn& i) -> std::optional<std::pair<Fact, ForwardedReturn>> {
+		if (profile.wordReturnRegister != ARM64_REG_X0) return {};
+		const auto& d = i.detail->arm64;
+		if (d.op_count != 1) return {};
+		std::optional<uint64_t> target;
+		if (i.id == ARM64_INS_BL && d.operands[0].type == ARM64_OP_IMM) target = d.operands[0].imm;
+		if (i.id == ARM64_INS_BLR && d.operands[0].type == ARM64_OP_REG) {
+			const auto loaded = Read(state, d.operands[0].reg);
+			if (loaded.kind == Target && loaded.value < profile.dispatchEntries.size()) target = profile.dispatchEntries[loaded.value];
+		}
+		if (!target || !profile.frameSafeCallees.contains(*target) || !profile.forwardedReturnInputs.contains(*target)) return {};
+		const auto input = profile.forwardedReturnInputs.at(*target);
+		const auto& sp = state.regs[15];
+		if (input < 0 || input > 248 || input % 8 || sp.kind != Stack || sp.aux != 0 || std::bit_cast<int64_t>(sp.value) > -16) return {};
+		for (unsigned r = 0; r < 31; ++r) if (r != 15 && r != 29 && state.regs[r].kind == Stack) return {};
+		const auto offset = Add(std::bit_cast<int64_t>(sp.value), input);
+		if (!offset) return {};
+		Fact value;
+		if (*offset >= 0 && state.liveInputs.contains(*offset) && inputValues.contains(*offset)) value = inputValues.at(*offset);
+		else if (state.spills.contains(*offset)) value = state.spills.at(*offset);
+		// The first consumer preserves object classes, not raw pointer bits or
+		// arbitrary word values across earlier potentially allocating calls.
+		if (value.kind != Object) return {};
+		value.proof = Union(value.proof, sp.proof);
+		value = Proven(std::move(value), i.address);
+		if (value.kind != Object) return {};
+		return std::pair{value, ForwardedReturn{*target, input, static_cast<uint32_t>(value.value), value.proof}};
+	};
 	auto execute = [&](State state, const cs_insn& i) {
+		const auto forwarded = forwardedAt(state, i);
 		const auto& d = i.detail->arm64;
 		// BLR may overwrite its own source (LR), so capture the proven dispatch
 		// target before applying architectural writes.
@@ -444,6 +473,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				const int reg = Number(profile.allocationResultRegister);
 				if (allocation != profile.allocationReturns.end() && reg >= 0) state.regs[reg] = {Object, allocation->second, 0, 0, {i.address}};
 			}
+			if (forwarded && preserves) state.regs[0] = forwarded->first;
 		}
 		const auto sp = state.regs[15];
 		if (sp.kind != Stack || sp.aux != 0) state.spills.clear();
@@ -534,6 +564,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			const auto& i = instructions[n];
 			const auto& d = i.detail->arm64;
 			const auto sp = state.regs[15];
+			if (const auto forwarded = forwardedAt(state, i)) result.forwardedReturns.emplace(i.address, forwarded->second);
 			if (OpaqueMemory(i)) recentStores.clear();
 			if (Group(i, CS_GRP_CALL) && sp.kind == Stack) {
 				for (const auto& [offset, value] : recentStores) {
@@ -586,7 +617,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || sp.kind != state.regs[15].kind || sp.aux != state.regs[15].aux) recentStores.clear();
 		}
 	}
-	if (result.resolutions.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
+	if (result.resolutions.empty() && result.forwardedReturns.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
 	std::ostringstream certificate;
 	certificate << "{\"payload\":" << start << ",\"blocks\":[";
 	for (size_t n = 0; n < blocks.size(); ++n) {

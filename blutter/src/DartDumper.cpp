@@ -134,7 +134,8 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		const auto& object = dart::Object::Handle(zone, pool.ObjectAt(i));
 		if (!object.IsSmi()) { if (comma) of << ','; comma = true; of << '[' << i << ',' << object.GetClassId() << ']'; }
 	}
-	of << "],\"pool_code_entries\":[";
+	of << "],\"word_return_register\":" << (dart::CallingConventions::kReturnReg == dart::R0 ? "\"x0\"" : "null");
+	of << ",\"pool_code_entries\":[";
 	comma = false;
 	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
 		const auto& object = dart::Object::Handle(zone, pool.ObjectAt(i));
@@ -722,6 +723,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	SnapshotAnalysis::Profile profile{profileName, ARM64_REG_X27, ARM64_REG_X26,
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
 	profile.dispatchRegister = ARM64_REG_X21;
+	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
 	profile.dispatchOrigin = dart::DispatchTable::kOriginElement;
 	profile.classIdShift = dart::UntaggedObject::ClassIdTag::shift();
 	profile.classIdBits = dart::UntaggedObject::ClassIdTag::bitsize();

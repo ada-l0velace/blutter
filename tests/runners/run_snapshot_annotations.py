@@ -78,7 +78,7 @@ def main():
             def read(address, length):
                 return fixture_bytes[address][:length]
             check_receivers(result, read, lambda raw, address: list(decoder.disasm(raw, address)),
-                            {'pool_heap_classes': [[3, 1], [4, 1], [5, 2]], 'class_allocations': [[0x2000, 1]],
+                            {'word_return_register': 'x0', 'pool_heap_classes': [[3, 1], [4, 1], [5, 2]], 'class_allocations': [[0x2000, 1]],
                              'pool_code_entries': [[2, 7, 0x2000], [2, 15, 0x2004], [6, 7, 0x5000], [7, 7, 0xa000], [8, 7, 0xc000]],
                              'leaf_math_contract': [0x80, 0x88, 0x90, 8],
                              'allocation_body_bounds': [[0x2000, 7, 31], [0x7000, 7, 15], [0x8000, 7, 39]],
@@ -675,6 +675,57 @@ def main():
         assert len(resolved(d)) == 1
         block = next(b for c in d['receiver_certificates'] if c['payload'] == 0x1000 for b in c['blocks'] if b['start'] == 0x1010)
         assert block['entry'] and block['reachable']
+        # Authored identity-return bodies. Their input is a physical entry slot,
+        # not a guessed source parameter or return type.
+        forward_caller = prologue + ['ldr x2, [x27, #40]', 'str x2, [x15]', 'bl 0x5000', 'mov x2, x0'] + dispatch[:-1] + epilogue
+        def forwarding(data, payload=0x5000):
+            return next((c.get('return_input') for c in data['call_effects'] if c['payload'] == payload), None)
+        for name, body, slot in [
+            ('leaf', ['ldr x0, [x15]', 'ret'], 0),
+            ('copy', ['ldr x4, [x15]', 'mov x0, x4', 'ret'], 0),
+            ('paired', ['ldp x0, x1, [x15]', 'ret'], 0),
+            ('local-spill', prologue + ['ldr x4, [x29, #16]', 'stur x4, [x29, #-8]', 'ldur x0, [x29, #-8]'] + epilogue, 0),
+            ('two-returns', ['cbz x1, 0x5010', 'ldr x0, [x15]', 'ret', 'nop', 'ldr x0, [x15]', 'ret'], 0),
+        ]:
+            d = run('result-forwards-' + name, forward_caller, {0x5000: body})
+            assert forwarding(d) == slot and len(resolved(d)) == 1, name
+            claim = next(e['forwarded_return'] for e in d['edges'] if e.get('forwarded_return'))
+            assert claim['class_id'] == 1 and claim['input_sp_offset'] == slot and claim['register'] == 'x0'
+        for name, body in [
+            ('narrow-load', ['ldr w0, [x15]', 'ret']),
+            ('narrow-copy', ['ldr x0, [x15]', 'mov w0, w0', 'ret']),
+            ('unaligned', ['ldur x0, [x15, #1]', 'ret']),
+            ('outside-window', ['ldr x0, [x15, #256]', 'ret']),
+            ('modified-input', ['ldr x0, [x15]', 'add x0, x0, #1', 'ret']),
+            ('different-return-slots', ['cbz x1, 0x5010', 'ldr x0, [x15]', 'ret', 'nop', 'ldr x0, [x15, #8]', 'ret']),
+            ('converged-conflict', ['ldr x0, [x15]', 'cbz x1, 0x5010', 'ldr x0, [x15, #8]', 'b 0x5014', 'nop', 'ret']),
+            ('unproved-link', ['ldr x0, [x15]', 'mov x30, x9', 'ret']),
+            ('caller-input-write', ['str x1, [x15]', 'ldr x0, [x15]', 'ret']),
+            ('calls-are-not-bit-identity', prologue + ['ldr x0, [x29, #16]', 'bl 0x2000'] + epilogue),
+        ]:
+            d = run('result-refuses-' + name, forward_caller, {0x5000: body})
+            assert forwarding(d) is None and not any(e.get('forwarded_return') for e in d['edges']), name
+            assert not resolved(d), name
+        d = run('result-input-beyond-slot-zero',
+                prologue + ['ldr x2, [x27, #40]', 'str x2, [x15, #8]', 'bl 0x5000', 'mov x2, x0'] + dispatch[:-1] + epilogue,
+                {0x5000: ['ldr x0, [x15, #8]', 'ret']})
+        assert forwarding(d) == 8 and len(resolved(d)) == 1
+        d = run('result-interior-call-remains-unknown',
+                prologue + ['ldr x2, [x27, #40]', 'str x2, [x15]', 'bl 0x5004', 'mov x2, x0'] + dispatch[:-1] + epilogue,
+                {0x5000: ['ldr x0, [x15]', 'ret']})
+        assert not resolved(d) and not any(e.get('forwarded_return') for e in d['edges'])
+        # Caller classes are separate contexts, including return-only contexts.
+        outer = prologue + ['ldr x2, [x27, #40]', 'str x2, [x15]', 'bl 0x4000'] + epilogue
+        other = prologue + ['ldr x2, [x27, #56]', 'str x2, [x15]', 'bl 0x4000'] + epilogue
+        wrapper = prologue + ['ldr x2, [x29, #16]', 'str x2, [x15]', 'bl 0x5000'] + epilogue
+        d = run('result-contexts-retain-distinct-caller-classes', outer,
+                {0x3000: other, 0x4000: wrapper, 0x5000: ['ldr x0, [x15]', 'ret']})
+        contexts = [c for c in d['call_contexts'] if c['payload'] == 0x4000]
+        assert len(contexts) == 2 and {c['forwarded_returns'][0]['class_id'] for c in contexts} == {1, 2}
+        assert all(not c['resolutions'] for c in contexts)
+        large = prologue + ['sub x15, x15, #1024', 'ldr x0, [x29, #16]'] + [f'str x0, [x15, #{i*8}]' for i in range(128)] + epilogue
+        d = run('result-input-cache-does-not-exhaust-frame-proof', forward_caller, {0x5000: large})
+        assert forwarding(d) == 0 and len(resolved(d)) == 1
         chain = {0x5000+i*0x100: prologue + [f'bl {hex(0x5100+i*0x100)}'] + epilogue for i in range(8)}
         chain[0x5800] = leaf
         d = run('callee-depth-bound', call_spill, chain)

@@ -38,6 +38,7 @@ int main(int argc, char** argv)
 				return slot;
 			}};
 		profile.dispatchRegister = ARM64_REG_X21;
+		profile.wordReturnRegister = ARM64_REG_X0;
 		profile.dispatchOrigin = 4;
 		profile.dispatchEntries = {0x2000, 0x2004, {}, 0x3000, 0x2000, 0x2004, 0x2000, 0x2004, 0xb000};
 		profile.dispatchNullTarget = 0x3000;

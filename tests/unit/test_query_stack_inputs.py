@@ -27,6 +27,18 @@ class StackQuery(unittest.TestCase):
         self.assertEqual(result['calls'][0]['stack_inputs'][0]['callee_loads'][0]['register'], 'x2')
         self.assertFalse(result['calls'][1]['stack_inputs'])
 
+    def test_result_forwarding_and_return_only_context_are_visible(self):
+        self.graph['format'] = 12
+        self.graph['receiver_metadata'] = {'word_return_register': 'x0'}
+        self.graph['call_effects'] = [{'payload': 0x2000, 'return_input': 0}]
+        self.graph['call_contexts'] = [{'payload': 0x2000, 'callers': [0x1010], 'resolutions': [],
+                                      'forwarded_returns': [{'site': 0x200c, 'callee': 0x3000, 'input_sp_offset': 0, 'class_id': 1}]}]
+        result = query(self.graph, 0x2000)
+        self.assertEqual(result['result_forwarding'], {'register': 'x0', 'input_sp_offset': 0})
+        self.assertEqual(result['callers_with_context_dispatches'], 0)
+        self.assertEqual(result['callers_with_context_forwarded_returns'], 1)
+        self.assertEqual(result['calls'][0]['context_forwarded_returns'][0]['callee'], '0x3000')
+
     def test_interior_entries_do_not_inherit_frame_mapping(self):
         result = query(self.graph, 0x2004)
         self.assertFalse(result['mapping_available'])

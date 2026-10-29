@@ -22,6 +22,7 @@ def query(graph, target, limit=20):
     loads = [v for v in graph.get('entry_stack_loads', []) if v['payload'] == target]
     callers = [e for e in graph['edges'] if e['kind'] == 'call' and e['target'] == target]
     context_by_caller = {}
+    returns_by_caller = {}
     for context in graph.get('call_contexts', []):
         if context['payload'] != target:
             continue
@@ -32,6 +33,8 @@ def query(graph, target, limit=20):
                                     snapshot_target=hex(resolution['snapshot_target']), snapshot_target_label=label))
         for caller in context['callers']:
             context_by_caller[caller] = resolutions
+            returns_by_caller[caller] = [dict(v, site=hex(v['site']), callee=hex(v['callee']))
+                                         for v in context.get('forwarded_returns', [])]
     calls = []
     for edge in callers[:limit]:
         values = []
@@ -44,13 +47,21 @@ def query(graph, target, limit=20):
             values.append(value)
         calls.append({'site': hex(edge['site']), 'source': hex(edge['source']),
                       'source_label': nodes.get(edge['source'], {}).get('label', ''), 'stack_inputs': values,
-                      'context_dispatches': context_by_caller.get(edge['site'], [])})
+                      'context_dispatches': context_by_caller.get(edge['site'], []),
+                      'forwarded_return': edge.get('forwarded_return'),
+                      'context_forwarded_returns': returns_by_caller.get(edge['site'], [])})
+    effect = next((c for c in graph.get('call_effects', []) if c['payload'] == target), {})
+    result_forwarding = ({'register': graph['receiver_metadata']['word_return_register'],
+                          'input_sp_offset': effect['return_input']} if effect.get('return_input') is not None else None)
     return {'target': hex(target), 'target_label': node['label'],
             'mapping_available': target == node['start'], 'caller_count': len(callers),
             'callers_with_observations': sum(bool(e.get('stack_inputs')) for e in callers),
-            'callers_with_context_dispatches': len(context_by_caller), 'calls': calls,
+            'callers_with_context_dispatches': sum(bool(v) for v in context_by_caller.values()),
+            'callers_with_context_forwarded_returns': sum(bool(v) for v in returns_by_caller.values()),
+            'result_forwarding': result_forwarding, 'calls': calls,
             'limits': 'Partial recent stores and physical entry-stack loads only. A matched slot does not establish '
-                      'a complete parameter list. context_dispatches, when present, are separate bounded '
+                      'a complete parameter list. result_forwarding is a checked physical word relation, '
+                      'not a source return type. context_dispatches and context_forwarded_returns are separate bounded '
                       'caller-specific analyses; the query itself does not solve or verify them. Interior-entry '
                       'calls have no payload-entry SP mapping. Omitted callers/slots are unknown.'}
 

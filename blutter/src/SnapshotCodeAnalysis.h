@@ -65,6 +65,10 @@ struct Profile {
 	std::map<uint64_t, uint32_t> preservedCallRegisters;
 	// Machine-code-proved effects, validated separately from SDK contracts.
 	std::set<uint64_t> frameSafeCallees;
+	// Optional matched ABI for full-word physical results. This does not imply
+	// a source return type or describe floating/pair results.
+	arm64_reg wordReturnRegister = ARM64_REG_INVALID;
+	std::map<uint64_t, int64_t> forwardedReturnInputs;
 	// Reviewed unary round leaf wrapper: thread entry, vm_tag, saved limit, Dart tag.
 	std::vector<int64_t> leafMathContract;
 	// Tagged-pointer-relative writable body intervals, excluding object headers.
@@ -125,6 +129,12 @@ struct EntryStackLoad {
 	unsigned width;
 	std::vector<uint64_t> proof;
 };
+struct ForwardedReturn {
+	uint64_t callee;
+	int64_t inputSpOffset;
+	uint32_t classId;
+	std::vector<uint64_t> proof;
+};
 struct Edge {
 	uint64_t site;
 	uint64_t source;
@@ -144,6 +154,7 @@ struct Edge {
 	// A separate normal-flow CFG inference; original local facts stay unchanged.
 	std::optional<StaticDispatch> staticDispatch;
 	std::vector<StackInput> stackInputs;
+	std::optional<ForwardedReturn> forwardedReturn;
 };
 
 class Analyzer {

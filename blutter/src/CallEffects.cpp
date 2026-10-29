@@ -8,7 +8,7 @@
 
 namespace SnapshotAnalysis {
 namespace {
-enum Kind { Unknown, Stack, CallerFP, CallerLR, Pool, Code, Entry, Heap, Word };
+enum Kind { Unknown, Stack, CallerFP, CallerLR, Pool, Code, Entry, Heap, Word, Input };
 struct Alias {
 	Kind kind = Unknown;
 	int64_t offset = 0;
@@ -154,6 +154,10 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 		const auto count = cs_disasm(decoder.handle, code.data(), code.size(), entry, 0, &raw);
 		const std::shared_ptr<cs_insn> owner(raw, [count](cs_insn* p) { cs_free(p, count); });
 		if (count * 4 != code.size()) { failed.insert(entry); return false; }
+		// Keep exact input-bit aliases confined to call-free bodies: a moving GC
+		// can update saved pointers. More general returns require a richer model.
+		const bool trackInputs = profile.wordReturnRegister == ARM64_REG_X0 &&
+			std::none_of(raw, raw + count, [](const cs_insn& i) { return Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT); });
 		bool poolFixed = true, threadFixed = true, reservedFixed = true;
 		for (size_t n = 0; n < count; ++n) for (unsigned j = 0; j < raw[n].detail->arm64.op_count; ++j) {
 			const auto& op = raw[n].detail->arm64.operands[j];
@@ -282,6 +286,8 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 						for (unsigned part = 0; part < (pair ? 2U : 1U); ++part) {
 							const int r = Reg(d.operands[part].reg);
 							if (r >= 0 && state.slots.contains(at + part * 8)) state.regs[r] = state.slots.at(at + part * 8);
+							else if (r >= 0 && trackInputs && at + part * 8 >= 0 && at + part * 8 <= 248 && (at + part * 8) % 8 == 0)
+								state.regs[r] = {Input, at + part * 8};
 						}
 					} else if (!d.writeback && m.index == ARM64_REG_INVALID && (i.id == ARM64_INS_LDR || i.id == ARM64_INS_LDUR) && Bytes(d.operands[0].reg) == 8 && base >= 0 && Reg(d.operands[0].reg) >= 0) {
 						const auto source = before.regs[base]; const auto dst = Reg(d.operands[0].reg);
@@ -332,6 +338,10 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 					}
 				}
 			}
+			// Optional input facts must not consume the existing frame-proof budget.
+			if (state.slots.size() > 128)
+				for (auto it = state.slots.begin(); it != state.slots.end();)
+					if (it->second.kind == Input) it = state.slots.erase(it); else ++it;
 			if (state.regs[15].kind != Stack || state.regs[15].offset < -(1 << 20) || state.regs[15].offset > 0 || state.slots.size() > 128) { valid = false; break; }
 			for (const auto& value : state.regs) if ((value.kind == Stack || value.kind == Pool || value.kind == Heap) && (value.offset < -(1 << 20) || value.offset > (1 << 20))) valid = false;
 			for (auto it = state.slots.begin(); it != state.slots.end();)
@@ -350,10 +360,23 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 		visiting.erase(entry);
 		if (!valid || !returned || !pending.empty()) { failed.insert(entry); return false; }
 		depths[entry] = depth;
+		// Inspect the converged pre-states, never a transient worklist result.
+		std::optional<int64_t> forwarded;
+		bool forwards = trackInputs;
+		for (size_t n = 0; n < count; ++n) if (incoming[n] && raw[n].id == ARM64_INS_RET) {
+			const auto& value = incoming[n]->regs[0];
+			if (value.kind != Input || (forwarded && *forwarded != value.offset)) forwards = false;
+			else forwarded = value.offset;
+		}
 		std::ostringstream out; out << "{\"payload\":" << entry << ",\"depth\":" << depth << ",\"states\":[";
 		bool first = true;
 		for (size_t n = 0; n < count; ++n) if (incoming[n]) { if (!first) out << ','; first = false; JsonState(out, entry + n * 4, *incoming[n]); }
-		out << "]}";
+		out << ']';
+		if (forwards && forwarded) {
+			result.forwardedInputs.emplace(entry, *forwarded);
+			out << ",\"return_input\":" << *forwarded;
+		}
+		out << '}';
 		result.certificates.emplace(entry, out.str()); return true;
 	};
 	for (const auto& [entry, code] : bytes) { if (result.steps >= 2000000) break; prove(entry); }

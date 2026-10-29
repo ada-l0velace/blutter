@@ -8,6 +8,7 @@ struct ReceiverAnalysisResult {
 	std::map<int64_t, uint32_t> poolClasses;
 	std::map<uint64_t, std::vector<StackInput>> stackInputs;
 	std::vector<EntryStackLoad> entryStackLoads;
+	std::map<uint64_t, ForwardedReturn> forwardedReturns;
 };
 // Must-facts over the known, normal-flow CFG. Unmodeled indirect jumps,
 // resource limits and conflicting incoming values produce no new resolutions.

@@ -100,6 +100,9 @@ def check_receivers(graph, read, decode, audit):
     claims = {e['site']: e['static_dispatch'] for e in graph['edges'] if e.get('static_dispatch') is not None}
     stack_claims = {e['site']: e['stack_inputs'] for e in graph['edges'] if e.get('stack_inputs')}
     load_claims = {(v['site'], v['register']): v for v in graph.get('entry_stack_loads', [])}
+    return_claims = {e['site']: e['forwarded_return'] for e in graph['edges'] if e.get('forwarded_return') is not None}
+    assert graph.get('format', 4) >= 12 or not return_claims and not any(c.get('forwarded_returns') for c in graph.get('call_contexts', []))
+    assert len(return_claims) == sum(e.get('forwarded_return') is not None for e in graph['edges'])
     certificates = graph.get('receiver_certificates', [])
     contexts = graph.get('call_contexts', [])
     assert graph.get('format', 4) >= 6 or not contexts
@@ -108,7 +111,7 @@ def check_receivers(graph, read, decode, audit):
     assert len(load_claims) == len(graph.get('entry_stack_loads', []))
     assert modern or not stack_claims and not load_claims
     assert len({c['payload'] for c in certificates}) == len(certificates)
-    if not claims and not stack_claims and not load_claims and not contexts and not graph.get('call_effects') and not graph.get('receiver_metadata', {}).get('nonreturning_calls'):
+    if not claims and not stack_claims and not load_claims and not return_claims and not contexts and not graph.get('call_effects') and not graph.get('receiver_metadata', {}).get('nonreturning_calls'):
         assert not certificates
         return {'receiver_claims_checked': 0, 'receiver_incoming_edges_checked': 0}
     assert audit, 'Receiver checking requires the separate VM audit'
@@ -138,6 +141,7 @@ def check_receivers(graph, read, decode, audit):
     from check_call_effects import check_call_effects, checked_nonreturning_calls
     nonreturning_calls = checked_nonreturning_calls(graph, audit)
     safe_callees, effect_instructions = check_call_effects(graph, read, decode, set(allocations) | set(preserving_calls), audit)
+    return_inputs = {c['payload']: c['return_input'] for c in graph.get('call_effects', []) if c.get('return_input') is not None}
     nodes = {n['start']: n for n in graph['nodes']}
     dispatch = graph['dispatch_table']
     external = {n['address'] for node in nodes.values() for n in node['names']}
@@ -146,7 +150,8 @@ def check_receivers(graph, read, decode, audit):
     image_start, image_end = min(nodes), max(n['end'] for n in nodes.values())
     assert {v for v in external if image_start <= v < image_end} == {v for v in metadata['entries'] if image_start <= v < image_end}
     verified, incoming_checks, blocks_checked = {}, 0, 0
-    verified_stacks, verified_loads = set(), set()
+    verified_stacks, verified_loads, verified_returns = set(), set(), set()
+    context_return_count = 0
     context_results, context_callers, context_keys = 0, set(), set()
     by_site = {e['site']: e for e in graph['edges']}
     checks = [(certificate, None) for certificate in certificates]
@@ -171,13 +176,17 @@ def check_receivers(graph, read, decode, audit):
             supplied = {v['sp_offset']: fact(WORD if v['kind'] == 'word' else OBJECT, int(v['value'], 16)) for v in stack_claims[site]}
             assert all(supplied.get(k) == v for k, v in bindings.items())
         assert context['certificate']['payload'] == context['payload'] and context['payload'] in nodes
-        assert context['resolutions'] and len({r['site'] for r in context['resolutions']}) == len(context['resolutions'])
+        assert context['resolutions'] or context.get('forwarded_returns')
+        assert len({r['site'] for r in context['resolutions']}) == len(context['resolutions'])
+        assert len({r['site'] for r in context.get('forwarded_returns', [])}) == len(context.get('forwarded_returns', []))
         checks.append((context['certificate'], context))
 
     for certificate, context in checks:
         active_claims = {r['site']: r for r in context['resolutions']} if context else claims
         active_stacks, active_loads = ({}, {}) if context else (stack_claims, load_claims)
         verified_context = set()
+        active_returns = {r['site']: r for r in context.get('forwarded_returns', [])} if context else return_claims
+        verified_context_returns = set()
         input_values = {v['sp_offset']: fact(WORD if v['kind'] == 'word' else OBJECT, int(v['value'], 16))
                         for v in context['inputs']} if context else {}
         start = certificate['payload']
@@ -219,7 +228,32 @@ def check_receivers(graph, read, decode, audit):
                 seed[int(name[1:])] = fact(kind, value)
         seed = tuple(seed)
 
+        def forwarded_at(state, live, spills, ins):
+            if metadata.get('word_return_register') != 'x0':
+                return None
+            ops = ins.operands
+            if len(ops) != 1:
+                return None
+            target = None
+            if ins.id == a.ARM64_INS_BL and ops[0].type == a.ARM64_OP_IMM:
+                target = ops[0].imm
+            elif ins.id == a.ARM64_INS_BLR and ops[0].type == a.ARM64_OP_REG:
+                loaded = read_reg(state, ins, ops[0].reg)
+                if loaded[0] == TARGET and loaded[1] < len(dispatch['entries']):
+                    target = dispatch['entries'][loaded[1]]
+            if target not in return_inputs or target not in safe_callees:
+                return None
+            sp = state[15]
+            if sp[0] != STACK or sp[2] != 0 or signed(sp[1]) > -16 or any(v[0] == STACK for r, v in enumerate(state) if r not in (15, 29)):
+                return None
+            offset = signed(sp[1]) + return_inputs[target]
+            value = input_values.get(offset, EMPTY) if offset >= 0 and offset in live else fact(OBJECT, spills[offset]) if offset in spills else EMPTY
+            if value[0] == OBJECT:
+                return target, return_inputs[target], value[1]
+            return None
+
         def step(state, comparison, live, spills, ins):
+            forwarded = forwarded_at(state, live, spills, ins)
             old = state
             state = list(state)
             live = set(live)
@@ -380,6 +414,8 @@ def check_receivers(graph, read, decode, audit):
                                 state[r] = before[r]
                 if ins.id == a.ARM64_INS_BL and ops[0].imm in allocations:
                     state[int(metadata['allocation_result_register'][1:])] = fact(OBJECT, allocations[ops[0].imm])
+                if forwarded and preserves:
+                    state[0] = fact(OBJECT, forwarded[2])
             sp = state[15]
             spills = {k: v for k, v in spills.items() if sp[0] == STACK and sp[2] == 0 and k >= signed(sp[1])}
             return tuple(state), comparison, frozenset(live), spills
@@ -475,6 +511,17 @@ def check_receivers(graph, read, decode, audit):
             for address in range(block['start'], block['end'], 4):
                 ins = by_address[address]
                 sp = state[15]
+                if address in active_returns:
+                    claim = active_returns[address]
+                    assert all(type(claim[k]) is int for k in ('callee', 'input_sp_offset', 'class_id'))
+                    proved = forwarded_at(state, live, spills, ins)
+                    assert proved is not None, 'Unproved forwarded result'
+                    assert (claim['callee'], claim['input_sp_offset'], claim['class_id']) == proved
+                    assert claim['register'] == 'x0' and 0 < len(claim['proof']) <= 128 and address in claim['proof'] and all(type(p) is int and p in by_address for p in claim['proof'])
+                    if context:
+                        verified_context_returns.add(address)
+                    else:
+                        verified_returns.add(address)
                 if ins.id in (a.ARM64_INS_DC, a.ARM64_INS_SYS, a.ARM64_INS_SYSL):
                     stores.clear()
                 if address in active_stacks:
@@ -570,8 +617,11 @@ def check_receivers(graph, read, decode, audit):
                 incoming_checks += 1
         if context:
             assert verified_context == set(active_claims), 'Missing context resolution certificate'
+            assert verified_context_returns == set(active_returns), 'Missing contextual forwarded-result certificate'
+            context_return_count += len(verified_context_returns)
             context_results += len(verified_context)
     assert set(verified) == set(claims), 'Missing or duplicate receiver certificate'
+    assert verified_returns == set(return_claims), 'Missing forwarded-result certificate'
     assert verified_stacks == set(stack_claims), 'Missing stack-input certificate'
     assert verified_loads == set(load_claims), 'Missing entry-stack-load certificate'
     assert context_callers <= verified_stacks, 'Unchecked context caller observations'
@@ -582,4 +632,7 @@ def check_receivers(graph, read, decode, audit):
             'thread_class_inputs_checked': len(thread_classes), 'call_contexts_checked': len(contexts),
             'context_dispatches_checked': context_results, 'context_callers_checked': len(context_callers),
             'call_effects_checked': len(safe_callees), 'call_effect_instructions_checked': effect_instructions,
-            'nonreturning_call_inputs_checked': len(nonreturning_calls)}
+            'nonreturning_call_inputs_checked': len(nonreturning_calls),
+            'forwarded_input_summaries_checked': len(return_inputs),
+            'forwarded_return_calls_checked': len(verified_returns),
+            'context_forwarded_returns_checked': context_return_count}
