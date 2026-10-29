@@ -46,6 +46,7 @@ set(SRCS
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
 	ReceiverAnalysis.cpp
+	CallEffects.cpp
 	ReceiverAnalysis.h
     SnapshotCodeRanges.h
     HtArrayIterator.h

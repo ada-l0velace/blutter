@@ -18,6 +18,15 @@
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
 
+// New engines split closure allocation into numbered stubs with a different
+// ABI. Do not assign the older, reviewed contract to an unreviewed variant.
+template <typename Stubs>
+static const dart::Code* PlainClosureAllocationStub()
+{
+	if constexpr (requires { Stubs::AllocateClosure(); }) return &Stubs::AllocateClosure();
+	else return nullptr;
+}
+
 // TODO: move arm64 specific code to *_arm64 file
 
 static std::unordered_map<std::string, std::string> OP_MAP {
@@ -124,6 +133,104 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
 		const auto& object = dart::Object::Handle(zone, pool.ObjectAt(i));
 		if (!object.IsSmi()) { if (comma) of << ','; comma = true; of << '[' << i << ',' << object.GetClassId() << ']'; }
+	}
+	of << "],\"pool_code_entries\":[";
+	comma = false;
+	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
+		const auto& object = dart::Object::Handle(zone, pool.ObjectAt(i));
+		if (!object.IsCode()) continue;
+		const auto& code = dart::Code::Cast(object);
+		for (const auto kind : {dart::Code::EntryKind::kNormal, dart::Code::EntryKind::kUnchecked}) {
+			const auto address = kind == dart::Code::EntryKind::kNormal ? code.EntryPoint() : code.UncheckedEntryPoint();
+			if (!address) continue;
+			if (comma) of << ','; comma = true;
+			of << '[' << i << ',' << dart::Code::entry_point_offset(kind) - dart::kHeapObjectTag << ',' << address - app.base() << ']';
+		}
+	}
+	of << "],\"leaf_math_contract\":[" << TargetThreadOffset(dart::Thread::LibcRound_entry_point_offset()) << ','
+		<< TargetThreadOffset(dart::Thread::vm_tag_offset()) << ',' << TargetThreadOffset(dart::Thread::saved_stack_limit_offset()) << ',' << dart::VMTag::kDartTagId;
+	of << "],\"thread_heap_classes\":[";
+	// Audit actual cached objects independently of formatted names and pool facts.
+	dart::ArrayPtr cachedEmptyArray;
+	std::memcpy(&cachedEmptyArray, reinterpret_cast<const uint8_t*>(thread) + dart::Thread::empty_array_offset(), sizeof(cachedEmptyArray));
+	const auto& emptyArray = dart::Object::Handle(zone, cachedEmptyArray);
+	of << '[' << TargetThreadOffset(dart::Thread::empty_array_offset()) << ',' << emptyArray.GetClassId() << ']';
+	of << "],\"frame_preserving_calls\":[";
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& stackCheck = dart::StubCode::StackOverflowSharedWithoutFPURegs();
+#else
+	const auto& stackCheck = dart::Code::Handle(zone, thread->isolate_group()->object_store()->stack_overflow_stub_without_fpu_regs_stub());
+#endif
+	if (!stackCheck.IsNull()) of << '[' << stackCheck.EntryPoint() - app.base() << ",\"stack_overflow_without_fpu\"]";
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& arrayBarrier = dart::StubCode::ArrayWriteBarrier();
+#else
+	const auto& arrayBarrier = dart::Code::Handle(zone, thread->isolate_group()->object_store()->array_write_barrier_stub());
+#endif
+	if (!arrayBarrier.IsNull()) {
+		if (!stackCheck.IsNull()) of << ',';
+		of << '[' << arrayBarrier.EntryPoint() - app.base() << ",\"array_write_barrier\"]";
+	}
+	const auto& doubleToInteger = dart::StubCode::DoubleToInteger();
+	if (!doubleToInteger.IsNull()) {
+		if (!stackCheck.IsNull() || !arrayBarrier.IsNull()) of << ',';
+		of << '[' << doubleToInteger.EntryPoint() - app.base() << ",\"double_to_integer\"]";
+	}
+	of << "],\"nonreturning_calls\":[";
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& rangeError = dart::StubCode::RangeErrorSharedWithoutFPURegs();
+#else
+	const auto& rangeError = dart::Code::Handle(zone, thread->isolate_group()->object_store()->range_error_stub_without_fpu_regs_stub());
+#endif
+	if (!rangeError.IsNull()) of << '[' << rangeError.EntryPoint() - app.base() << ",\"range_error_without_fpu\"]";
+	of << "],\"predefined_allocations\":[";
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& arrayAllocation = dart::StubCode::AllocateArray();
+	const auto* closureAllocation = PlainClosureAllocationStub<dart::StubCode>();
+	const auto& mintAllocation = dart::StubCode::AllocateMintSharedWithoutFPURegs();
+#else
+	const auto& arrayAllocation = dart::Code::Handle(zone, thread->isolate_group()->object_store()->allocate_array_stub());
+	const auto* closureAllocation = &dart::Code::Handle(zone, thread->isolate_group()->object_store()->allocate_closure_stub());
+	const auto& mintAllocation = dart::Code::Handle(zone, thread->isolate_group()->object_store()->allocate_mint_without_fpu_regs_stub());
+#endif
+	bool predefinedComma = false;
+	auto auditPredefined = [&](const dart::Code& code, intptr_t cid) {
+		if (code.IsNull()) return;
+		const auto& cls = dart::Class::Handle(zone, thread->isolate_group()->class_table()->At(cid));
+		if (predefinedComma) of << ','; predefinedComma = true;
+		of << '[' << code.EntryPoint() - app.base() << ',' << cls.id() << ']';
+	};
+	auditPredefined(arrayAllocation, dart::kArrayCid);
+	if (closureAllocation) auditPredefined(*closureAllocation, dart::kClosureCid);
+	auditPredefined(mintAllocation, dart::kMintCid);
+	of << "],\"array_body_contract\":[";
+	if (!arrayAllocation.IsNull()) of << arrayAllocation.EntryPoint() - app.base() << ',' << dart::AllocateArrayABI::kLengthReg << ','
+		<< dart::Array::data_offset() - dart::kHeapObjectTag << ',' << dart::compiler::target::kCompressedWordSize << ',' << dart::kSmiTagShift;
+	of << "],\"allocation_body_bounds\":[";
+	bool bodyComma = false;
+	auto auditBody = [&](const dart::Code& code, const dart::Class& cls) {
+		const auto size = cls.target_instance_size();
+		if (size < 8 || size > (1 << 20)) return;
+		if (bodyComma) of << ','; bodyComma = true;
+		of << '[' << code.EntryPoint() - app.base() << ',' << 8 - dart::kHeapObjectTag << ',' << size - dart::kHeapObjectTag << ']';
+	};
+	if (closureAllocation && !closureAllocation->IsNull()) auditBody(*closureAllocation, dart::Class::Handle(zone, thread->isolate_group()->class_table()->At(dart::kClosureCid)));
+	if (!mintAllocation.IsNull()) auditBody(mintAllocation, dart::Class::Handle(zone, thread->isolate_group()->class_table()->At(dart::kMintCid)));
+	for (const auto ptr : visitor.codes) {
+		const auto& code = dart::Code::Handle(zone, ptr);
+		const auto& owner = dart::Object::Handle(zone, code.owner());
+		if (owner.IsClass() && dart::Class::Cast(owner).id() >= dart::kNumPredefinedCids) auditBody(code, dart::Class::Cast(owner));
+	}
+	of << "],\"preserved_call_registers\":[";
+	uint32_t savedMask = 0;
+	for (unsigned r = 0; r < 31; ++r) if (!(dart::kReservedCpuRegisters & (1U << r)) && r != dart::AllocateMintABI::kResultReg && r != dart::AllocateMintABI::kTempReg)
+		savedMask |= 1U << r;
+	if (!mintAllocation.IsNull()) of << '[' << mintAllocation.EntryPoint() - app.base() << ',' << savedMask << ']';
+	uint32_t barrierMask = 0;
+	for (unsigned r = 0; r < 31; ++r) if (!(dart::kReservedCpuRegisters & (1U << r)) && r != dart::kWriteBarrierSlotReg) barrierMask |= 1U << r;
+	if (!arrayBarrier.IsNull()) {
+		if (!mintAllocation.IsNull()) of << ',';
+		of << '[' << arrayBarrier.EntryPoint() - app.base() << ',' << barrierMask << ']';
 	}
 	of << "],\"class_allocations\":[";
 	comma = false;
@@ -619,20 +726,89 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	profile.classIdShift = dart::UntaggedObject::ClassIdTag::shift();
 	profile.classIdBits = dart::UntaggedObject::ClassIdTag::bitsize();
 	profile.headerDisplacement = dart::Object::tags_offset() - dart::kHeapObjectTag;
+	profile.leafMathContract = {TargetThreadOffset(dart::Thread::LibcRound_entry_point_offset()),
+		TargetThreadOffset(dart::Thread::vm_tag_offset()), TargetThreadOffset(dart::Thread::saved_stack_limit_offset()), dart::VMTag::kDartTagId};
 	profile.nullRegister = ARM64_REG_X22;
 	profile.nullClassId = dart::kNullCid;
+	profile.threadHeapClasses.emplace(TargetThreadOffset(dart::Thread::empty_array_offset()),
+		static_cast<uint32_t>(dart::Object::empty_array().GetClassId()));
 	profile.poolHeapClass = [&](int64_t index) -> std::optional<uint32_t> {
 		if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject) return {};
 		const auto& object = dart::Object::Handle(pool.ObjectAt(index));
 		if (object.IsSmi()) return {};
 		return static_cast<uint32_t>(object.GetClassId());
 	};
-	static_assert(dart::NULL_REG == dart::R22 && dart::AllocateObjectABI::kResultReg == dart::R0);
+	static_assert(dart::NULL_REG == dart::R22 && dart::AllocateObjectABI::kResultReg == dart::R0 && dart::AllocateArrayABI::kResultReg == dart::R0 &&
+		dart::AllocateClosureABI::kResultReg == dart::R0 && dart::AllocateMintABI::kResultReg == dart::R0);
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& arrayAllocation = dart::StubCode::AllocateArray();
+	const auto* closureAllocation = PlainClosureAllocationStub<dart::StubCode>();
+	const auto& mintAllocation = dart::StubCode::AllocateMintSharedWithoutFPURegs();
+#else
+	const auto& arrayAllocation = dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->allocate_array_stub());
+	const auto* closureAllocation = &dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->allocate_closure_stub());
+	const auto& mintAllocation = dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->allocate_mint_without_fpu_regs_stub());
+#endif
+	auto addPredefined = [&](const dart::Code& code, uint32_t cid) {
+		if (!code.IsNull() && code.EntryPoint() >= codeStart && code.EntryPoint() < imageEnd) {
+			profile.allocationReturns.emplace(code.EntryPoint() - app.base(), cid);
+			if (cid != dart::kArrayCid) {
+				const auto& cls = dart::Class::Handle(thread->zone(), thread->isolate_group()->class_table()->At(cid));
+				const auto size = cls.target_instance_size();
+				if (size >= 8 && size <= (1 << 20)) profile.allocationBodyBounds.emplace(code.EntryPoint() - app.base(), std::pair{int64_t{7}, static_cast<int64_t>(size - dart::kHeapObjectTag)});
+			}
+		}
+	};
+	addPredefined(arrayAllocation, dart::kArrayCid);
+	if (closureAllocation) addPredefined(*closureAllocation, dart::kClosureCid);
+	addPredefined(mintAllocation, dart::kMintCid);
+	static_assert(dart::AllocateArrayABI::kLengthReg == dart::R2 && dart::kSmiTagShift == 1 && dart::kHeapObjectTag == 1);
+	if (!arrayAllocation.IsNull() && profile.allocationReturns.contains(arrayAllocation.EntryPoint() - app.base()))
+		profile.arrayBodyContract = {static_cast<int64_t>(arrayAllocation.EntryPoint() - app.base()), 2,
+			AOT_Array_data_offset - dart::kHeapObjectTag, dart::compiler::target::kCompressedWordSize, dart::kSmiTagShift};
+	if (!mintAllocation.IsNull() && profile.allocationReturns.contains(mintAllocation.EntryPoint() - app.base()))
+		profile.preservedCallRegisters.emplace(mintAllocation.EntryPoint() - app.base(),
+			static_cast<uint32_t>(dart::kDartAvailableCpuRegs) & ~(1U << dart::AllocateMintABI::kResultReg) & ~(1U << dart::AllocateMintABI::kTempReg));
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& stackCheck = dart::StubCode::StackOverflowSharedWithoutFPURegs();
+#else
+	const auto& stackCheck = dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->stack_overflow_stub_without_fpu_regs_stub());
+#endif
+	if (!stackCheck.IsNull() && stackCheck.EntryPoint() >= codeStart && stackCheck.EntryPoint() < imageEnd)
+		profile.framePreservingCalls.emplace(stackCheck.EntryPoint() - app.base(), "stack_overflow_without_fpu");
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& rangeError = dart::StubCode::RangeErrorSharedWithoutFPURegs();
+#else
+	const auto& rangeError = dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->range_error_stub_without_fpu_regs_stub());
+#endif
+	if (!rangeError.IsNull() && rangeError.EntryPoint() >= codeStart && rangeError.EntryPoint() < imageEnd)
+		profile.nonReturningCalls.emplace(rangeError.EntryPoint() - app.base(), "range_error_without_fpu");
+	const auto& doubleToInteger = dart::StubCode::DoubleToInteger();
+	if (!doubleToInteger.IsNull())
+		profile.framePreservingCalls.emplace(doubleToInteger.EntryPoint() - app.base(), "double_to_integer");
+	static_assert(dart::kWriteBarrierObjectReg == dart::R1 && dart::kWriteBarrierValueReg == dart::R0 && dart::kWriteBarrierSlotReg == dart::R25);
+	static_assert((dart::UntaggedObject::ClassIdTag::mask_in_place() &
+		(dart::UntaggedObject::NotMarkedBit::mask_in_place() | dart::UntaggedObject::OldAndNotRememberedBit::mask_in_place())) == 0);
+#ifdef BLUTTER_NO_OBJECT_STORE_STUBS
+	const auto& arrayBarrier = dart::StubCode::ArrayWriteBarrier();
+#else
+	const auto& arrayBarrier = dart::Code::Handle(thread->zone(), thread->isolate_group()->object_store()->array_write_barrier_stub());
+#endif
+	if (!arrayBarrier.IsNull() && arrayBarrier.EntryPoint() >= codeStart && arrayBarrier.EntryPoint() < imageEnd) {
+		const auto entry = arrayBarrier.EntryPoint() - app.base();
+		profile.framePreservingCalls.emplace(entry, "array_write_barrier");
+		profile.preservedCallRegisters.emplace(entry, static_cast<uint32_t>(dart::kDartAvailableCpuRegs) & ~(1U << dart::kWriteBarrierSlotReg));
+	}
 	for (const auto& [entry, stub] : app.stubs) if (stub->kind == DartStub::AllocateUserObjectStub) {
 		const auto& code = dart::Code::Handle(stub->ptr);
 		const auto& owner = dart::Object::Handle(code.owner());
-		if (owner.IsClass() && code.EntryPoint() >= codeStart && code.EntryPoint() < imageEnd)
+		if (owner.IsClass() && code.EntryPoint() >= codeStart && code.EntryPoint() < imageEnd) {
 			profile.allocationReturns.emplace(entry, static_cast<uint32_t>(dart::Class::Cast(owner).id()));
+			const auto& cls = dart::Class::Handle(thread->zone(), thread->isolate_group()->class_table()->At(dart::Class::Cast(owner).id()));
+			const auto size = cls.target_instance_size();
+			if (cls.id() >= dart::kNumPredefinedCids && size >= 8 && size <= (1 << 20))
+				profile.allocationBodyBounds.emplace(entry, std::pair{int64_t{7}, static_cast<int64_t>(size - dart::kHeapObjectTag)});
+		}
 	}
 	if (const auto* dispatch = thread->isolate_group()->dispatch_table(); dispatch &&
 		dispatch->length() >= profile.dispatchOrigin && dispatch->length() <= (1 << 24)) {

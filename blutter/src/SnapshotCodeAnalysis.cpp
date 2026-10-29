@@ -1,11 +1,13 @@
 #include "SnapshotCodeAnalysis.h"
 #include "ReceiverAnalysis.h"
+#include "CallEffects.h"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -255,6 +257,18 @@ Analyzer::Analyzer(Profile config, std::vector<Payload> ranges, std::vector<Name
 }
 void Analyzer::RegisterEntries(const cs_insn* instructions, size_t count)
 {
+	if (callEffectsPrepared) throw std::runtime_error("Entries must be registered before analysis");
+	if (count && count <= 16384 && count * 4 <= 32 * 1024 * 1024 - contextBytesSize) {
+		const auto index = FindPayload(instructions[0].address);
+		if (index && payloads[*index].start == instructions[0].address && count * 4 == payloads[*index].end - payloads[*index].start && !contextBytes.contains(instructions[0].address)) {
+			std::vector<uint8_t> bytes;
+			for (size_t n = 0; n < count; ++n) {
+				if (instructions[n].size != 4 || instructions[n].address != instructions[0].address + n * 4) { bytes.clear(); break; }
+				bytes.insert(bytes.end(), instructions[n].bytes, instructions[n].bytes + 4);
+			}
+			if (!bytes.empty()) { contextBytesSize += bytes.size(); contextBytes.emplace(instructions[0].address, std::move(bytes)); }
+		}
+	}
 	for (size_t i = 0; i < count; ++i) {
 		if (!instructions[i].detail) throw std::runtime_error("Missing ARM64 instruction details");
 		if (!Transfer(instructions[i])) continue;
@@ -279,6 +293,13 @@ std::optional<size_t> Analyzer::FindPayload(uint64_t address) const
 
 std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, size_t count, uint64_t payloadStart)
 {
+	if (!callEffectsPrepared) {
+		const auto effects = AnalyzeCallEffects(contextBytes, profile);
+		callEffectCertificates = effects.certificates;
+		callEffectAttempts = effects.attempted; callEffectSteps = effects.steps;
+		for (const auto& [entry, certificate] : effects.certificates) profile.frameSafeCallees.insert(entry);
+		callEffectsPrepared = true;
+	}
 	std::map<uint64_t, std::string> comments;
 	const auto index = FindPayload(payloadStart);
 	if (!index || payloads[*index].start != payloadStart) throw std::runtime_error("Unknown annotation payload");
@@ -520,6 +541,18 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 			if (!comment.empty()) comment += " | ";
 			comment += std::format("normal-flow receiver/index proof -> snapshot {:#x}", found->second.snapshotTarget);
 		}
+		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.stackInputs.find(edges[n].site); found != receiver.stackInputs.end()) {
+			edges[n].stackInputs = found->second;
+			auto& comment = comments[edges[n].site];
+			if (!comment.empty()) comment += " | ";
+			comment += "recent stack inputs (partial): ";
+			for (size_t k = 0; k < found->second.size(); ++k) {
+				const auto& value = found->second[k];
+				if (k) comment += ", ";
+				comment += std::format("SP+{:#x} {} {:#x}", value.spOffset, value.kind, value.value);
+			}
+		}
+		entryStackLoads.insert(entryStackLoads.end(), receiver.entryStackLoads.begin(), receiver.entryStackLoads.end());
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
 	}
@@ -528,9 +561,51 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 
 void Analyzer::Write(const std::string& filename) const
 {
+	using Bindings = std::vector<std::tuple<int64_t, std::string, uint64_t>>;
+	std::map<std::pair<uint64_t, Bindings>, std::vector<uint64_t>> groups;
+	std::map<uint64_t, uint64_t> globallyResolved;
+	for (const auto& edge : edges) if (edge.staticDispatch) globallyResolved.emplace(edge.site, edge.staticDispatch->snapshotTarget);
+	for (const auto& edge : edges) if (edge.kind == "call" && edge.target && !edge.stackInputs.empty() && contextBytes.contains(*edge.target)) {
+		Bindings bindings;
+		for (const auto& input : edge.stackInputs) bindings.emplace_back(input.spOffset, input.kind, input.value);
+		std::sort(bindings.begin(), bindings.end());
+		groups[{*edge.target, std::move(bindings)}].push_back(edge.site);
+	}
+	struct Context {
+		uint64_t payload;
+		std::vector<uint64_t> callers;
+		std::vector<StackInput> inputs;
+		ReceiverAnalysisResult analysis;
+	};
+	std::vector<Context> contexts;
+	auto checkedPoolClasses = receiverPoolClasses;
+	size_t attempted = 0, remainingSteps = 20000000;
+	struct Decoder { csh handle = 0; ~Decoder() { if (handle) cs_close(&handle); } } decoder;
+	if (!groups.empty()) {
+		if (cs_open(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, &decoder.handle) != CS_ERR_OK ||
+			cs_option(decoder.handle, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) throw std::runtime_error("Cannot initialize context decoder");
+	}
+	for (const auto& [key, callers] : groups) {
+		if (attempted >= 4096 || !remainingSteps) break;
+		++attempted;
+		const auto& [payload, bindings] = key;
+		const auto& bytes = contextBytes.at(payload);
+		cs_insn* raw = nullptr;
+		const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+		const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+		if (count * 4 != bytes.size()) continue; // Never bridge an undecoded word.
+		std::vector<StackInput> inputs;
+		for (const auto& [offset, kind, value] : bindings) inputs.push_back({offset, kind, value, {}});
+		auto analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &remainingSteps);
+		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();)
+			if (globallyResolved.contains(it->first) && globallyResolved.at(it->first) == it->second.snapshotTarget) it = analysis.resolutions.erase(it); else ++it;
+		if (analysis.resolutions.empty()) continue;
+		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		contexts.push_back({payload, callers, std::move(inputs), std::move(analysis)});
+	}
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":4,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":11,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -591,7 +666,23 @@ void Analyzer::Write(const std::string& filename) const
 				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":";
 			Proof(out, value.proof); out << '}';
 		}
-		out << '}';
+		out << ",\"stack_inputs\":[";
+		for (size_t n = 0; n < edge.stackInputs.size(); ++n) {
+			if (n) out << ',';
+			const auto& value = edge.stackInputs[n];
+			out << "{\"sp_offset\":" << value.spOffset << ",\"kind\":" << Quoted(value.kind)
+				<< ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << ",\"proof\":";
+			Proof(out, value.proof); out << '}';
+		}
+		out << "]}";
+	}
+	out << "],\"entry_stack_loads\":[";
+	for (size_t n = 0; n < entryStackLoads.size(); ++n) {
+		if (n) out << ',';
+		const auto& value = entryStackLoads[n];
+		out << "{\"site\":" << value.site << ",\"payload\":" << value.payload << ",\"entry_sp_offset\":" << value.entrySpOffset
+			<< ",\"register\":" << Quoted(value.reg) << ",\"width\":" << value.width << ",\"proof\":";
+		Proof(out, value.proof); out << '}';
 	}
 	out << "],\"references\":[";
 	for (size_t i = 0; i < references.size(); ++i) {
@@ -636,13 +727,52 @@ void Analyzer::Write(const std::string& filename) const
 		<< ",\"class_id_bits\":" << profile.classIdBits << ",\"null_register\":" << Quoted(RegName(profile.nullRegister))
 		<< ",\"null_class_id\":" << profile.nullClassId << ",\"allocation_result_register\":" << Quoted(RegName(profile.allocationResultRegister)) << ",\"pool_classes\":[";
 	bool first = true;
-	for (const auto& [slot, cid] : receiverPoolClasses) { if (!first) out << ','; first = false; out << '[' << slot << ',' << cid << ']'; }
+	for (const auto& [slot, cid] : checkedPoolClasses) { if (!first) out << ','; first = false; out << '[' << slot << ',' << cid << ']'; }
 	out << "],\"allocation_returns\":["; first = true;
 	for (const auto& [address, cid] : profile.allocationReturns) { if (!first) out << ','; first = false; out << '[' << address << ',' << cid << ']'; }
+	out << "],\"thread_heap_classes\":["; first = true;
+	for (const auto& [offset, cid] : profile.threadHeapClasses) { if (!first) out << ','; first = false; out << '[' << offset << ',' << cid << ']'; }
+	out << "],\"frame_preserving_calls\":["; first = true;
+	for (const auto& [entry, contract] : profile.framePreservingCalls) { if (!first) out << ','; first = false; out << '[' << entry << ',' << Quoted(contract) << ']'; }
+	out << "],\"nonreturning_calls\":["; first = true;
+	for (const auto& [entry, contract] : profile.nonReturningCalls) { if (!first) out << ','; first = false; out << '[' << entry << ',' << Quoted(contract) << ']'; }
+	out << "],\"preserved_call_registers\":["; first = true;
+	for (const auto& [entry, mask] : profile.preservedCallRegisters) { if (!first) out << ','; first = false; out << '[' << entry << ',' << mask << ']'; }
+	out << "],\"leaf_math_contract\":["; first = true;
+	for (const auto value : profile.leafMathContract) { if (!first) out << ','; first = false; out << value; }
+	out << "],\"allocation_body_bounds\":["; first = true;
+	for (const auto& [entry, interval] : profile.allocationBodyBounds) { if (!first) out << ','; first = false; out << '[' << entry << ',' << interval.first << ',' << interval.second << ']'; }
+	out << "],\"array_body_contract\":["; first = true;
+	for (const auto value : profile.arrayBodyContract) { if (!first) out << ','; first = false; out << value; }
 	out << "],\"entries\":["; first = true;
 	for (const auto address : receiverEntries) { if (!first) out << ','; first = false; out << address; }
 	out << "]},\"receiver_certificates\":[";
 	for (size_t n = 0; n < receiverCertificates.size(); ++n) { if (n) out << ','; out << receiverCertificates[n]; }
-	out << "],\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch uses a bounded normal-flow must-fact CFG with entry resets, equal-value joins and equality guards. Indirect-jump payloads and resource-limit failures produce no CFG results. Exception/unknown indirect entries and stack arguments are not recovered. Original local facts stop at transfers/joins.\"}\n";
+	out << "],\"call_effects\":["; first = true;
+	for (const auto& [entry, certificate] : callEffectCertificates) { if (!first) out << ','; first = false; out << certificate; }
+	out << "],\"call_effect_analysis\":{\"attempted\":" << callEffectAttempts << ",\"transfer_steps\":" << callEffectSteps
+		<< ",\"depth_limit\":8,\"payload_byte_limit\":4096,\"step_limit\":2000000},\"call_contexts\":[";
+	for (size_t n = 0; n < contexts.size(); ++n) {
+		if (n) out << ',';
+		const auto& context = contexts[n];
+		out << "{\"payload\":" << context.payload << ",\"callers\":"; Proof(out, context.callers);
+		out << ",\"inputs\":[";
+		for (size_t k = 0; k < context.inputs.size(); ++k) {
+			if (k) out << ',';
+			const auto& value = context.inputs[k];
+			out << "{\"sp_offset\":" << value.spOffset << ",\"kind\":" << Quoted(value.kind) << ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << '}';
+		}
+		out << "],\"resolutions\":["; bool firstResolution = true;
+		for (const auto& [site, value] : context.analysis.resolutions) {
+			if (!firstResolution) out << ','; firstResolution = false;
+			out << "{\"site\":" << site << ",\"load\":" << value.load << ",\"index\":" << value.index << ",\"table_index\":" << value.tableIndex
+				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":"; Proof(out, value.proof); out << '}';
+		}
+		out << "],\"certificate\":" << context.analysis.certificate << '}';
+	}
+	out << "],\"context_analysis\":{\"candidate_groups\":" << groups.size() << ",\"attempted_groups\":" << attempted
+		<< ",\"transfer_steps\":" << 20000000 - remainingSteps << ",\"cached_bytes\":" << contextBytesSize
+		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"cache_limit\":33554432}";
+	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not working registers, return types or heap contents. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

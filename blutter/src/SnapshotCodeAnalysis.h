@@ -50,8 +50,27 @@ struct Profile {
 	arm64_reg nullRegister = ARM64_REG_INVALID;
 	uint32_t nullClassId = 0;
 	arm64_reg allocationResultRegister = ARM64_REG_X0;
+	// SDK allocator contracts, including explicitly reviewed predefined stubs.
 	std::map<uint64_t, uint32_t> allocationReturns;
 	std::function<std::optional<uint32_t>(int64_t)> poolHeapClass;
+	// Matched VM cached-object fields, never inferred from their display names.
+	std::map<int64_t, uint32_t> threadHeapClasses;
+	// Additional matched SDK stubs with no writes into the caller's input
+	// area on normal return. Allocators use allocationReturns.
+	std::map<uint64_t, std::string> framePreservingCalls;
+	// Matched SDK entries that never return normally. Not inferred from names,
+	// absence of RET, or failure to prove a callee's returning effects.
+	std::map<uint64_t, std::string> nonReturningCalls;
+	// GPRs preserved by a specific SDK helper on both fast and slow paths.
+	std::map<uint64_t, uint32_t> preservedCallRegisters;
+	// Machine-code-proved effects, validated separately from SDK contracts.
+	std::set<uint64_t> frameSafeCallees;
+	// Reviewed unary round leaf wrapper: thread entry, vm_tag, saved limit, Dart tag.
+	std::vector<int64_t> leafMathContract;
+	// Tagged-pointer-relative writable body intervals, excluding object headers.
+	std::map<uint64_t, std::pair<int64_t, int64_t>> allocationBodyBounds;
+	// entry, length GPR, data displacement, element bytes, Smi shift.
+	std::vector<int64_t> arrayBodyContract;
 };
 struct Reference {
 	uint64_t site;
@@ -92,6 +111,20 @@ struct StaticDispatch {
 	uint64_t snapshotTarget;
 	std::vector<uint64_t> proof;
 };
+struct StackInput {
+	int64_t spOffset;
+	std::string kind; // word or heap_class; not a complete Dart argument list.
+	uint64_t value;
+	std::vector<uint64_t> proof;
+};
+struct EntryStackLoad {
+	uint64_t site;
+	uint64_t payload;
+	int64_t entrySpOffset;
+	std::string reg;
+	unsigned width;
+	std::vector<uint64_t> proof;
+};
 struct Edge {
 	uint64_t site;
 	uint64_t source;
@@ -110,6 +143,7 @@ struct Edge {
 	std::optional<DispatchAccess> dispatch;
 	// A separate normal-flow CFG inference; original local facts stay unchanged.
 	std::optional<StaticDispatch> staticDispatch;
+	std::vector<StackInput> stackInputs;
 };
 
 class Analyzer {
@@ -133,5 +167,11 @@ private:
 	std::set<uint64_t> receiverEntries;
 	std::vector<std::string> receiverCertificates;
 	std::map<int64_t, uint32_t> receiverPoolClasses;
+	std::vector<EntryStackLoad> entryStackLoads;
+	std::map<uint64_t, std::vector<uint8_t>> contextBytes;
+	size_t contextBytesSize = 0;
+	bool callEffectsPrepared = false;
+	std::map<uint64_t, std::string> callEffectCertificates;
+	size_t callEffectAttempts = 0, callEffectSteps = 0;
 };
 }
