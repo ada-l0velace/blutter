@@ -43,6 +43,15 @@ std::optional<NativeIr::Instruction> LowerArm64(const cs_insn& instruction) {
 	const auto* bytes = instruction.bytes;
 	Instruction result{{instruction.address, uint32_t{bytes[0]} | uint32_t{bytes[1]} << 8 | uint32_t{bytes[2]} << 16 | uint32_t{bytes[3]} << 24}};
 	const auto transfer = [&](uint8_t group) { return std::find(instruction.detail->groups, instruction.detail->groups + instruction.detail->groups_count, group) != instruction.detail->groups + instruction.detail->groups_count; };
+	if (instruction.id == ARM64_INS_RET) {
+		if (d.update_flags || d.writeback) return result;
+		if (d.op_count == 0) result.operation = Return{{30, 64}};
+		else if (d.op_count == 1 && d.operands[0].type == ARM64_OP_REG && Plain(d.operands[0])) {
+			if (const auto target = Register(d.operands[0].reg); target && target->bits == 64 && target->id < 31)
+				result.operation = Return{*target};
+		}
+		return result;
+	}
 	if (d.update_flags || transfer(CS_GRP_CALL) || transfer(CS_GRP_JUMP) || transfer(CS_GRP_RET) || transfer(CS_GRP_INT) ||
 		d.op_count < 2 || d.operands[0].type != ARM64_OP_REG) return result;
 	const auto destination = Register(d.operands[0].reg);
@@ -50,7 +59,12 @@ std::optional<NativeIr::Instruction> LowerArm64(const cs_insn& instruction) {
 	const auto bits = destination->bits;
 	const RegisterWrite target{destination->id, bits, 64, bits == 32 ? Extension::Zero : Extension::None};
 	const auto& source = d.operands[1];
-	if (instruction.id == ARM64_INS_MOV && d.op_count == 2) {
+	if ((instruction.id == ARM64_INS_LDR || instruction.id == ARM64_INS_LDUR) && d.op_count == 2 &&
+		destination->id < 31 && Plain(d.operands[0]) && source.type == ARM64_OP_MEM && Plain(source) &&
+		!d.writeback && source.mem.index == ARM64_REG_INVALID) {
+		if (const auto base = Register(source.mem.base); base && base->bits == 64)
+			result.operation = Load{target, {*base, source.mem.disp}, bits / 8};
+	} else if (instruction.id == ARM64_INS_MOV && d.op_count == 2) {
 		if (const auto value = Value(source, bits, false)) result.operation = Assign{target, *value};
 	} else if ((instruction.id == ARM64_INS_MOVZ || instruction.id == ARM64_INS_MOVN || instruction.id == ARM64_INS_MOVK) &&
 		d.op_count == 2 && source.type == ARM64_OP_IMM && source.imm >= 0 && source.imm <= 65535 && source.ext == ARM64_EXT_INVALID &&
@@ -70,6 +84,48 @@ std::optional<NativeIr::Instruction> LowerArm64(const cs_insn& instruction) {
 		if (const auto value = Value(source, bits, false); value && lsb >= 0 && lsb < bits && size > 0 && size < 64 && size <= bits - lsb)
 			result.operation = ExtractUnsigned{target, *value, static_cast<unsigned>(lsb), static_cast<unsigned>(size)};
 	}
+	if ((instruction.id == ARM64_INS_SBFX || instruction.id == ARM64_INS_SBFIZ) && d.op_count == 4 &&
+		source.type == ARM64_OP_REG && Width(source.reg) == bits && Plain(d.operands[0]) &&
+		d.operands[2].type == ARM64_OP_IMM && d.operands[3].type == ARM64_OP_IMM) {
+		const auto lsb = d.operands[2].imm, size = d.operands[3].imm;
+		if (const auto value = Value(source, bits, false); value && lsb >= 0 && lsb < bits && size > 0 && size <= bits - lsb)
+			result.operation = ExtractSigned{target, *value, instruction.id == ARM64_INS_SBFX ? static_cast<unsigned>(lsb) : 0,
+				static_cast<unsigned>(size), instruction.id == ARM64_INS_SBFIZ ? static_cast<unsigned>(lsb) : 0};
+	}
 	return result;
+}
+std::optional<bool> EvaluateArm64Condition(const cs_insn& branch, const cs_insn& compare, const NativeIr::ReadRegister& read) {
+	const auto b = LowerArm64(branch), c = LowerArm64(compare);
+	if (!b || !c || !read || c->source.address > UINT64_MAX-4 || c->source.address+4 != b->source.address) return {};
+	const auto word = c->source.word, bw = b->source.word;
+	if ((bw & 0xff000010) != 0x54000000 || (bw & 15) >= 14) return {};
+	const unsigned bits = word >> 31 ? 64 : 32;
+	const uint64_t mask = bits == 64 ? UINT64_MAX : UINT32_MAX;
+	const auto left = read({static_cast<uint16_t>((word >> 5) & 31), bits});
+	std::optional<uint64_t> right;
+	if ((word & 0x7f20001f) == 0x6b00001f) {
+		const auto shift = (word >> 10) & 63, kind = (word >> 22) & 3, r = (word >> 16) & 31;
+		if (shift >= bits || kind == 3) return {};
+		right = r == 31 ? std::optional<uint64_t>{0} : read({static_cast<uint16_t>(r), bits});
+		if (right) {
+			*right &= mask;
+			if (kind == 0) *right = (*right << shift) & mask;
+			else {
+				const bool negative = *right & (uint64_t{1} << (bits-1));
+				*right >>= shift;
+				if (kind == 2 && negative && shift) *right |= mask ^ (mask >> shift);
+			}
+		}
+	} else if ((word & 0x7f80001f) == 0x7100001f) right = uint64_t{(word >> 10) & 4095} << ((word & (1U << 22)) ? 12 : 0);
+	if (!left || !right) return {};
+	const auto l = *left & mask, r = *right & mask, d = (l-r) & mask, sign = uint64_t{1} << (bits-1);
+	const bool n = d & sign, z = d == 0, carry = l >= r, overflow = ((l ^ r) & (l ^ d) & sign) != 0;
+	switch (bw & 15) {
+	case 0: return z; case 1: return !z; case 2: return carry; case 3: return !carry;
+	case 4: return n; case 5: return !n; case 6: return overflow; case 7: return !overflow;
+	case 8: return carry && !z; case 9: return !carry || z; case 10: return n == overflow;
+	case 11: return n != overflow; case 12: return !z && n == overflow; case 13: return z || n != overflow;
+	default: return {};
+	}
 }
 }

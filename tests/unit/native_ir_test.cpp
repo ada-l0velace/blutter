@@ -18,16 +18,78 @@ void Value(Operation operation, uint64_t expected, const ReadRegister& read = {}
 	Check(Evaluate(instruction, read) == expected, "IR value differs from authored expectation");
 	const auto effect = GetEffects(instruction);
 	Check(effect.destination.has_value() && !effect.unlistedRegistersMayChange && effect.memory == MemoryEffect::None &&
-		effect.control == ControlEffect::Fallthrough && effect.flags == FlagsEffect::Preserved, "Pure operation has wrong effects");
+		effect.control == ControlEffect::Fallthrough && effect.flags == FlagsEffect::Preserved && effect.fault == FaultEffect::None, "Pure operation has wrong effects");
 }
 void Unknown(Operation operation) {
-	unsigned reads = 0;
+	unsigned reads = 0, memoryReads = 0;
 	const Instruction instruction{{0x1000, 0}, operation};
-	Check(!Evaluate(instruction, [&](RegisterView) { ++reads; return std::optional<uint64_t>{0}; }), "Malformed/opaque operation acquired a value");
-	Check(reads == 0, "Malformed operation read a register before validation");
+	Check(!Evaluate(instruction, [&](RegisterView) { ++reads; return std::optional<uint64_t>{0}; },
+		[&](uint64_t, unsigned) { ++memoryReads; return std::optional<uint64_t>{0}; }), "Malformed/opaque operation acquired a value");
+	Check(reads == 0 && memoryReads == 0, "Malformed operation requested inputs before validation");
 	const auto effect = GetEffects(instruction);
 	Check(!effect.destination && effect.unlistedRegistersMayChange && effect.memory == MemoryEffect::Unknown &&
-		effect.control == ControlEffect::Unknown && effect.flags == FlagsEffect::Unknown, "Malformed/opaque operation acquired pure effects");
+		effect.control == ControlEffect::Unknown && effect.flags == FlagsEffect::Unknown && effect.fault == FaultEffect::Unknown,
+		"Malformed/opaque operation acquired known effects");
+}
+void MemoryAndReturnCases() {
+	unsigned registerReads = 0, memoryReads = 0;
+	const ReadRegister read = [&](RegisterView reg) -> std::optional<uint64_t> {
+		++registerReads;
+		Check(reg.bits == 64, "Address base was narrowed");
+		if (reg.id == 1) return 0x2000;
+		if (reg.id == 31) return 0;
+		return {};
+	};
+	const Instruction narrow{{0x1000, 0}, Load{W(), {{1, 64}, -1}, 4}};
+	const auto effect = GetEffects(narrow);
+	Check(effect.destination && effect.destination->valueBits == 32 && effect.destination->storageBits == 64 &&
+		effect.destination->extension == Extension::Zero && !effect.unlistedRegistersMayChange &&
+		effect.memory == MemoryEffect::Read && effect.control == ControlEffect::Fallthrough &&
+		effect.flags == FlagsEffect::Preserved && effect.fault == FaultEffect::MayFault, "Load effects lost memory read or possible fault");
+	Check(Evaluate(narrow, read, [&](uint64_t address, unsigned bytes) {
+		++memoryReads;
+		Check(address == 0x1fff && bytes == 4, "Load address or width differs");
+		return std::optional<uint64_t>{0xabcdef01ffffffff};
+	}) == 0xffffffff, "Word load failed to zero-extend");
+	Check(registerReads == 1 && memoryReads == 1, "Load made unexpected input requests");
+	const Instruction wide{{0x1004, 0}, Load{X(2), {{31, 64}, 0}, 8}};
+	Check(Evaluate(wide, read, [](uint64_t address, unsigned bytes) {
+		Check(address == 0 && bytes == 8, "Zero address was not passed to the memory policy");
+		return std::optional<uint64_t>{0x8877665544332211};
+	}) == 0x8877665544332211, "Full load was truncated");
+	const auto before = registerReads;
+	Check(!Evaluate(narrow, read), "Missing memory policy acquired a value");
+	Check(registerReads == before, "Missing memory policy unnecessarily requested a base");
+	Check(!Evaluate(narrow, read, [](uint64_t, unsigned) { return std::optional<uint64_t>{}; }), "Unknown memory acquired a value");
+	Check(GetEffects(narrow).memory == MemoryEffect::Read, "Unknown value changed load effects");
+	const auto memoryBefore = memoryReads;
+	Check(!Evaluate(Instruction{{0x1008, 0}, Load{X(), {{7, 64}, 8}, 8}}, read,
+		[&](uint64_t, unsigned) { ++memoryReads; return std::optional<uint64_t>{1}; }), "Unknown base acquired a load value");
+	Check(memoryReads == memoryBefore, "Unknown base requested memory");
+	Check(EvaluateAddress({{1, 64}, -0x2001}, read) == UINT64_MAX, "Negative displacement did not wrap at address width");
+	Check(EvaluateAddress({{1, 64}, 1}, [](RegisterView) { return std::optional<uint64_t>{UINT64_MAX}; }) == 0,
+		"Positive displacement did not wrap at address width");
+	Check(EvaluateAddress({{1, 64}, INT64_MIN}, [](RegisterView) { return std::optional<uint64_t>{0}; }) == (uint64_t{1} << 63),
+		"Most negative displacement caused signed arithmetic");
+	Check(!EvaluateAddress({{1, 32}, 0}, read), "Narrow address base accepted");
+	Check(!EvaluateAddress({{1, 64}, 0}), "Address acquired an absent base");
+	unsigned supplied = 0;
+	const ReadMemory changing = [&](uint64_t, unsigned) { return std::optional<uint64_t>{++supplied}; };
+	Check(Evaluate(narrow, read, changing) == 1 && Evaluate(narrow, read, changing) == 2,
+		"Load evaluator cached a memory value across instructions");
+	const Instruction ret{{0x100c, 0}, Return{{30, 64}}};
+	const auto returns = GetEffects(ret);
+	Check(!returns.destination && !returns.unlistedRegistersMayChange && returns.memory == MemoryEffect::None &&
+		returns.control == ControlEffect::Return && returns.flags == FlagsEffect::Preserved && returns.fault == FaultEffect::MayFault,
+		"Return effects differ from an unchecked control transfer");
+	const auto readsBeforeReturn = registerReads;
+	Check(!Evaluate(ret, read, changing), "Return was evaluated as an ABI result or branch address");
+	Check(registerReads == readsBeforeReturn && supplied == 2, "Return value evaluator requested an input");
+	for (const auto bytes : {0U, 1U, 2U, 8U, 16U}) Unknown(Load{W(), {{1, 64}, 0}, bytes});
+	Unknown(Load{X(), {{1, 64}, 0}, 4});
+	Unknown(Load{W(), {{1, 32}, 0}, 4});
+	Unknown(Load{{0, 32, 64, Extension::None}, {{1, 64}, 0}, 4});
+	Unknown(Return{{30, 32}});
 }
 }
 int main() {
@@ -78,6 +140,7 @@ int main() {
 		Unknown(ExtractUnsigned{X(), RegisterView{1, 64}, 64, 1});
 		Unknown(ExtractUnsigned{W(), RegisterView{1, 32}, 32, 1});
 		Unknown(ExtractUnsigned{W(), RegisterView{1, 32}, 16, 17});
+		MemoryAndReturnCases();
 		std::cout << "Native IR checks passed: " << checks << '\n';
 		return 0;
 	} catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

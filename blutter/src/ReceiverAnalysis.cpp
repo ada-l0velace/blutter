@@ -1,4 +1,6 @@
 #include "ReceiverAnalysis.h"
+#include "StackCheckAnalysis.h"
+#include "Arm64Ir.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -22,9 +24,22 @@ struct Compare {
 	uint64_t value = 0, site = 0;
 	bool operator==(const Compare&) const = default;
 };
+// One selected edge only. Packed values and saved index words are dropped;
+// this is not a general heap domain or a loop-carried allocation identity.
+struct ArrayContinuation {
+	uint64_t site;
+	Fact seed;
+	bool entryBinding;
+	int64_t inputOffset;
+	std::array<Fact, 31> aliases;
+	std::map<int64_t, Fact> cells, roots;
+	bool operator==(const ArrayContinuation&) const = default;
+};
 struct State {
 	std::array<Fact, 31> regs;
 	Compare compare;
+	std::optional<uint64_t> indexedOrigin;
+	uint32_t resultDependencies = 0;
 	// Input values are immutable analysis bindings. Writes kill liveness;
 	// they never recreate an original caller input or introduce a new value.
 	std::set<int64_t> liveInputs;
@@ -33,6 +48,7 @@ struct State {
 	std::map<int64_t, Fact> spills;
 	// One-instruction handoff from the allocation call to its return block.
 	Fact freshArray;
+	std::optional<ArrayContinuation> arrayContinuation;
 	bool operator==(const State&) const = default;
 };
 struct Block { size_t first, end; bool entry; std::optional<State> in; };
@@ -88,6 +104,20 @@ std::set<int> Writes(const cs_insn& i)
 		if (op.type == ARM64_OP_MEM && i.detail->arm64.writeback && Number(op.mem.base) >= 0) result.insert(Number(op.mem.base));
 	}
 	return result;
+}
+bool ReadsResult(const cs_insn& i, uint32_t dependencies)
+{
+	const auto uses = [&](arm64_reg reg) { const int r = Number(reg); return r >= 0 && (dependencies & (1U << r)); };
+	if (i.detail->regs_read_count > std::size(i.detail->regs_read)) return false;
+	for (unsigned n = 0; n < i.detail->regs_read_count; ++n)
+		if (uses(static_cast<arm64_reg>(i.detail->regs_read[n]))) return true;
+	const auto& d = i.detail->arm64;
+	for (unsigned n = 0; n < d.op_count; ++n) {
+		const auto& op = d.operands[n];
+		if (op.type == ARM64_OP_REG && (op.access & CS_AC_READ) && uses(op.reg)) return true;
+		if (op.type == ARM64_OP_MEM && (uses(op.mem.base) || uses(op.mem.index))) return true;
+	}
+	return i.id == ARM64_INS_MOVK && d.op_count && d.operands[0].type == ARM64_OP_REG && uses(d.operands[0].reg);
 }
 std::vector<uint64_t> Union(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b)
 {
@@ -148,8 +178,8 @@ Fact Meet(const Fact& a, const Fact& b)
 	result.proof = Union(a.proof, b.proof);
 	return result.proof.size() <= 128 ? result : Fact{};
 }
-// Contents and identities are confined to one basic block following a matched
-// allocator. No allocation-site identity is carried around a loop or across calls.
+// Contents are block-local, except checked length-call continuations and the
+// explicitly conditioned initial fast edge. Other branches/calls discard them.
 struct LocalArray {
 	Fact seed;
 	bool entryBinding = false;
@@ -157,6 +187,22 @@ struct LocalArray {
 	std::array<Fact, 31> aliases, compressed;
 	std::map<int64_t, Fact> cells;
 	std::map<int64_t, Fact> roots, words;
+	void Restore(const ArrayContinuation& value) {
+		*this = {}; seed = value.seed; entryBinding = value.entryBinding; inputOffset = value.inputOffset;
+		aliases = value.aliases; cells = value.cells; roots = value.roots;
+	}
+	std::optional<ArrayContinuation> Continue(uint64_t site, uint32_t writes) const {
+		if (seed.kind != Word) return {};
+		ArrayContinuation next{site, Proven(seed, site), entryBinding, inputOffset, aliases, cells, roots};
+		if (next.seed.kind != Word) return {};
+		for (unsigned r = 0; r < 31; ++r) next.aliases[r] = (writes & (1U << r)) || next.aliases[r].kind != Word ? Fact{} : Proven(next.aliases[r], site);
+		for (auto* values : {&next.cells, &next.roots})
+			for (auto it = values->begin(); it != values->end();) {
+				it->second = Proven(it->second, site);
+				if (it->second.kind == Unknown) it = values->erase(it); else ++it;
+			}
+		return next;
+	}
 	void Begin(const Fact& fresh, int resultReg) {
 		if (fresh.kind != Word || resultReg < 0) return;
 		*this = {}; seed = fresh; aliases[resultReg] = {Word, 0, 0, 0, fresh.proof};
@@ -289,6 +335,7 @@ bool Join(std::optional<State>& destination, const State& source)
 	auto merged = *destination;
 	for (unsigned r = 0; r < 31; ++r) merged.regs[r] = Meet(merged.regs[r], source.regs[r]);
 	merged.freshArray = Meet(merged.freshArray, source.freshArray);
+	if (merged.arrayContinuation != source.arrayContinuation) merged.arrayContinuation.reset();
 	for (auto it = merged.liveInputs.begin(); it != merged.liveInputs.end();)
 		if (!source.liveInputs.contains(*it)) it = merged.liveInputs.erase(it); else ++it;
 	for (auto it = merged.spills.begin(); it != merged.spills.end();) {
@@ -298,6 +345,9 @@ bool Join(std::optional<State>& destination, const State& source)
 		else { it->second = value; ++it; }
 	}
 	if (merged.compare != source.compare) merged.compare = {};
+	if (merged.indexedOrigin != source.indexedOrigin) { merged.indexedOrigin.reset(); merged.resultDependencies = 0; }
+	else merged.resultDependencies &= source.resultDependencies;
+	for (unsigned r = 0; r < 31; ++r) if (merged.regs[r].kind == Unknown) merged.resultDependencies &= ~(1U << r);
 	if (merged == *destination) return false;
 	destination = std::move(merged);
 	return true;
@@ -310,7 +360,7 @@ void JsonFact(std::ostream& out, unsigned reg, const Fact& f)
 
 ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t count,
 	const Profile& profile, const std::set<uint64_t>& externalEntries,
-	const std::vector<StackInput>* inputs, size_t* sharedSteps, const ArrayInputBinding* arrayInput)
+	const std::vector<StackInput>* inputs, size_t* sharedSteps, const ArrayInputBinding* arrayInput, const InitialStackCheck* initialPath, bool firstTraversal, bool followIndexedResult, bool probeMissingEffects)
 {
 	ReceiverAnalysisResult result;
 	if (!count || count > 16384 || profile.poolSlotSize != 8 || !profile.classIdBits || profile.classIdBits > 32 ||
@@ -333,7 +383,14 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			inputValues.emplace(input.spOffset, Fact{input.kind == "word" ? Word : Object, input.value});
 		}
 	}
+	if ((firstTraversal && (!initialPath || !arrayInput)) || ((followIndexedResult || probeMissingEffects) && !firstTraversal) || (followIndexedResult && probeMissingEffects)) return result;
 	const auto start = instructions[0].address, end = start + count * 4;
+	if (initialPath) {
+		const auto checked = FindInitialStackCheck(instructions, count, profile);
+		for (const auto entry : externalEntries) if (entry > start && entry <= initialPath->site) return result;
+		if (!arrayInput || !checked || *checked != *initialPath || externalEntries.contains(initialPath->successor) ||
+			externalEntries.contains(initialPath->slowPath) || externalEntries.contains(initialPath->slowPath+4)) return result;
+	}
 	const auto& array = profile.arrayBodyContract;
 	const bool arrayEnabled = array.size() == 5 && profile.allocationReturns.contains(array[0]) && array[1] >= 0 && array[1] <= 14 &&
 		array[2] >= 7 && array[2] <= (1 << 20) && (array[3] == 4 || array[3] == 8) && array[4] == 1;
@@ -346,6 +403,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	}
 	std::set<size_t> leaders{0};
 	std::set<size_t> calledEntries;
+	std::set<uint64_t> targetedEntries = externalEntries;
 	std::set<int> written;
 	for (size_t n = 0; n < count; ++n) {
 		const auto& i = instructions[n];
@@ -363,6 +421,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (n + 1 < count) leaders.insert(n + 1);
 			if (!detail.op_count) continue;
 			for (const auto& op : std::span(i.detail->arm64.operands + detail.op_count - 1, size_t{1})) {
+				if (op.type == ARM64_OP_IMM) targetedEntries.insert(static_cast<uint64_t>(op.imm));
 				if (op.type == ARM64_OP_IMM && op.imm >= static_cast<int64_t>(start) && op.imm < static_cast<int64_t>(end) && (op.imm - start) % 4 == 0)
 					{ leaders.insert((op.imm - start) / 4); if (Group(i, CS_GRP_CALL)) calledEntries.insert((op.imm - start) / 4); }
 			}
@@ -426,7 +485,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		return std::pair{value, ForwardedReturn{*target, input, static_cast<uint32_t>(value.value), value.proof}};
 	};
 	auto indexedAt = [&](const State& state, const cs_insn& i, const LocalArray& contents) -> std::optional<std::pair<Fact, IndexedReturn>> {
-		if (profile.wordReturnRegister != ARM64_REG_X0 || contents.seed.kind != Word || contents.entryBinding) return {};
+		if (profile.wordReturnRegister != ARM64_REG_X0 || contents.seed.kind != Word || contents.entryBinding != firstTraversal) return {};
 		const auto& d = i.detail->arm64;
 		if (d.op_count != 1) return {};
 		std::optional<uint64_t> target; std::vector<uint64_t> targetProof;
@@ -450,14 +509,72 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		for (const auto& proof : {sp.proof, contents.seed.proof, contents.roots.at(*arrayAt).proof, index.proof, targetProof}) value.proof = Union(value.proof, proof);
 		value = Proven(std::move(value), i.address);
 		if (value.kind != Object) return {};
-		return std::pair{value, IndexedReturn{*target, contents.seed.origin, index.value / 2, static_cast<uint32_t>(value.value), value.proof}};
+		return std::pair{value, IndexedReturn{*target, contents.seed.origin, index.value / 2, static_cast<uint32_t>(value.value), value.proof, contents.entryBinding ? std::optional<int64_t>{contents.inputOffset} : std::nullopt}};
 	};
 	const bool heapFixed = profile.heapBitsRegister == ARM64_REG_X28 && !written.contains(28);
+	auto lengthAt = [&](const State& state, const cs_insn& i, const LocalArray& contents) -> std::optional<std::pair<Fact, ArrayLengthReturn>> {
+		if (!arrayEnabled || !profile.arrayLengthLayout || profile.wordReturnRegister != ARM64_REG_X0 || contents.seed.kind != Word) return {};
+		const auto& layout = *profile.arrayLengthLayout;
+		if (layout.classId != profile.allocationReturns.at(array[0]) || layout.bytes != array[3] || layout.smiShift != 1 || contents.seed.value > 32) return {};
+		const auto& d = i.detail->arm64;
+		if (d.op_count != 1) return {};
+		std::optional<uint64_t> target; std::vector<uint64_t> targetProof;
+		if (i.id == ARM64_INS_BL && d.operands[0].type == ARM64_OP_IMM) target = d.operands[0].imm;
+		if (i.id == ARM64_INS_BLR && d.operands[0].type == ARM64_OP_REG) {
+			const auto value = Read(state, d.operands[0].reg);
+			if (value.kind == Target && value.value < profile.dispatchEntries.size()) { target = profile.dispatchEntries[value.value]; targetProof = value.proof; }
+		}
+		if (!target || !profile.frameSafeCallees.contains(*target) || !profile.arrayLengthEffects.contains(*target)) return {};
+		const auto& effect = profile.arrayLengthEffects.at(*target); const auto sp = state.regs[15];
+		if (effect.arraySpOffset < 0 || effect.arraySpOffset > 248 || effect.arraySpOffset % 8 ||
+			sp.kind != Stack || sp.aux != 0 || std::bit_cast<int64_t>(sp.value) > -16) return {};
+		for (unsigned r = 0; r < 31; ++r) if (r != 15 && r != 29 && state.regs[r].kind == Stack) return {};
+		const auto at = Add(std::bit_cast<int64_t>(sp.value), effect.arraySpOffset);
+		if (!at || !contents.roots.contains(*at)) return {};
+		Fact value{Word, contents.seed.value << 1};
+		for (const auto& proof : {contents.seed.proof, contents.roots.at(*at).proof, sp.proof, targetProof}) value.proof = Union(value.proof, proof);
+		value = Proven(std::move(value), i.address);
+		if (value.kind != Word) return {};
+		ArrayLengthReturn claim{*target, contents.seed.value, effect.arraySpOffset, {}, {}, value.proof};
+		if (contents.entryBinding) claim.entryInputSpOffset = contents.inputOffset; else claim.allocation = contents.seed.origin;
+		return std::pair{value, claim};
+	};
 	auto execute = [&](State state, const cs_insn& i, LocalArray& contents) {
 		if (arrayEnabled) contents.Begin(state.freshArray, Number(profile.allocationResultRegister));
 		state.freshArray = {};
+		state.arrayContinuation.reset();
+		const auto indexedOrigin = state.indexedOrigin;
+		const bool dependent = followIndexedResult && ReadsResult(i, state.resultDependencies);
+		bool resultDispatch = false;
+		if (followIndexedResult && indexedOrigin && i.id == ARM64_INS_BLR && i.detail->arm64.op_count == 1 && i.detail->arm64.operands[0].type == ARM64_OP_REG) {
+			const auto r = Number(i.detail->arm64.operands[0].reg);
+			resultDispatch = r >= 0 && (state.resultDependencies & (1U << r)) && state.regs[r].kind == Target;
+		}
+		if (probeMissingEffects && contents.entryBinding && contents.seed.kind == Word && !result.missingArrayEffect) {
+			std::optional<uint64_t> target;
+			const auto& d = i.detail->arm64;
+			if (i.id == ARM64_INS_BL && d.op_count == 1 && d.operands[0].type == ARM64_OP_IMM) target = d.operands[0].imm;
+			if (i.id == ARM64_INS_BLR && d.op_count == 1 && d.operands[0].type == ARM64_OP_REG) {
+				const auto value = Read(state, d.operands[0].reg);
+				if (value.kind == Target && value.value < profile.dispatchEntries.size()) target = profile.dispatchEntries[value.value];
+			}
+			const auto sp = state.regs[15];
+			if (target && !profile.arrayReturnInputs.contains(*target) && !profile.arrayLengthEffects.contains(*target) &&
+				sp.kind == Stack && sp.aux == 0 && std::bit_cast<int64_t>(sp.value) <= -16) {
+				for (const auto& [at, root] : contents.roots) {
+					const auto offset = Add(at, -std::bit_cast<int64_t>(sp.value));
+					if (offset && *offset >= 0 && *offset <= 248 && *offset % 8 == 0) {
+						result.missingArrayEffect = {{i.address, *target}}; break;
+					}
+				}
+			}
+		}
 		const auto forwarded = forwardedAt(state, i);
 		const auto indexed = indexedAt(state, i, contents);
+		const auto lengthReturn = lengthAt(state, i, contents);
+		std::optional<ArrayContinuation> continued;
+		if (lengthReturn && i.address + 4 < end && (firstTraversal || !targetedEntries.contains(i.address + 4)))
+			continued = contents.Continue(i.address, profile.arrayLengthEffects.at(lengthReturn->second.callee).writtenRegisters | (1U << 30));
 		const auto element = contents.Result(i, profile, heapFixed);
 		const auto length = arrayEnabled ? state.regs[array[1]] : Fact{};
 		const auto& d = i.detail->arm64;
@@ -521,6 +638,14 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 					else if (source.kind == Header && lsb == profile.classIdShift && bits == profile.classIdBits) produced = {Word, source.value};
 					produced.proof = source.proof;
 				}
+			}
+			if (firstTraversal) if (const auto ir = LowerArm64(i); ir && std::holds_alternative<NativeIr::ExtractSigned>(ir->operation)) {
+				std::vector<uint64_t> proof;
+				const auto value = NativeIr::Evaluate(*ir, [&](NativeIr::RegisterView r) -> std::optional<uint64_t> {
+					if (r.id >= 31 || state.regs[r.id].kind != Word) return {};
+					proof = Union(proof, state.regs[r.id].proof); return state.regs[r.id].value;
+				});
+				if (value) produced = {Word, *value, 0, 0, std::move(proof)};
 			}
 			if ((i.id == ARM64_INS_LDR || i.id == ARM64_INS_LDUR) && d.op_count == 2 && op.type == ARM64_OP_MEM && !d.writeback) {
 				const auto base = Read(state, op.mem.base);
@@ -623,6 +748,11 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (produced.kind == Unknown && width == 32) produced = {Range, UINT32_MAX};
 			state.regs[destination] = Proven(std::move(produced), i.address);
 		}
+		if (followIndexedResult) {
+			for (const int r : writes) state.resultDependencies &= ~(1U << r);
+			if (destination >= 0 && writes.contains(destination) && produced.kind != Unknown && dependent)
+				state.resultDependencies |= 1U << destination;
+		}
 		if (stackWriteback) state.regs[stackWriteback->first] = std::move(stackWriteback->second);
 		if (i.id == ARM64_INS_CMP && d.op_count == 2 && d.operands[0].type == ARM64_OP_REG && destination >= 0) {
 			const auto right = Operand(state, d.operands[1], width);
@@ -662,6 +792,23 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			}
 			if (forwarded && preserves) state.regs[0] = forwarded->first;
 			if (indexed && preserves) state.regs[0] = indexed->first;
+			if (followIndexedResult) {
+				state.indexedOrigin = indexedOrigin;
+				state.resultDependencies = 0;
+				if (indexed && preserves) {
+					state.indexedOrigin = i.address;
+					state.resultDependencies = 1U;
+					state.liveInputs.clear(); state.spills.clear();
+					result.traceGetter = i.address;
+				}
+			}
+			if (lengthReturn && preserves) {
+				const auto mask = profile.arrayLengthEffects.at(lengthReturn->second.callee).writtenRegisters | (1U << 30);
+				for (unsigned r = 0; r < 31; ++r) if (!(mask & (1U << r)) && savedRegs[r].kind != Unknown)
+					state.regs[r] = Proven(savedRegs[r], i.address);
+				state.regs[0] = lengthReturn->first;
+				state.arrayContinuation = std::move(continued);
+			}
 			if (arrayEnabled && i.id == ARM64_INS_BL && d.op_count == 1 && d.operands[0].type == ARM64_OP_IMM && d.operands[0].imm == array[0] &&
 				length.kind == Word && length.value <= 64 && length.value % 2 == 0)
 				state.freshArray = Proven({Word, length.value / 2, 0, i.address, length.proof}, i.address);
@@ -670,6 +817,12 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (sp.kind != Stack || sp.aux != 0) state.spills.clear();
 		else for (auto it = state.spills.begin(); it != state.spills.end();)
 			if (it->first < std::bit_cast<int64_t>(sp.value)) it = state.spills.erase(it); else ++it;
+		if ((initialPath && i.address == initialPath->site) || (firstTraversal && Group(i, CS_GRP_JUMP) && !Group(i, CS_GRP_CALL)))
+			state.arrayContinuation = contents.Continue(i.address, 0);
+		if (firstTraversal && indexed && !followIndexedResult) result.traceStop = i.address;
+		if (resultDispatch) result.traceStop = i.address;
+		if (followIndexedResult) for (unsigned r = 0; r < 31; ++r)
+			if (state.regs[r].kind == Unknown) state.resultDependencies &= ~(1U << r);
 		return state;
 	};
 	// Generate edge states and apply only equality constraints. A 32-bit test
@@ -682,7 +835,18 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		auto append = [&](uint64_t address, State edge) {
 			if (address >= start && address < end && (address - start) % 4 == 0) edges.emplace_back(blockOf[(address - start) / 4], std::move(edge));
 		};
-		if (Terminal(i)) return edges;
+		if (Terminal(i) || (firstTraversal && result.traceStop == i.address)) return edges;
+		if (probeMissingEffects && result.missingArrayEffect && result.missingArrayEffect->first == i.address) return edges;
+		// A result use never crosses another call. The getter itself is the
+		// one allowed returning producer; its mutable contents have expired.
+		if (followIndexedResult && state.indexedOrigin && Group(i, CS_GRP_CALL) && *state.indexedOrigin != i.address) return edges;
+		if (initialPath && i.address == initialPath->site) { append(initialPath->successor, state); return edges; }
+		if (firstTraversal && Group(i, CS_GRP_JUMP) && !Group(i, CS_GRP_CALL)) {
+			if (const auto guard = FindStackCheckAt(instructions, count, profile, i.address)) {
+				if (result.traceGuards.size() >= 8) return edges;
+				result.traceGuards.push_back(*guard); append(guard->successor, state); return edges;
+			}
+		}
 		if (i.id == ARM64_INS_BL && d.op_count == 1 && d.operands[0].type == ARM64_OP_IMM && profile.nonReturningCalls.contains(d.operands[0].imm)) return edges;
 		if (Group(i, CS_GRP_CALL) || !Group(i, CS_GRP_JUMP)) { if (b.end < count) append(start + b.end * 4, state); return edges; }
 		const auto target = static_cast<uint64_t>(d.operands[d.op_count - 1].imm);
@@ -692,6 +856,10 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		uint64_t equalValue = 0, compareSite = 0;
 		bool equalityTaken = false;
 		std::optional<bool> taken;
+		if (firstTraversal && b.end - b.first >= 2) taken = EvaluateArm64Condition(i, instructions[b.end-2], [&](NativeIr::RegisterView r) -> std::optional<uint64_t> {
+			if (r.id >= 31 || state.regs[r.id].kind != Word) return {};
+			return state.regs[r.id].value;
+		});
 		if (i.id == ARM64_INS_B && (d.cc == ARM64_CC_EQ || d.cc == ARM64_CC_NE) && state.compare.reg >= 0) {
 			compared = state.compare.reg; width = state.compare.width; equalValue = state.compare.value; compareSite = state.compare.site;
 			equalityTaken = d.cc == ARM64_CC_EQ;
@@ -711,6 +879,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (value.kind == Word) taken = ((value.value & Mask(width)) == equalValue) == equalityTaken;
 			else if (value.kind == Range && equalValue > value.value) taken = !equalityTaken;
 		}
+		if (firstTraversal && !taken) return edges;
 		for (bool branch : {false, true}) {
 			if (taken && *taken != branch) continue;
 			auto edge = state;
@@ -737,21 +906,37 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	size_t steps = 0;
 	while (!work.empty()) {
 		const auto current = work.front(); work.pop_front(); queued[current] = false;
+		if (firstTraversal) {
+			const auto address = start + blocks[current].first*4;
+			if (result.traceBlocks.size() >= 64 || std::find(result.traceBlocks.begin(), result.traceBlocks.end(), address) != result.traceBlocks.end()) return {};
+			result.traceBlocks.push_back(address);
+		}
 		auto state = *blocks[current].in;
 		LocalArray contents;
 		if (arrayInput && blocks[current].first == 0) contents.BeginInput(*arrayInput, profile);
+		else if (state.arrayContinuation) contents.Restore(*state.arrayContinuation);
 		for (size_t n = blocks[current].first; n < blocks[current].end; ++n) {
-			if (++steps > 1000000 || (sharedSteps && !*sharedSteps)) return {};
+			if (++steps > (firstTraversal ? 256U : 1000000U) || (sharedSteps && !*sharedSteps)) return {};
 			if (sharedSteps) --*sharedSteps;
 			state = execute(std::move(state), instructions[n], contents);
 		}
-		for (auto& [next, incoming] : successors(current, state))
+		if (firstTraversal && !Group(instructions[blocks[current].end-1], CS_GRP_CALL))
+			state.arrayContinuation = contents.Continue(instructions[blocks[current].end-1].address, 0);
+		auto outgoing = successors(current, state);
+		if (firstTraversal && outgoing.size() > 1) return {};
+		for (auto& [next, incoming] : outgoing)
 			if (Join(blocks[next].in, incoming) && !queued[next]) { work.push_back(next); queued[next] = true; }
+	}
+	if (firstTraversal && !result.traceStop) {
+		ReceiverAnalysisResult unresolved;
+		if (probeMissingEffects) unresolved.missingArrayEffect = result.missingArrayEffect;
+		return unresolved;
 	}
 	for (const auto& b : blocks) if (b.in) {
 		auto state = *b.in;
 		LocalArray contents;
 		if (arrayInput && b.first == 0) contents.BeginInput(*arrayInput, profile);
+		else if (state.arrayContinuation) { contents.Restore(*state.arrayContinuation); result.arrayContinuationUsed = true; }
 		// Deliberately local to one basic block. These are recent physical
 		// writes at a call boundary, not a signature or inferred argument count.
 		std::map<int64_t, Fact> recentStores;
@@ -768,6 +953,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			}
 			if (const auto forwarded = forwardedAt(state, i)) result.forwardedReturns.emplace(i.address, forwarded->second);
 			if (const auto indexed = indexedAt(state, i, contents)) result.indexedReturns.emplace(i.address, indexed->second);
+			if (const auto lengthReturn = lengthAt(state, i, contents)) result.lengthReturns.emplace(i.address, lengthReturn->second);
 			if (OpaqueMemory(i)) recentStores.clear();
 			if (Group(i, CS_GRP_CALL) && sp.kind == Stack) {
 				for (const auto& [offset, value] : recentStores) {
@@ -830,7 +1016,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || sp.kind != state.regs[15].kind || sp.aux != state.regs[15].aux) recentStores.clear();
 		}
 	}
-	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
+	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && result.lengthReturns.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
 	std::ostringstream certificate;
 	certificate << "{\"payload\":" << start << ",\"blocks\":[";
 	for (size_t n = 0; n < blocks.size(); ++n) {
@@ -850,6 +1036,8 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		certificate << "],\"fresh_array\":";
 		if (b.in && b.in->freshArray.kind == Word) certificate << "{\"allocation\":" << b.in->freshArray.origin << ",\"length\":" << b.in->freshArray.value << '}';
 		else certificate << "null";
+		certificate << ",\"array_continuation\":";
+		if (b.in && b.in->arrayContinuation) certificate << b.in->arrayContinuation->site; else certificate << "null";
 		certificate << '}';
 	}
 	certificate << "]}";

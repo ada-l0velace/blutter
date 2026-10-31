@@ -41,9 +41,11 @@ def main():
                         str(root / 'blutter/src/CallEffects.cpp'),
                         str(root / 'blutter/src/NativeIr.cpp'),
                         str(root / 'blutter/src/Arm64Ir.cpp'),
+                        str(root / 'blutter/src/ArrayLengthAnalysis.cpp'),
+                        str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -70,7 +72,8 @@ def main():
             if args.memcheck:
                 command = ['valgrind', '--quiet', '--error-exitcode=97', '--leak-check=full',
                            '--errors-for-leak-kinds=definite,indirect,possible'] + command
-            subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes),
+            subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
+                BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
             # The checker verifies inductive invariants instead of reproducing the
@@ -78,13 +81,20 @@ def main():
             decoder = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)
             decoder.detail = True
             fixture_bytes = {address: (temp / (str(address) + '.bin')).read_bytes() for address in blocks}
+            if late_helper:
+                fixture_bytes.update({0x10000+n*8: bytes.fromhex('c0035fd6') for n in range(16384)})
             def read(address, length):
-                return fixture_bytes[address][:length]
+                for start, raw in fixture_bytes.items():
+                    if start <= address and address+length <= start+len(raw):
+                        return raw[address-start:address-start+length]
+                raise AssertionError('Read outside authored fixture bytes')
             audit = {'heap_bits_register': 'x28' if element_bytes == 4 else None, 'word_return_register': 'x0', 'pool_heap_classes': [[3, 1], [4, 1], [5, 2]], 'class_allocations': [[0x2000, 1]],
                              'pool_code_entries': [[2, 7, 0x2000], [2, 15, 0x2004], [6, 7, 0x5000], [7, 7, 0xa000], [8, 7, 0xc000]],
                              'leaf_math_contract': [0x80, 0x88, 0x90, 8],
                              'allocation_body_bounds': [[0x2000, 7, 31], [0x7000, 7, 15], [0x8000, 7, 39]],
                              'array_body_contract': [0x6000, 2, 15, element_bytes, 1],
+                             'array_length_layout': [2, 7, element_bytes, 1],
+                             'stack_limit_offset': 0x60,
                              'thread_heap_classes': [[0xa8, 2]],
                              'predefined_allocations': [[0x6000, 2], [0x7000, 3], [0x8000, 4]],
                              'preserved_call_registers': [[0x7000, 1 << 2], [0x9000, 31]],
@@ -92,7 +102,165 @@ def main():
                              'frame_preserving_calls': [[0x3000, 'stack_overflow_without_fpu'], [0x9000, 'array_write_barrier'], [0xa000, 'double_to_integer']]}
             def verify(value):
                 return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
+            if name == 'prefix-interior-dispatch-entries':
+                assert len(result['prefix_call_effects']) == 2, 'Interior helper proofs missing'
+                for defect in ('missing-parent', 'wrong-parent', 'unrecorded-entry', 'legacy-scope', 'legacy-format', 'boolean-parent'):
+                    forged = copy.deepcopy(result)
+                    effect = forged['prefix_call_effects'][0]
+                    if defect == 'missing-parent': effect.pop('containing_payload')
+                    elif defect == 'wrong-parent': effect['containing_payload'] = 0x5000
+                    elif defect == 'unrecorded-entry':
+                        forged['dispatch_table']['entries'] = [None if v == effect['payload'] else v for v in forged['dispatch_table']['entries']]
+                    elif defect == 'legacy-scope': forged['call_effects'].extend(forged['prefix_call_effects'])
+                    elif defect == 'legacy-format': forged['format'] = 21
+                    elif defect == 'boolean-parent': effect['containing_payload'] = True
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('prefix-interior-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged interior-entry proof: '+defect)
+            if name == 'prefix-helper-budget-boundary':
+                for defect in ('missing', 'duplicate', 'argument-slot', 'result-slot'):
+                    forged = copy.deepcopy(result)
+                    if defect == 'missing': forged['prefix_call_effects'] = []
+                    elif defect == 'duplicate': forged['prefix_call_effects'] *= 2
+                    elif defect == 'argument-slot': forged['prefix_call_effects'][0]['array_return']['array_sp_offset'] = 0
+                    elif defect == 'result-slot': forged['prefix_call_effects'][0]['array_return']['index_sp_offset'] = 8
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('prefix-helper-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged supplemental proof: '+defect)
+            if name == 'result-use-tagged-header':
+                for defect in ('getter', 'stop', 'blocks', 'scope', 'class', 'target', 'continuation', 'promoted'):
+                    forged = copy.deepcopy(result)
+                    c = forged['array_result_traces'][0]
+                    if defect == 'getter': c['trace']['getter'] += 4
+                    elif defect == 'stop': c['trace']['stop'] -= 4
+                    elif defect == 'blocks': c['trace']['blocks'].append(c['trace']['blocks'][-1])
+                    elif defect == 'scope': c['scope'] = 'entry_prefix'
+                    elif defect == 'class': c['indexed_returns'][0]['class_id'] += 1
+                    elif defect == 'target': c['resolutions'][0]['snapshot_target'] += 4
+                    elif defect == 'continuation':
+                        block = next(b for b in c['certificate']['blocks'] if b['start'] == c['trace']['getter']+4)
+                        block['array_continuation'] = c['trace']['getter']
+                    elif defect == 'promoted':
+                        forged['array_entry_traces'] = forged['array_result_traces']
+                        forged['array_result_traces'] = []
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('result-use-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged result use: '+defect)
+            if name == 'entry-prefix-first-result-4':
+                for defect in ('stop', 'repeat', 'omit-block', 'guard-offset', 'guard-stub', 'guard-missing', 'index', 'class', 'binding', 'scope', 'promoted'):
+                    forged = copy.deepcopy(result)
+                    c = forged['array_entry_traces'][0]
+                    claim = c['indexed_returns'][0]
+                    if defect == 'stop': c['trace']['stop'] += 4
+                    elif defect == 'repeat': c['trace']['blocks'].append(c['trace']['blocks'][0])
+                    elif defect == 'omit-block': del c['trace']['blocks'][1]
+                    elif defect == 'guard-offset': c['trace']['stack_checks'][0]['site'] += 4
+                    elif defect == 'guard-stub': c['trace']['stack_checks'][0]['stub'] += 4
+                    elif defect == 'guard-missing': c['trace']['stack_checks'] = []
+                    elif defect == 'index': claim['index'] = 1
+                    elif defect == 'class': claim['class_id'] += 1
+                    elif defect == 'binding': claim['entry_input_sp_offset'] += 8
+                    elif defect == 'scope': c['scope'] = 'entry_chain'
+                    elif defect == 'promoted':
+                        forged['array_contexts'] = forged['array_entry_traces']
+                        forged['array_entry_traces'] = []
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('entry-prefix-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged entry trace: '+defect)
+            if name == 'stack-path-element-and-dispatch':
+                for defect in ('edge', 'site', 'successor', 'slow_path', 'stub', 'proof', 'offset', 'scope', 'missing', 'promoted'):
+                    forged = copy.deepcopy(result)
+                    c = forged['array_path_contexts'][0]
+                    condition = c['path_condition']
+                    if defect == 'edge': condition['edge'] = 'taken'
+                    elif defect in ('site', 'successor', 'slow_path', 'stub'): condition[defect] += 4
+                    elif defect == 'proof': condition['proof'] = condition['proof'][:-1]
+                    elif defect == 'offset': forged['receiver_metadata']['stack_limit_offset'] += 8
+                    elif defect == 'scope': c['scope'] = 'entry_chain'
+                    elif defect == 'missing': del c['path_condition']
+                    elif defect == 'promoted':
+                        forged['array_contexts'] = forged['array_path_contexts']
+                        forged['array_path_contexts'] = []
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('stack-path-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged path condition: '+defect)
+
             verify(result)
+            if name == 'length-call-bound-array':
+                for defect in ('scope', 'origin', 'slot', 'value', 'status', 'continuation'):
+                    forged = copy.deepcopy(result)
+                    context = next(c for c in forged['array_contexts'] if c['array_length_returns'])
+                    claim = context['array_length_returns'][0]
+                    if defect == 'scope': context['scope'] = 'entry_block'
+                    elif defect == 'origin': claim['entry_input_sp_offset'] = 8
+                    elif defect == 'slot': claim['input_sp_offset'] = 8
+                    elif defect == 'value': claim['value'] = '0x6'
+                    elif defect == 'status': context['status'] = 'length_proved'
+                    else: next(b for b in context['certificate']['blocks'] if b.get('array_continuation') is not None)['array_continuation'] = None
+                    try:
+                        verify(forged)
+                    except AssertionError:
+                        passed.append('length-context-certificate-reject-' + defect)
+                    else:
+                        raise AssertionError('Forged contextual length application accepted: ' + defect)
+            if name == 'length-call-local-array-4':
+                for defect in ('value', 'length', 'callee', 'slot', 'allocation', 'origin', 'proof', 'mask', 'callee-certificate', 'continuation', 'missing-continuation'):
+                    forged = copy.deepcopy(result)
+                    edge = next(e for e in forged['edges'] if e.get('array_length_return'))
+                    claim = edge['array_length_return']
+                    if defect == 'value': claim['value'] = '0x6'
+                    elif defect == 'length': claim['length'] = 3
+                    elif defect == 'callee': claim['callee'] += 4
+                    elif defect == 'slot': claim['input_sp_offset'] = 8
+                    elif defect == 'allocation': claim['allocation'] += 4
+                    elif defect == 'origin': claim['allocation'] = None; claim['entry_input_sp_offset'] = 0
+                    elif defect == 'proof': claim['proof'].remove(edge['site'])
+                    elif defect == 'mask': next(c['array_length'] for c in forged['call_effects'] if c['payload'] == claim['callee'])['written_registers'] = 0
+                    elif defect == 'callee-certificate': forged['call_effects'] = [c for c in forged['call_effects'] if c['payload'] != claim['callee']]
+                    else:
+                        block = next(b for c in forged['receiver_certificates'] if c['payload'] == 0x1000 for b in c['blocks'] if b.get('array_continuation') is not None)
+                        block['array_continuation'] = block['array_continuation']-4 if defect == 'continuation' else None
+                    try:
+                        verify(forged)
+                    except AssertionError:
+                        passed.append('length-call-certificate-reject-' + defect)
+                    else:
+                        raise AssertionError('Forged length application accepted: ' + defect)
+            if name == 'array-length-4-16':
+                for defect in ('class', 'slot', 'result', 'representation', 'effect', 'fault', 'proof', 'layout', 'audit', 'legacy'):
+                    forged = copy.deepcopy(result)
+                    claim = next(c['array_length'] for c in forged['call_effects'] if c.get('array_length'))
+                    if defect == 'class': claim['array_class_id'] += 1
+                    elif defect == 'slot': claim['array_sp_offset'] = 0
+                    elif defect == 'result': claim['result_register'] = 'x1'
+                    elif defect == 'representation': claim['result_representation'] = 'smi'
+                    elif defect == 'effect': claim['heap_effect'] = 'unknown'
+                    elif defect == 'fault': claim['may_fault'] = False
+                    elif defect == 'proof': claim['proof'].pop()
+                    elif defect == 'layout': forged['receiver_metadata']['array_length_layout'][1] += 4
+                    elif defect == 'audit': forged['receiver_metadata']['array_length_layout'][2] = 8
+                    else: forged['format'] = 15
+                    try:
+                        verify(forged)
+                    except AssertionError:
+                        passed.append('array-length-certificate-reject-' + defect)
+                    else:
+                        raise AssertionError('Forged length contract accepted: ' + defect)
             if name == 'indexed-result-4-0':
                 for defect in ('class', 'index', 'allocation', 'callee', 'duplicate', 'missing-certificate', 'legacy'):
                     forged = copy.deepcopy(result)
@@ -820,6 +988,84 @@ def main():
         assert not resolved(d) and not any(e['array_arguments'] for e in d['edges'])
         d = run('array-full-width-elements', allocate + ['ldr x3, [x27, #40]', 'stur x3, [x0, #15]', 'ldur x2, [x0, #15]'] + dispatch[:-1] + epilogue, element_bytes=8)
         assert len(resolved(d)) == 1
+        # A conditional length relation is stronger than a frame-only proof.
+        def length_summary(data):
+            return next((c.get('array_length') for c in data['call_effects'] if c['payload'] == 0x5000), None)
+        for width in (4, 8):
+            for slot in (0, 16, 248):
+                body = [f'ldr x3, [x15, #{slot}]', f'ldur {"w0" if width == 4 else "x0"}, [x3, #7]', 'ret']
+                d = run(f'array-length-{width}-{slot}', ['bl 0x5000'], {0x5000: body}, element_bytes=width)
+                claim = length_summary(d)
+                assert claim and claim['array_sp_offset'] == slot and claim['array_class_id'] == 2
+                assert claim['heap_effect'] == 'read_only' and claim['may_fault'] is True
+        simple_length = ['ldr x3, [x15, #16]', 'ldur w0, [x3, #7]', 'ret']
+        d = run('array-length-copied-input-and-result', ['bl 0x5000'],
+                {0x5000: ['mov x5, x15', 'ldr x3, [x5, #16]', 'ldur w2, [x3, #7]', 'mov x0, x2', 'ret']})
+        assert length_summary(d)
+        for name, body in [
+            ('wrong-field', [simple_length[0], 'ldur w0, [x3, #15]', 'ret']),
+            ('wrong-width', [simple_length[0], 'ldur x0, [x3, #7]', 'ret']),
+            ('signed-field', [simple_length[0], 'ldursw x0, [x3, #7]', 'ret']),
+            ('narrow-input', ['ldr w3, [x15, #16]'] + simple_length[1:]),
+            ('outside-input-window', ['ldr x3, [x15, #256]'] + simple_length[1:]),
+            ('clobbered-result', simple_length[:-1] + ['mov x0, x9', 'ret']),
+            ('heap-write', simple_length[:-1] + ['stur w9, [x3, #15]', 'ret']),
+            ('returning-call', prologue + ['bl 0x3000'] + ['ldr x3, [x29, #32]', simple_length[1]] + epilogue),
+            ('frame-writes', prologue + ['ldr x3, [x29, #32]', simple_length[1]] + epilogue),
+            ('branch', simple_length[:-1] + ['cbz x9, 0x500c', 'ret']),
+            ('alternate-return', simple_length[:-1] + ['ret x19']),
+            ('trailing-code', simple_length + ['nop']),
+        ]:
+            d = run('array-length-reject-' + name, ['bl 0x5000'], {0x5000: body})
+            assert length_summary(d) is None, name
+            if name == 'frame-writes': assert any(c['payload'] == 0x5000 for c in d['call_effects'])
+        def length_leaf(width=4, argument=0, pointer='x1'):
+            return [f'ldr {pointer}, [x15, #{argument}]', f'ldur {"w0" if width == 4 else "x0"}, [{pointer}, #7]', 'ret']
+        def length_claims(data):
+            return [e['array_length_return'] for e in data['edges'] if e.get('array_length_return')]
+        for width in (4, 8):
+            prepare = allocate + ['ldr x3, [x27, #40]', f'stur {"w3" if width == 4 else "x3"}, [x0, #15]', 'mov x8, x0', 'str x8, [x15]']
+            consume = [f'ldur {"w4" if width == 4 else "x2"}, [x8, #15]'] + (['add x2, x4, x28, lsl #32'] if width == 4 else [])
+            d = run(f'length-call-local-array-{width}', prepare + ['bl 0x5000', 'mov x6, x0'] + consume + dispatch[:-1] + epilogue,
+                    {0x5000: length_leaf(width)}, element_bytes=width)
+            assert len(length_claims(d)) == 1 and length_claims(d)[0]['length'] == 2 and length_claims(d)[0]['value'] == '0x4'
+            assert len(resolved(d)) == 1 and any(b.get('array_continuation') is not None for c in d['receiver_certificates'] if c['payload'] == 0x1000 for b in c['blocks'])
+        prepare = allocate + write + ['mov x8, x0', 'str x8, [x15]']
+        consume = ['ldur w4, [x8, #15]', 'add x2, x4, x28, lsl #32'] + dispatch[:-1] + epilogue
+        d = run('length-call-repeated-leaves', prepare + ['bl 0x5000', 'bl 0x5000'] + consume, {0x5000: length_leaf()})
+        assert len(length_claims(d)) == 2 and len(resolved(d)) == 1
+        d = run('length-call-reload-clobbered-root', prepare + ['bl 0x5000', 'ldr x8, [x15]'] + consume, {0x5000: length_leaf(pointer='x8')})
+        assert len(length_claims(d)) == 1 and len(resolved(d)) == 1
+        d = run('length-call-empty-array', prologue + ['mov x2, #0', 'bl 0x6000', 'str x0, [x15]', 'bl 0x5000'] + epilogue, {0x5000: length_leaf()})
+        assert len(length_claims(d)) == 1 and length_claims(d)[0]['length'] == 0
+        continuation_address = 0x1000+(len(prepare)+1)*4
+        d = run('length-call-external-return-entry', prepare + ['bl 0x5000'] + consume,
+                {0x5000: length_leaf(), 0x4000: [f'b {hex(continuation_address)}']})
+        assert len(length_claims(d)) == 1 and not resolved(d)
+        d = run('length-call-backedge-return-entry', prepare + ['bl 0x5000'] + consume[:-3] +
+                [f'cbz x9, {hex(continuation_address)}'] + consume[-3:], {0x5000: length_leaf()})
+        assert len(length_claims(d)) == 1 and not resolved(d)
+        d = run('length-call-drops-packed-handoff', prepare + ['ldur w9, [x8, #15]', 'bl 0x5000', 'add x2, x9, x28, lsl #32'] + dispatch[:-1] + epilogue,
+                {0x5000: length_leaf()})
+        assert len(length_claims(d)) == 1 and not resolved(d)
+        for name, before, after, leaf in [
+            ('wrong-class', ['ldr x3, [x27, #40]', 'str x3, [x15]'], [], length_leaf()),
+            ('same-class-other-identity', ['ldr x3, [x27, #56]', 'str x3, [x15]'], [], length_leaf()),
+            ('partial-argument', ['sturb w9, [x15, #1]'], [], length_leaf()),
+            ('wrong-slot', [], [], length_leaf(argument=8)),
+            ('clobbered-root-register', [], [], length_leaf(pointer='x8')),
+            ('unknown-call', [], ['bl 0x3000'], length_leaf()),
+            ('changed-element', [], ['sturb w9, [x8, #16]'], length_leaf()),
+            ('branch-boundary', [], [f'b {hex(0x1000+(len(prepare)+2)*4)}'], length_leaf()),
+        ]:
+            d = run('length-call-reject-' + name, prepare + before + ['bl 0x5000'] + after + consume, {0x5000: leaf})
+            assert not resolved(d), name
+            if name in ('wrong-class', 'same-class-other-identity', 'partial-argument', 'wrong-slot'): assert not length_claims(d), name
+        indirect_length = ['mov x0, #4', 'ldr x30, [x21, x0, lsl #3]', 'blr x30']
+        d = run('length-call-indirect-target', prepare + indirect_length + consume, {0xb000: length_leaf()})
+        assert len(length_claims(d)) == 1 and length_claims(d)[0]['callee'] == 0xb000 and len(resolved(d)) == 2
+        d = run('length-call-does-not-preserve-lr', prepare + indirect_length + ['blr x30'] + epilogue, {0xb000: length_leaf()})
+        assert len(length_claims(d)) == 1 and len(resolved(d)) == 1
         # Conditional input-to-element summaries, independent authored getters.
         def array_summary(data):
             return next((c.get('array_return') for c in data['call_effects'] if c['payload'] == 0x5000), None)
@@ -846,6 +1092,12 @@ def main():
         narrow_index = getter()[:2] + ['mov w4, w4'] + getter()[2:]
         d = run('indexed-result-bounded-smi-word-copy', indexed_caller() + consumer, {0x5000: narrow_index})
         assert array_summary(d) and len(resolved(d)) == 1
+        unscaled_inputs = ['ldur x2, [x15, #8]', 'ldur x4, [x15]'] + getter()[2:]
+        d = run('indexed-result-unscaled-entry-loads', indexed_caller() + consumer, {0x5000: unscaled_inputs})
+        assert array_summary(d) and len(resolved(d)) == 1
+        overlapping_base = ['mov x2, x15', 'ldr x2, [x2, #8]'] + getter()[1:]
+        d = run('indexed-result-load-overwrites-base', indexed_caller() + consumer, {0x5000: overlapping_base})
+        assert array_summary(d) and len(resolved(d)) == 1
         indirect = ['mov x0, #4', 'ldr x30, [x21, x0, lsl #3]', 'blr x30', 'mov x2, x0'] + dispatch[:-1] + epilogue
         d = run('indexed-result-proved-indirect-callee', indexed_caller() + indirect, {0xb000: getter()})
         assert len(resolved(d)) == 2 and any(e.get('indexed_return', {}).get('callee') == 0xb000 for e in d['edges'] if e.get('indexed_return'))
@@ -870,6 +1122,12 @@ def main():
             ('wrong-decompression-shift', getter()[:5]+['add x0, x0, x28, lsl #31', 'ret']),
             ('wrong-index-slot', getter()[:1]+['ldr x4, [x15, #16]']+getter()[2:]),
             ('wrong-untag', getter()[:2]+['sbfx x5, x4, #2, #30']+getter()[3:]),
+            ('narrow-input-pointer', ['ldr w2, [x15, #8]']+getter()[1:]),
+            ('signed-element-load', getter()[:4]+['ldursw x0, [x16, #15]']+getter()[5:]),
+            ('byte-element-load', getter()[:4]+['ldurb w0, [x16, #15]']+getter()[5:]),
+            ('halfword-element-load', getter()[:4]+['ldurh w0, [x16, #15]']+getter()[5:]),
+            ('wrong-element-width', getter()[:4]+['ldur x0, [x16, #15]']+getter()[5:]),
+            ('alternate-return-register', getter()[:-1]+['ret x19']),
             ('heap-write', getter()[:3]+['stur w9, [x2, #15]']+getter()[3:]),
             ('returning-call', prologue+['bl 0x3000']+getter()[:-1]+epilogue),
             ('conflicting-return', getter()[:-1]+['cbz x8, 0x5020', 'ret', 'mov x0, #0', 'ret']),
@@ -901,6 +1159,211 @@ def main():
                 ['add x2, x9, x28, lsl #32'] if width == 4 else []) + dispatch[:-1] + epilogue
         def bound_contexts(data):
             return [c for c in data['array_contexts'] if c['payload'] == 0x5000]
+        length_body = prologue + ['ldr x8, [x29, #16]', 'str x8, [x15]', 'bl 0xb000', 'mov x6, x0',
+                                  'ldur w9, [x8, #15]', 'add x2, x9, x28, lsl #32'] + dispatch[:-1] + epilogue
+        # Restrict one analysis to a named fast edge; the ordinary view still
+        # includes the runtime slow path and must keep its previous uncertainty.
+        def guarded_body(check=None, tail=None):
+            prefix = prologue + (check or ['ldr x16, [x26, #0x60]', 'cmp x15, x16'])
+            fast = 0x5000+(len(prefix)+1)*4
+            body = (tail if tail is not None else length_body[len(prologue):])
+            slow = fast+len(body)*4
+            return prefix + [f'b.ls {hex(slow)}'] + body + ['bl 0x3000', f'b {hex(fast)}']
+        for width in (4, 8):
+            body = guarded_body(tail=['ldr x8, [x29, #16]', 'str x8, [x15]', 'bl 0xb000'] + epilogue)
+            d = run('stack-path-length-'+str(width), bound_caller(width=width),
+                    {0x5000: body, 0xb000: length_leaf(width)}, element_bytes=width)
+            assert bound_contexts(d)[0]['status'] == 'bound_only'
+            paths = d['array_path_contexts']
+            assert len(paths) == 1 and paths[0]['scope'] == 'initial_stack_check_fast_path'
+            assert paths[0]['status'] == 'length_proved' and len(paths[0]['array_length_returns']) == 1
+            assert not length_claims(d) and not resolved(d)
+        d = run('stack-path-element-and-dispatch', bound_caller(),
+                {0x5000: guarded_body(), 0xb000: length_leaf()})
+        path = d['array_path_contexts'][0]
+        assert bound_contexts(d)[0]['status'] == 'bound_only' and not resolved(d)
+        assert path['status'] == 'read_proved' and len(path['resolutions']) == len(path['array_reads']) == 1
+        for name, check in [
+            ('wrong-offset', ['ldr x16, [x26, #0x68]', 'cmp x15, x16']),
+            ('wrong-width', ['ldr w16, [x26, #0x60]', 'cmp x15, x16']),
+            ('wrong-base', ['ldr x16, [x25, #0x60]', 'cmp x15, x16']),
+            ('wrong-compare', ['ldr x16, [x26, #0x60]', 'cmp x14, x16']),
+            ('shifted-compare', ['ldr x16, [x26, #0x60]', 'cmp x15, x16, lsl #1']),
+        ]:
+            d = run('stack-path-reject-'+name, bound_caller(),
+                    {0x5000: guarded_body(check), 0xb000: length_leaf()})
+            assert not d['array_path_contexts']
+        for name, mutate, extra in [
+            ('wrong-stub', lambda b: b[:-2]+['bl 0x9000', b[-1]], {}),
+            ('wrong-edge', lambda b: [x.replace('b.ls', 'b.hi') for x in b], {}),
+            ('wrong-return', lambda b: b[:-1]+['b 0x5000'], {}),
+            ('alternate-fast-entry', lambda b: b, {0x4000: ['b 0x5018']}),
+            ('alternate-prefix-entry', lambda b: b, {0x4000: ['b 0x500c']}),
+        ]:
+            d = run('stack-path-reject-'+name, bound_caller(),
+                    {0x5000: mutate(guarded_body()), 0xb000: length_leaf(), **extra})
+            assert not d['array_path_contexts']
+        d = run('length-call-bound-array', bound_caller(), {0x5000: length_body, 0xb000: length_leaf()})
+        ctx = bound_contexts(d)[0]
+        assert ctx['status'] == 'read_proved' and ctx['scope'] == 'entry_chain' and len(ctx['array_length_returns']) == 1
+        assert ctx['array_length_returns'][0]['allocation'] is None and ctx['array_length_returns'][0]['entry_input_sp_offset'] == 0
+        assert len(ctx['array_reads']) == 1 and len(ctx['resolutions']) == 1
+        d = run('length-call-bound-return-alternate-entry', bound_caller(),
+                {0x5000: length_body, 0xb000: length_leaf(), 0x4000: ['b 0x5018']})
+        ctx = bound_contexts(d)[0]
+        assert ctx['status'] == 'length_proved' and not ctx['array_reads'] and not ctx['resolutions']
+        d = run('length-call-bound-length-only', bound_caller(),
+                {0x5000: prologue + ['ldr x8, [x29, #16]', 'str x8, [x15]', 'bl 0xb000'] + epilogue, 0xb000: length_leaf()})
+        ctx = bound_contexts(d)[0]
+        assert ctx['status'] == 'length_proved' and len(ctx['array_length_returns']) == 1 and not ctx['array_reads']
+        def entry_body(index='mov x5, #0', bound='cmp x5, x3', offset=0x60, before=None, after=None, getter_call=None, length_call=None):
+            body, labels = [], {}
+            def label(name): labels[name] = 0x5000+len(body)*4
+            body += prologue + ['ldr x16, [x26, #0x60]', 'cmp x15, x16', 'b.ls @slow_a']
+            label('fast')
+            body += ['ldr x8, [x29, #16]', 'str x8, [x15]'] + (length_call or ['bl 0xb000']) + ['sbfx x3, x0, #1, #31', index]
+            label('loop')
+            body += [f'ldr x16, [x26, #{offset}]', 'cmp x15, x16', 'b.ls @slow_b']
+            label('bound')
+            body += [bound, 'b.ge @done', 'sbfiz x4, x5, #1, #31', 'cmp x5, x4, asr #1', 'b.eq @tagged', 'bl 0x3000']
+            label('tagged')
+            body += (before or []) + ['stp x4, x8, [x15]'] + (getter_call or ['bl 0xb100'])
+            for text in after or []:
+                if text.endswith(':'): label(text[:-1])
+                else: body.append(text)
+            body += ['b @loop']
+            label('done')
+            body += epilogue
+            label('slow_a')
+            body += ['bl 0x3000', 'b @fast']
+            label('slow_b')
+            body += ['bl 0x3000', 'b @bound']
+            return [re.sub(r'@([a-z_]+)', lambda m: hex(labels[m[1]]), text) for text in body]
+        for width in (4, 8):
+            d = run('entry-prefix-first-result-'+str(width), bound_caller(width=width),
+                    {0x5000: entry_body(), 0xb000: length_leaf(width), 0xb100: getter(width)}, element_bytes=width)
+            traces = d['array_entry_traces']
+            assert len(traces) == 1 and traces[0]['scope'] == 'entry_prefix'
+            claim = traces[0]['indexed_returns'][0]
+            assert claim['index'] == 0 and claim['class_id'] == 1 and claim['allocation'] is None and claim['entry_input_sp_offset'] == 0
+            assert len(traces[0]['trace']['stack_checks']) == 1
+            assert not any(e.get('indexed_return') for e in d['edges'])
+            assert bound_contexts(d)[0]['status'] == 'bound_only'
+        split_body = entry_body()
+        split_site = 0x5000+4*next(n for n, text in enumerate(split_body) if text.startswith('b.ge '))
+        d = run('entry-prefix-reject-split-comparison', bound_caller(),
+                {0x5000: split_body, 0xb000: length_leaf(), 0xb100: getter(), 0x4000: [f'b {hex(split_site)}']})
+        assert not d['array_entry_traces']
+        escaping = [re.sub(r'^b.ge .*', 'b.ge 0xf000', text) for text in entry_body(bound='cmp x5, x9')]
+        d = run('entry-prefix-reject-unknown-escaping-branch', bound_caller(),
+                {0x5000: escaping, 0xb000: length_leaf(), 0xb100: getter()})
+        assert not d['array_entry_traces']
+        for name, entry_options in [
+            ('unknown-index', {'index': 'mov x5, x9'}),
+            ('unknown-bound', {'bound': 'cmp x5, x9'}),
+            ('out-of-bounds', {'index': 'mov x5, #2'}),
+            ('negative-index', {'index': 'mov x5, #-1'}),
+            ('unmatched-second-guard', {'offset': 0x68}),
+            ('intervening-call', {'before': ['bl 0x3000']}),
+            ('fresh-array-is-not-entry-input', {'before': ['mov x2, #4', 'bl 0x6000', 'ldr x3, [x27, #40]', 'stur w3, [x0, #15]', 'mov x8, x0', 'mov x4, #0']}),
+            ('overwritten-element', {'before': ['sturb w9, [x8, #15]']}),
+        ]:
+            d = run('entry-prefix-reject-'+name, bound_caller(),
+                    {0x5000: entry_body(**entry_options), 0xb000: length_leaf(), 0xb100: getter()})
+            assert not d['array_entry_traces'], name
+        def run_result_uses():
+            direct = ['mov x2, x0'] + dispatch[:-1]
+            for width in (4, 8):
+                for pool_offset, cid in ((40, 1), (56, 2)):
+                    d = run(f'result-use-direct-{width}-{cid}', bound_caller(pool_offset, width),
+                            {0x5000: entry_body(after=direct), 0xb000: length_leaf(width), 0xb100: getter(width)}, element_bytes=width)
+                    uses = d['array_result_traces']
+                    assert len(uses) == 1 and uses[0]['scope'] == 'entry_result_use'
+                    assert uses[0]['indexed_returns'][0]['class_id'] == cid
+                    assert uses[0]['trace']['getter'] == uses[0]['indexed_returns'][0]['site']
+                    assert uses[0]['trace']['stop'] == uses[0]['resolutions'][0]['site']
+                    assert uses[0]['resolutions'][0]['index'] == cid
+                    assert d['array_entry_traces'][0]['trace']['stop'] == uses[0]['trace']['getter']
+            tagged = ['mov x1, #7', 'tbz w0, #0, @class_join', 'ldur x1, [x0, #-1]', 'ubfx x1, x1, #8, #16',
+                      'class_join:', 'str x0, [x15]', 'mov x5, x1', 'ldr x30, [x21, x5, lsl #3]', 'blr x30']
+            d = run('result-use-tagged-header', bound_caller(), {0x5000: entry_body(after=tagged), 0xb000: length_leaf(), 0xb100: getter()})
+            assert len(d['array_result_traces']) == 1
+            header = ['ldur x1, [x0, #-1]', 'ubfx x1, x1, #8, #16']
+            for name, change in [('word-copy', ['mov w5, w1']), ('partial-constant', ['mov x5, x1', 'movk x5, #0, lsl #16'])]:
+                d = run('result-use-'+name, bound_caller(), {0x5000: entry_body(after=header+change+['ldr x30, [x21, x5, lsl #3]', 'blr x30']), 0xb000: length_leaf(), 0xb100: getter()})
+                assert len(d['array_result_traces']) == 1
+            for name, after in [
+                ('overwritten-result', ['mov x0, #0']+direct),
+                ('same-class-other-object', ['ldr x2, [x27, #40]']+dispatch[:-1]),
+                ('constant-target', ['mov x0, #1', 'ldr x30, [x21, x0, lsl #3]', 'blr x30']),
+                ('intervening-runtime-call', ['bl 0x3000']+direct),
+                ('intervening-indirect-call', ['mov x5, #4', 'ldr x30, [x21, x5, lsl #3]', 'blr x30']+direct),
+                ('narrow-object-copy', ['mov w2, w0']+dispatch[:-1]),
+                ('untracked-spill-provenance', ['stur x0, [x29, #-8]', 'ldur x2, [x29, #-8]']+dispatch[:-1]),
+                ('unknown-alias-store', ['str x9, [x10]']+direct),
+                ('unknown-branch', ['cbz x9, @uncertain', 'uncertain:']+direct),
+                ('target-overwrite', header+['ldr x30, [x21, x1, lsl #3]', 'mov x30, #0', 'blr x30']),
+                ('constant-class-overwrite', header+['mov x1, #1', 'ldr x30, [x21, x1, lsl #3]', 'blr x30']),
+            ]:
+                d = run('result-use-reject-'+name, bound_caller(), {0x5000: entry_body(after=after), 0xb000: length_leaf(), 0xb100: getter()})
+                assert not d['array_result_traces'], name
+                assert len(d['array_entry_traces']) == 1
+        run_result_uses()
+        def run_late_helpers():
+            indirect = ['mov x5, #5', 'ldr x30, [x21, x5, lsl #3]', 'blr x30']
+            body = entry_body(after=['mov x2, x0']+dispatch[:-1], getter_call=indirect)
+            d = run('prefix-helper-budget-boundary', bound_caller(),
+                    {0x4000: bound_caller(), 0x5000: body, 0xb000: length_leaf(), 0x40000: getter()}, late_helper=True)
+            assert d['call_effect_analysis']['attempted'] == 16384
+            assert not any(c['payload'] == 0x40000 for c in d['call_effects'])
+            assert [c['payload'] for c in d['prefix_call_effects']] == [0x40000]
+            assert d['prefix_effect_analysis']['attempted'] == d['prefix_effect_analysis']['accepted'] == 1
+            assert len(d['array_entry_traces']) == len(d['array_result_traces']) == 1
+            assert len(d['array_result_traces'][0]['callers']) == 2
+            late_length_body = entry_body(after=['mov x2, x0']+dispatch[:-1], getter_call=indirect,
+                                         length_call=['mov x5, #6', 'ldr x30, [x21, x5, lsl #3]', 'blr x30'])
+            d = run('prefix-helper-two-round-dependency', bound_caller(),
+                    {0x5000: late_length_body, 0x40100: length_leaf(), 0x40000: getter()}, late_helper=True)
+            assert d['call_effect_analysis']['attempted'] == 16384
+            assert [c['payload'] for c in d['prefix_call_effects']] == [0x40000, 0x40100]
+            assert d['prefix_effect_analysis']['rounds'] == 2
+            assert d['prefix_effect_analysis']['attempted'] == d['prefix_effect_analysis']['accepted'] == 2
+            assert len(d['array_entry_traces']) == len(d['array_result_traces']) == 1
+            d = run('prefix-helper-reject-mutating-body', bound_caller(),
+                    {0x5000: body, 0xb000: length_leaf(), 0x40000: ['ldr x2, [x15, #8]', 'stur w9, [x2, #15]']+getter()}, late_helper=True)
+            assert not d['prefix_call_effects'] and not d['array_entry_traces'] and not d['array_result_traces']
+        run_late_helpers()
+
+        def run_interior_helpers():
+            prefix = ['br x16'] + ['nop']*5
+            length_call = ['mov x5, #4', 'ldr x30, [x21, x5, lsl #3]', 'blr x30']
+            getter_call = ['mov x5, #5', 'ldr x30, [x21, x5, lsl #3]', 'blr x30']
+            body = entry_body(after=['mov x2, x0']+dispatch[:-1], getter_call=getter_call, length_call=length_call)
+            d = run('prefix-interior-dispatch-entries', bound_caller(),
+                    {0x4000: bound_caller(), 0x5000: body, 0xb000: prefix+length_leaf(), 0xb100: prefix+getter()}, helper_entry_offset=24)
+            assert [(c['payload'], c['containing_payload']) for c in d['prefix_call_effects']] == [(0xb018, 0xb000), (0xb118, 0xb100)]
+            assert not any(c.get('array_length') or c.get('array_return') for c in d['call_effects'])
+            assert not any(n['start'] in (0xb018, 0xb118) for n in d['nodes'])
+            assert len(d['array_entry_traces']) == len(d['array_result_traces']) == 1
+            assert len(d['array_result_traces'][0]['callers']) == 2
+            for name, helpers, offset in [
+                ('write', {0xb000: prefix+['ldr x1, [x15]', 'stur w9, [x1, #15]']+length_leaf(), 0xb100: prefix+getter()}, 24),
+                ('escaping-branch', {0xb000: prefix+['b 0xb000']+length_leaf(), 0xb100: prefix+getter()}, 24),
+                ('unaligned-entry', {0xb000: prefix+length_leaf(), 0xb100: prefix+getter()}, 26),
+            ]:
+                d = run('prefix-interior-reject-'+name, bound_caller(), {0x5000: body, **helpers}, helper_entry_offset=offset)
+                assert not d['prefix_call_effects'] and not d['array_entry_traces'] and not d['array_result_traces'], name
+            direct = entry_body(after=['mov x2, x0']+dispatch[:-1], getter_call=getter_call, length_call=['bl 0xb01c'])
+            d = run('prefix-interior-reject-unrecorded-direct-entry', bound_caller(),
+                    {0x5000: direct, 0xb000: prefix+['nop']+length_leaf(), 0xb100: prefix+getter()}, helper_entry_offset=24)
+            assert not d['prefix_call_effects'] and not d['array_entry_traces'] and not d['array_result_traces']
+            large_body = entry_body(after=['mov x2, x0']+dispatch[:-1], getter_call=['bl 0xb300'], length_call=length_call)
+            d = run('prefix-interior-small-suffix-large-container', bound_caller(),
+                    {0x5000: large_body, 0xb000: ['br x16']+['nop']*69+length_leaf(), 0xb300: getter()}, helper_entry_offset=280)
+            assert [(c['payload'], c['containing_payload']) for c in d['prefix_call_effects']] == [(0xb118, 0xb000)]
+            assert len(d['array_entry_traces']) == len(d['array_result_traces']) == 1
+        run_interior_helpers()
+
         d = run('array-context-distinct-caller-contents', bound_caller(), {0x4000: bound_caller(56), 0x5000: bound_body()})
         ctx = bound_contexts(d)
         assert len(ctx) == 2 and all(c['status'] == 'read_proved' for c in ctx)

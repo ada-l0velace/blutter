@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <cstdlib>
+#include <algorithm>
 
 // Standalone harness: no Dart runtime, SDK layout, or deserializer involved.
 int main(int argc, char** argv)
@@ -29,6 +30,24 @@ int main(int argc, char** argv)
 			blocks.push_back({std::shared_ptr<cs_insn>(instructions, [count](cs_insn* p) { cs_free(p, count); }), count, start});
 			payloads.push_back({start, start + bytes.size(), {}, ""});
 		}
+		const bool lateHelper = std::getenv("BLUTTER_TEST_LATE_HELPER") && std::string(std::getenv("BLUTTER_TEST_LATE_HELPER")) == "1";
+		const auto entryOffsetText = std::getenv("BLUTTER_TEST_HELPER_ENTRY_OFFSET");
+		const uint64_t entryOffset = entryOffsetText ? std::stoull(entryOffsetText) : 0;
+		if (entryOffset > 4096 || (entryOffset && lateHelper)) throw std::runtime_error("Invalid helper entry fixture");
+		if (lateHelper) {
+			// Authored budget-boundary control: no assembler process per filler.
+			const uint8_t returnWord[] = {0xc0, 0x03, 0x5f, 0xd6};
+			for (size_t n = 0; n < 16384; ++n) {
+				const uint64_t start = 0x10000 + n*8;
+				cs_insn* raw = nullptr;
+				const auto count = cs_disasm(handle, returnWord, sizeof(returnWord), start, 0, &raw);
+				if (count != 1) throw std::runtime_error("Cannot decode authored return control");
+				blocks.push_back({std::shared_ptr<cs_insn>(raw, [count](cs_insn* p) { cs_free(p, count); }), count, start});
+				payloads.push_back({start, start+4, {}, ""});
+			}
+			std::sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+			std::sort(payloads.begin(), payloads.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+		}
 		SnapshotAnalysis::Profile profile{"test", ARM64_REG_X27, ARM64_REG_X26, 16, 8, 2048,
 			{{0x78, "known_thread_field"}}, [](int64_t index) {
 				SnapshotAnalysis::PoolSlot slot{"fixture", "slot " + std::to_string(index)};
@@ -43,6 +62,14 @@ int main(int argc, char** argv)
 		profile.heapBitsRegister = ARM64_REG_X28;
 		profile.dispatchOrigin = 4;
 		profile.dispatchEntries = {0x2000, 0x2004, {}, 0x3000, 0x2000, 0x2004, 0x2000, 0x2004, 0xb000};
+		if (lateHelper) {
+			profile.dispatchEntries.push_back(0x40000);
+			profile.dispatchEntries.push_back(0x40100);
+		}
+		if (entryOffset) {
+			profile.dispatchEntries[8] = 0xb000 + entryOffset;
+			profile.dispatchEntries.push_back(0xb100 + entryOffset);
+		}
 		profile.dispatchNullTarget = 0x3000;
 		profile.classIdShift = 8;
 		profile.classIdBits = 16;
@@ -51,13 +78,15 @@ int main(int argc, char** argv)
 		profile.allocationReturns = {{0x2000, 1}, {0x6000, 2}, {0x7000, 3}, {0x8000, 4}};
 		profile.preservedCallRegisters = {{0x7000, 1U << 2}, {0x9000, 31}};
 		profile.threadHeapClasses = {{0xa8, 2}};
+		profile.stackLimitOffset = 0x60;
 		profile.framePreservingCalls = {{0x3000, "stack_overflow_without_fpu"}, {0x9000, "array_write_barrier"}, {0xa000, "double_to_integer"}};
 		profile.nonReturningCalls = {{0xc000, "range_error_without_fpu"}};
 		profile.leafMathContract = {0x80, 0x88, 0x90, 8};
 		profile.allocationBodyBounds = {{0x2000, {7, 31}}, {0x7000, {7, 15}}, {0x8000, {7, 39}}};
 		profile.arrayBodyContract = {0x6000, 2, 15, 4, 1};
+		profile.arrayLengthLayout = SnapshotAnalysis::ArrayLengthLayout{2, 7, 4, 1};
 		if (const char* width = std::getenv("BLUTTER_TEST_ARRAY_BYTES")) {
-			if (std::string(width) == "8") { profile.arrayBodyContract[3] = 8; profile.heapBitsRegister = ARM64_REG_INVALID; }
+			if (std::string(width) == "8") { profile.arrayBodyContract[3] = 8; profile.arrayLengthLayout->bytes = 8; profile.heapBitsRegister = ARM64_REG_INVALID; }
 			else if (std::string(width) != "4") throw std::runtime_error("Unsupported test array width");
 		}
 		profile.poolHeapClass = [](int64_t index) -> std::optional<uint32_t> {

@@ -2,6 +2,7 @@
 #include "ReceiverAnalysis.h"
 #include "CallEffects.h"
 #include "Arm64Ir.h"
+#include "StackCheckAnalysis.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -109,6 +110,15 @@ void Forwarded(std::ostream& out, const ForwardedReturn& value, std::optional<ui
 		<< ",\"register\":\"x0\",\"class_id\":" << value.classId << ",\"proof\":";
 	Proof(out, value.proof); out << '}';
 }
+void LengthReturn(std::ostream& out, const ArrayLengthReturn& value, std::optional<uint64_t> site = {})
+{
+	out << '{';
+	if (site) out << "\"site\":" << *site << ',';
+	out << "\"callee\":" << value.callee << ",\"input_sp_offset\":" << value.inputSpOffset << ",\"register\":\"x0\",\"length\":" << value.length
+		<< ",\"value\":" << Quoted(std::format("{:#x}", value.length << 1)) << ",\"allocation\":" << (value.allocation ? std::to_string(*value.allocation) : "null")
+		<< ",\"entry_input_sp_offset\":" << (value.entryInputSpOffset ? std::to_string(*value.entryInputSpOffset) : "null") << ",\"proof\":";
+	Proof(out, value.proof); out << '}';
+}
 struct Origin {
 	std::string kind;
 	int64_t offset;
@@ -156,7 +166,7 @@ std::optional<Constant> ConstantResult(const cs_insn& instruction,
 	const std::array<std::optional<Constant>, 31>& constants)
 {
 	const auto ir = LowerArm64(instruction);
-	if (!ir) return {};
+	if (!ir || std::holds_alternative<NativeIr::ExtractSigned>(ir->operation)) return {}; // This consumer retains its selected subset.
 	const auto effects = NativeIr::GetEffects(*ir);
 	if (!effects.destination || effects.destination->id >= constants.size()) return {};
 	std::vector<uint64_t> proof;
@@ -276,6 +286,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		callEffectCertificates = effects.certificates;
 		profile.forwardedReturnInputs = effects.forwardedInputs;
 		profile.arrayReturnInputs = effects.arrayReturns;
+		profile.arrayLengthEffects = effects.arrayLengths;
 		callEffectAttempts = effects.attempted; callEffectSteps = effects.steps;
 		for (const auto& [entry, certificate] : effects.certificates) profile.frameSafeCallees.insert(entry);
 		callEffectsPrepared = true;
@@ -547,6 +558,12 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		}
 		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.arrayArguments.find(edges[n].site); found != receiver.arrayArguments.end())
 			edges[n].arrayArguments = found->second;
+		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.lengthReturns.find(edges[n].site); found != receiver.lengthReturns.end()) {
+			edges[n].arrayLengthReturn = found->second;
+			auto& comment = comments[edges[n].site];
+			if (!comment.empty()) comment += " | ";
+			comment += std::format("x0 returns known array length {} (Smi {:#x}); checked read-only leaf", found->second.length, found->second.length << 1);
+		}
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
 	}
@@ -591,8 +608,9 @@ void Analyzer::Write(const std::string& filename) const
 		std::vector<StackInput> inputs;
 		ArrayInputBinding binding;
 		ReceiverAnalysisResult analysis;
+		std::optional<InitialStackCheck> path;
 	};
-	std::vector<ArrayContext> arrayContexts;
+	std::vector<ArrayContext> arrayContexts, arrayPathContexts, arrayEntryTraces, arrayResultTraces;
 	auto checkedPoolClasses = receiverPoolClasses;
 	size_t attempted = 0, remainingSteps = 20000000;
 	struct Decoder { csh handle = 0; ~Decoder() { if (handle) cs_close(&handle); } } decoder;
@@ -614,7 +632,7 @@ void Analyzer::Write(const std::string& filename) const
 		auto analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &remainingSteps);
 		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();)
 			if (globallyResolved.contains(it->first) && globallyResolved.at(it->first) == it->second.snapshotTarget) it = analysis.resolutions.erase(it); else ++it;
-		if (analysis.resolutions.empty() && analysis.forwardedReturns.empty()) continue;
+		if (analysis.resolutions.empty() && analysis.forwardedReturns.empty() && analysis.lengthReturns.empty()) continue;
 		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
 		for (const auto& [site, resolution] : analysis.resolutions) scalarResolutions[key][site] = resolution.snapshotTarget;
 		contexts.push_back({payload, callers, std::move(inputs), std::move(analysis)});
@@ -633,7 +651,7 @@ void Analyzer::Write(const std::string& filename) const
 		ArrayInputBinding binding{offset, length, elements};
 		ReceiverAnalysisResult analysis;
 		if (count * 4 == bytes.size()) analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &arrayRemainingSteps, &binding);
-		if (analysis.arrayReads.empty()) analysis = {}; // Bindings alone do not establish a read or callee effect.
+		if (analysis.arrayReads.empty() && analysis.lengthReturns.empty()) analysis = {}; // Bindings alone do not establish a read or callee effect.
 		else {
 			const auto previous = scalarResolutions.find({payload, bindings});
 			for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
@@ -646,9 +664,146 @@ void Analyzer::Write(const std::string& filename) const
 		}
 		arrayContexts.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis)});
 	}
+	// Path-qualified results have their own budget and never replace normal-flow facts.
+	size_t pathAttempted = 0, pathRemainingSteps = 20000000;
+	for (const auto& [key, callers] : arrayGroups) {
+		if (pathAttempted >= 4096 || !pathRemainingSteps) break;
+		++pathAttempted;
+		const auto& [payload, bindings, offset, length, elements] = key;
+		const auto& bytes = contextBytes.at(payload);
+		cs_insn* raw = nullptr;
+		const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+		const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+		if (count * 4 != bytes.size()) continue;
+		const auto path = FindInitialStackCheck(raw, count, profile);
+		if (!path) continue;
+		std::vector<StackInput> inputs;
+		for (const auto& [at, kind, value] : bindings) inputs.push_back({at, kind, value, {}});
+		ArrayInputBinding binding{offset, length, elements};
+		auto analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &pathRemainingSteps, &binding, &*path);
+		if (analysis.arrayReads.empty() && analysis.lengthReturns.empty()) continue;
+		const auto previous = scalarResolutions.find({payload, bindings});
+		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
+			const auto site = it->first, target = it->second.snapshotTarget;
+			if ((globallyResolved.contains(site) && globallyResolved.at(site) == target) ||
+				(previous != scalarResolutions.end() && previous->second.contains(site) && previous->second.at(site) == target)) it = analysis.resolutions.erase(it);
+			else ++it;
+		}
+		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		arrayPathContexts.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis), path});
+	}
+	// Preserve the original broad pass and its budgets. Requests identify exact
+	// callees only; no effect is granted until the ordinary proof succeeds.
+	Profile prefixProfile = profile;
+	std::map<uint64_t, std::string> prefixEffects;
+	std::set<uint64_t> requestedEffects;
+	std::set<uint64_t> dispatchTargets;
+	for (const auto target : profile.dispatchEntries) if (target) dispatchTargets.insert(*target);
+	size_t helperAttempts = 0, helperSteps = 0, probeSteps = 20000000, helperRounds = 0;
+	for (size_t round = 0; round < 2 && probeSteps && helperAttempts < 128; ++round) {
+		++helperRounds;
+		std::set<uint64_t> requests;
+		for (const auto& [key, callers] : arrayGroups) {
+			if (!probeSteps) break;
+			const auto& [payload, bindings, offset, length, elements] = key;
+			const auto& bytes = contextBytes.at(payload);
+			cs_insn* raw = nullptr;
+			const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+			const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+			if (count * 4 != bytes.size()) continue;
+			const auto path = FindInitialStackCheck(raw, count, prefixProfile);
+			if (!path) continue;
+			std::vector<StackInput> inputs;
+			for (const auto& [at, kind, value] : bindings) inputs.push_back({at, kind, value, {}});
+			ArrayInputBinding binding{offset, length, elements};
+			const auto probe = AnalyzeReceivers(raw, count, prefixProfile, receiverEntries, &inputs, &probeSteps, &binding, &*path, true, false, true);
+			if (probe.missingArrayEffect) requests.insert(probe.missingArrayEffect->second);
+		}
+		bool changed = false;
+		for (const auto target : requests) {
+			if (helperAttempts >= 128) break;
+			if (!requestedEffects.insert(target).second || target % 4) continue;
+			const auto index = FindPayload(target);
+			if (!index) continue;
+			const auto& container = payloads[*index];
+			const auto bytes = contextBytes.find(container.start);
+			if (bytes == contextBytes.end() || container.end - target > 256 || (target - container.start) % 4 ||
+				(target != container.start && !dispatchTargets.contains(target))) continue;
+			// A recorded dispatch entry can skip a payload's checked-entry prefix.
+			// Prove its retained suffix without changing the native inventory.
+			const std::vector<uint8_t> body(bytes->second.begin() + (target - container.start), bytes->second.end());
+			++helperAttempts;
+			const auto effects = AnalyzeCallEffects({{target, body}}, prefixProfile);
+			helperSteps += effects.steps;
+			if (!effects.certificates.contains(target) || (!effects.arrayReturns.contains(target) && !effects.arrayLengths.contains(target))) continue;
+			auto certificate = effects.certificates.at(target);
+			if (target != container.start) certificate.insert(certificate.size()-1, std::format(",\"containing_payload\":{}", container.start));
+			prefixEffects.emplace(target, std::move(certificate));
+			prefixProfile.frameSafeCallees.insert(target);
+			if (effects.arrayReturns.contains(target)) prefixProfile.arrayReturnInputs[target] = effects.arrayReturns.at(target);
+			if (effects.arrayLengths.contains(target)) prefixProfile.arrayLengthEffects[target] = effects.arrayLengths.at(target);
+			changed = true;
+		}
+		if (!changed) break;
+	}
+	size_t entryAttempted = 0, entryRemainingSteps = 20000000;
+	for (const auto& [key, callers] : arrayGroups) {
+		if (entryAttempted >= 4096 || !entryRemainingSteps) break;
+		++entryAttempted;
+		const auto& [payload, bindings, offset, length, elements] = key;
+		const auto& bytes = contextBytes.at(payload);
+		cs_insn* raw = nullptr;
+		const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+		const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+		if (count * 4 != bytes.size()) continue;
+		const auto path = FindInitialStackCheck(raw, count, prefixProfile);
+		if (!path) continue;
+		std::vector<StackInput> inputs;
+		for (const auto& [at, kind, value] : bindings) inputs.push_back({at, kind, value, {}});
+		ArrayInputBinding binding{offset, length, elements};
+		auto analysis = AnalyzeReceivers(raw, count, prefixProfile, receiverEntries, &inputs, &entryRemainingSteps, &binding, &*path, true);
+		if (analysis.indexedReturns.empty() || !analysis.traceStop) continue;
+		const auto previous = scalarResolutions.find({payload, bindings});
+		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
+			const auto site = it->first, target = it->second.snapshotTarget;
+			if ((globallyResolved.contains(site) && globallyResolved.at(site) == target) ||
+				(previous != scalarResolutions.end() && previous->second.contains(site) && previous->second.at(site) == target)) it = analysis.resolutions.erase(it);
+			else ++it;
+		}
+		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		arrayEntryTraces.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis), path});
+	}
+	size_t resultAttempted = 0, resultRemainingSteps = 20000000;
+	for (const auto& [key, callers] : arrayGroups) {
+		if (resultAttempted >= 4096 || !resultRemainingSteps) break;
+		++resultAttempted;
+		const auto& [payload, bindings, offset, length, elements] = key;
+		const auto& bytes = contextBytes.at(payload);
+		cs_insn* raw = nullptr;
+		const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+		const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+		if (count * 4 != bytes.size()) continue;
+		const auto path = FindInitialStackCheck(raw, count, prefixProfile);
+		if (!path) continue;
+		std::vector<StackInput> inputs;
+		for (const auto& [at, kind, value] : bindings) inputs.push_back({at, kind, value, {}});
+		ArrayInputBinding binding{offset, length, elements};
+		auto analysis = AnalyzeReceivers(raw, count, prefixProfile, receiverEntries, &inputs, &resultRemainingSteps, &binding, &*path, true, true);
+		if (analysis.indexedReturns.size() != 1 || !analysis.traceGetter || !analysis.traceStop || analysis.traceGetter == analysis.traceStop) continue;
+		const auto previous = scalarResolutions.find({payload, bindings});
+		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
+			const auto site = it->first, target = it->second.snapshotTarget;
+			if (site != *analysis.traceStop || (globallyResolved.contains(site) && globallyResolved.at(site) == target) ||
+				(previous != scalarResolutions.end() && previous->second.contains(site) && previous->second.at(site) == target)) it = analysis.resolutions.erase(it);
+			else ++it;
+		}
+		if (!analysis.resolutions.contains(*analysis.traceStop)) continue;
+		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		arrayResultTraces.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis), path});
+	}
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":15,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":22,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -725,6 +880,8 @@ void Analyzer::Write(const std::string& filename) const
 			out << "{\"callee\":" << value.callee << ",\"allocation\":" << value.allocation << ",\"index\":" << value.index << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"proof\":";
 			Proof(out, value.proof); out << '}';
 		} else out << "null";
+		out << ",\"array_length_return\":";
+		if (edge.arrayLengthReturn) LengthReturn(out, *edge.arrayLengthReturn); else out << "null";
 		out << ",\"array_arguments\":[";
 		for (size_t n = 0; n < edge.arrayArguments.size(); ++n) {
 			if (n) out << ',';
@@ -790,6 +947,7 @@ void Analyzer::Write(const std::string& filename) const
 	bool first = true;
 	for (const auto& [slot, cid] : checkedPoolClasses) { if (!first) out << ','; first = false; out << '[' << slot << ',' << cid << ']'; }
 	out << "],\"word_return_register\":" << (profile.wordReturnRegister == ARM64_REG_X0 ? "\"x0\"" : "null");
+	out << ",\"stack_limit_offset\":" << (profile.stackLimitOffset ? std::to_string(*profile.stackLimitOffset) : "null");
 	out << ",\"heap_bits_register\":" << (profile.heapBitsRegister == ARM64_REG_X28 ? "\"x28\"" : "null");
 	out << ",\"allocation_returns\":["; first = true;
 	for (const auto& [address, cid] : profile.allocationReturns) { if (!first) out << ','; first = false; out << '[' << address << ',' << cid << ']'; }
@@ -807,6 +965,11 @@ void Analyzer::Write(const std::string& filename) const
 	for (const auto& [entry, interval] : profile.allocationBodyBounds) { if (!first) out << ','; first = false; out << '[' << entry << ',' << interval.first << ',' << interval.second << ']'; }
 	out << "],\"array_body_contract\":["; first = true;
 	for (const auto value : profile.arrayBodyContract) { if (!first) out << ','; first = false; out << value; }
+	out << "],\"array_length_layout\":[";
+	if (profile.arrayLengthLayout) {
+		const auto& layout = *profile.arrayLengthLayout;
+		out << layout.classId << ',' << layout.displacement << ',' << layout.bytes << ',' << layout.smiShift;
+	}
 	out << "],\"entries\":["; first = true;
 	for (const auto address : receiverEntries) { if (!first) out << ','; first = false; out << address; }
 	out << "]},\"receiver_certificates\":[";
@@ -836,15 +999,20 @@ void Analyzer::Write(const std::string& filename) const
 			if (!firstReturn) out << ','; firstReturn = false;
 			Forwarded(out, value, site);
 		}
+		out << "],\"array_length_returns\":["; bool firstLength = true;
+		for (const auto& [site, value] : context.analysis.lengthReturns) {
+			if (!firstLength) out << ','; firstLength = false; LengthReturn(out, value, site);
+		}
 		out << "],\"certificate\":" << context.analysis.certificate << '}';
 	}
 	out << "],\"context_analysis\":{\"candidate_groups\":" << groups.size() << ",\"attempted_groups\":" << attempted
 		<< ",\"transfer_steps\":" << 20000000 - remainingSteps << ",\"cached_bytes\":" << contextBytesSize
 		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"cache_limit\":33554432}";
-	out << ",\"array_contexts\":[";
-	for (size_t n = 0; n < arrayContexts.size(); ++n) {
+	auto writeArrays = [&](const auto& collection) {
+	out << '[';
+	for (size_t n = 0; n < collection.size(); ++n) {
 		if (n) out << ',';
-		const auto& context = arrayContexts[n];
+		const auto& context = collection[n];
 		out << "{\"payload\":" << context.payload << ",\"callers\":"; Proof(out, context.callers);
 		out << ",\"inputs\":[";
 		for (size_t k = 0; k < context.inputs.size(); ++k) {
@@ -857,7 +1025,8 @@ void Analyzer::Write(const std::string& filename) const
 		for (const auto& [index, cid] : context.binding.elements) {
 			if (!firstElement) out << ','; firstElement = false; out << '[' << index << ',' << cid << ']';
 		}
-		out << "]},\"scope\":\"entry_block\",\"status\":" << Quoted(context.analysis.arrayReads.empty() ? "bound_only" : "read_proved") << ",\"array_reads\":[";
+		out << "]},\"scope\":" << Quoted(context.analysis.traceGetter ? "entry_result_use" : !context.analysis.traceBlocks.empty() ? "entry_prefix" : context.path ? "initial_stack_check_fast_path" : context.analysis.arrayContinuationUsed ? "entry_chain" : "entry_block")
+			<< ",\"status\":" << Quoted(context.analysis.traceGetter ? "result_dispatch_proved" : !context.analysis.traceBlocks.empty() ? "indexed_result_proved" : !context.analysis.arrayReads.empty() ? "read_proved" : !context.analysis.lengthReturns.empty() ? "length_proved" : "bound_only") << ",\"array_reads\":[";
 		bool firstRead = true;
 		for (const auto& [site, read] : context.analysis.arrayReads) {
 			if (!firstRead) out << ','; firstRead = false;
@@ -870,10 +1039,57 @@ void Analyzer::Write(const std::string& filename) const
 			out << "{\"site\":" << site << ",\"load\":" << value.load << ",\"index\":" << value.index << ",\"table_index\":" << value.tableIndex
 				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":"; Proof(out, value.proof); out << '}';
 		}
-		out << "],\"certificate\":" << (context.analysis.certificate.empty() ? "null" : context.analysis.certificate) << '}';
+		out << "],\"array_length_returns\":["; bool firstLength = true;
+		for (const auto& [site, value] : context.analysis.lengthReturns) {
+			if (!firstLength) out << ','; firstLength = false; LengthReturn(out, value, site);
+		}
+		if (!context.analysis.traceBlocks.empty()) {
+			out << "],\"indexed_returns\":["; bool firstIndexed = true;
+			for (const auto& [site, value] : context.analysis.indexedReturns) {
+				if (!firstIndexed) out << ','; firstIndexed = false;
+				out << "{\"site\":" << site << ",\"callee\":" << value.callee << ",\"allocation\":null,\"entry_input_sp_offset\":" << *value.entryInputSpOffset
+					<< ",\"index\":" << value.index << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"proof\":";
+				Proof(out, value.proof); out << '}';
+			}
+			out << "],\"trace\":{\"blocks\":"; Proof(out, context.analysis.traceBlocks);
+			if (context.analysis.traceGetter) out << ",\"getter\":" << *context.analysis.traceGetter;
+			out << ",\"stop\":" << *context.analysis.traceStop << ",\"stack_checks\":[";
+			for (size_t k = 0; k < context.analysis.traceGuards.size(); ++k) {
+				if (k) out << ',';
+				const auto& guard = context.analysis.traceGuards[k];
+				out << "{\"edge\":\"fallthrough\",\"site\":" << guard.site << ",\"successor\":" << guard.successor << ",\"slow_path\":" << guard.slowPath
+					<< ",\"stub\":" << guard.stub << ",\"proof\":"; Proof(out, guard.proof); out << '}';
+			}
+			out << ']';
+		}
+		out << (context.analysis.traceBlocks.empty() ? "]" : "}") << ",\"certificate\":" << (context.analysis.certificate.empty() ? "null" : context.analysis.certificate);
+		if (context.path) {
+			const auto& path = *context.path;
+			out << ",\"path_condition\":{\"edge\":\"fallthrough\",\"site\":" << path.site << ",\"successor\":" << path.successor
+				<< ",\"slow_path\":" << path.slowPath << ",\"stub\":" << path.stub << ",\"proof\":";
+			Proof(out, path.proof); out << '}';
+		}
+		out << '}';
 	}
-	out << "],\"array_context_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << arrayAttempted
+	out << ']';
+	};
+	out << ",\"prefix_call_effects\":["; first = true;
+	for (const auto& [entry, certificate] : prefixEffects) { if (!first) out << ','; first = false; out << certificate; }
+	out << "],\"prefix_effect_analysis\":{\"requested\":" << requestedEffects.size() << ",\"attempted\":" << helperAttempts
+		<< ",\"accepted\":" << prefixEffects.size() << ",\"transfer_steps\":" << helperSteps << ",\"probe_steps\":" << 20000000 - probeSteps
+		<< ",\"rounds\":" << helperRounds << ",\"round_limit\":2,\"attempt_limit\":128,\"payload_byte_limit\":256,\"probe_step_limit\":20000000,\"per_helper_step_limit\":20000,\"per_helper_array_step_limit\":300000}";
+	out << ",\"array_contexts\":"; writeArrays(arrayContexts);
+	out << ",\"array_path_contexts\":"; writeArrays(arrayPathContexts);
+	out << ",\"array_entry_traces\":"; writeArrays(arrayEntryTraces);
+	out << ",\"array_result_traces\":"; writeArrays(arrayResultTraces);
+	out << ",\"array_result_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << resultAttempted
+		<< ",\"transfer_steps\":" << 20000000 - resultRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000,\"trace_instruction_limit\":256,\"trace_block_limit\":64}";
+	out << ",\"array_entry_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << entryAttempted
+		<< ",\"transfer_steps\":" << 20000000 - entryRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000,\"trace_instruction_limit\":256,\"trace_block_limit\":64}";
+	out << ",\"array_path_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << pathAttempted
+		<< ",\"transfer_steps\":" << 20000000 - pathRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000}";
+	out << ",\"array_context_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << arrayAttempted
 		<< ",\"transfer_steps\":" << 20000000 - arrayRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000}";
-	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not general working registers, source return types or heap contents. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block. Calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block read certificate. Input contents are discarded at calls and branch boundaries; entry backedges disable this consumer. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
+	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Frame-only callee effects preserve caller-frame classes. Checked length leaves can additionally preserve unwritten working registers and selected array contents; no source return type is inferred. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block and checked unique length-call continuations. Other calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block or checked entry-chain read certificate. length_proved records require a checked length-call result. Exact-target length leaves preserve contents only with a verified argument root and register-write mask at an untargeted immediate normal-return block. Packed values and saved index words are dropped there. Other calls and branch boundaries discard contents; entry backedges disable this consumer. array_path_contexts additionally require their explicit initial-stack-check fallthrough condition, checked against the matched SDK offset and slow stub. They exclude the initial slow edge only; the runtime stub has no asserted heap-preservation contract. They never replace unconditional array_contexts or global dispatch facts. array_entry_traces additionally describe one non-revisiting entry prefix ending at its first proved indexed result. Every chosen branch is concrete or an explicit checked stack condition; later iterations and post-getter execution are outside that scope. array_result_traces separately follow the getter result to the first later call, retaining scalar class/register data provenance and expiring array contents, prior input bindings and spills at the getter. Their stopped indirect target must derive from the result; unrelated or intervening calls produce no result-use claim. prefix_call_effects contain separately proved small callees requested by exact array-bound prefix calls. An interior helper must be an aligned dispatch-table entry within retained payload bytes; containing_payload identifies its unchanged native container and only the entry-to-end suffix is proved. They supplement entry/result traces only, with independent bounded work; original broad effects and ordinary contexts keep their original budgets and assumptions. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

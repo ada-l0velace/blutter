@@ -46,7 +46,9 @@ def checked_nonreturning_calls(graph, audit):
     return calls
 
 
-def check_call_effects(graph, read, decode, trusted, audit):
+def check_call_effects(graph, read, decode, trusted, audit, *, allow_interior_entries=False):
+    from check_array_lengths import checked_length_layout
+    checked_length_layout(graph, audit)
     certificates = graph.get('call_effects', [])
     assert graph.get('format', 4) >= 9 or not certificates
     assert len(certificates) <= 16384
@@ -101,8 +103,17 @@ def check_call_effects(graph, read, decode, trusted, audit):
         return kind, offset
 
     for start, certificate in effects.items():
-        assert type(start) is int and start in nodes
-        end = nodes[start]['end']
+        assert type(start) is int
+        parent = certificate.get('containing_payload')
+        if 'containing_payload' in certificate:
+            assert allow_interior_entries and graph.get('format', 4) >= 22
+            assert type(parent) is int and parent in nodes
+            end = nodes[parent]['end']
+            assert parent < start < end and start % 4 == 0 and (start-parent) % 4 == 0
+            assert start in graph['dispatch_table']['entries'], 'Interior helper is not a recorded dispatch entry'
+        else:
+            assert start in nodes
+            end = nodes[start]['end']
         assert 0 < end - start <= 4096 and (end - start) % 4 == 0
         depth = certificate['depth']
         assert type(depth) is int and 1 <= depth <= 8
@@ -342,5 +353,8 @@ def check_call_effects(graph, read, decode, trusted, audit):
             assert graph.get('format', 4) >= 14
             from check_array_returns import check_array_return
             check_array_return(certificate['array_return'], code, states, graph['receiver_metadata'], audit, nonreturning)
+        if certificate.get('array_length') is not None:
+            from check_array_lengths import check_array_length
+            check_array_length(certificate['array_length'], code, graph, audit)
 
     return set(effects), instructions_checked

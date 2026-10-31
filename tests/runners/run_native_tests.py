@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT))
 import blutter
 
 TESTS = ('arm64_analyzer_test', 'arm64_decoder_test', 'arm64_boxing_test',
-         'arm64_patterns_test', 'analysis_diagnostics_test', 'snapshot_code_ranges_test', 'read_unaligned_test')
+         'arm64_patterns_test', 'analysis_diagnostics_test', 'snapshot_code_ranges_test', 'read_unaligned_test',
+         'native_ir_test', 'arm64_ir_test', 'array_length_test', 'stack_check_test', 'entry_predicate_test')
 
 
 def main():

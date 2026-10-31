@@ -1,4 +1,6 @@
 #include "CallEffects.h"
+#include "Arm64Ir.h"
+#include "ArrayLengthAnalysis.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -140,16 +142,26 @@ std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
 	const auto& layout = profile.arrayBodyContract;
 	if (layout.empty() || profile.wordReturnRegister != ARM64_REG_X0 ||
 		(layout[3] == 4 && profile.heapBitsRegister != ARM64_REG_X28)) return {};
+	// Normalize once for this optional relation. The frame proof still owns
+	// reachability, entry-stack aliases and acceptance of normal returns.
+	std::vector<std::optional<NativeIr::Instruction>> instructions;
+	instructions.reserve(count);
+	for (size_t n = 0; n < count; ++n) instructions.push_back(LowerArm64(raw[n]));
+	const auto loadAt = [&](size_t n) -> const NativeIr::Load* {
+		return instructions[n] ? std::get_if<NativeIr::Load>(&instructions[n]->operation) : nullptr;
+	};
+	const auto returns = [&](size_t n) {
+		return instructions[n] && std::holds_alternative<NativeIr::Return>(instructions[n]->operation);
+	};
 	std::set<int64_t> candidates;
 	bool elementLoad = false;
 	for (size_t n = 0; n < count; ++n) if (frames[n]) {
-		const auto& d = raw[n].detail->arm64;
-		if ((raw[n].id != ARM64_INS_LDR && raw[n].id != ARM64_INS_LDUR) || d.op_count != 2 ||
-			d.operands[0].type != ARM64_OP_REG || d.operands[1].type != ARM64_OP_MEM || d.writeback || d.operands[1].mem.index) continue;
-		const auto& m = d.operands[1].mem; const int r = Reg(m.base);
-		elementLoad |= m.disp == layout[2] && Bytes(d.operands[0].reg) == layout[3];
-		if (r >= 0 && frames[n]->regs[r].kind == Stack && Bytes(d.operands[0].reg) == 8) {
-			const auto slot = frames[n]->regs[r].offset + m.disp;
+		const auto* load = loadAt(n);
+		if (!load) continue;
+		const auto r = load->address.base.id;
+		elementLoad |= load->address.displacement == layout[2] && load->bytes == layout[3];
+		if (r < 31 && frames[n]->regs[r].kind == Stack && load->bytes == 8) {
+			const auto slot = frames[n]->regs[r].offset + load->address.displacement;
 			if (slot >= 0 && slot <= 248 && slot % 8 == 0) candidates.insert(slot);
 		}
 	}
@@ -188,7 +200,7 @@ std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
 				if (profile.nonReturningCalls.contains(target)) continue;
 				valid = false; break;
 			}
-			if (i.id == ARM64_INS_RET || i.id == ARM64_INS_BRK || i.id == ARM64_INS_HLT) continue;
+			if (returns(n) || i.id == ARM64_INS_BRK || i.id == ARM64_INS_HLT) continue;
 			const int dst = d.op_count && d.operands[0].type == ARM64_OP_REG ? Reg(d.operands[0].reg) : -1;
 			if (i.id == ARM64_INS_MOV && d.op_count == 2 && dst >= 0 && d.operands[1].type == ARM64_OP_REG && !d.operands[1].shift.type && !d.operands[1].ext) {
 				const int r = Reg(d.operands[1].reg);
@@ -218,13 +230,15 @@ std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
 				// Frame proof already bounds own-frame stores. No heap writes or
 				// returning calls are permitted by this stronger relation.
 				if (!Load(i.id)) { if (!stack) valid = false; continue; }
-				if ((i.id != ARM64_INS_LDR && i.id != ARM64_INS_LDUR) || d.op_count != 2 || dst < 0 || d.writeback || m.index) continue;
-				const auto width = Bytes(d.operands[0].reg);
-				if (stack && width == 8) {
-					const auto slot = frames[n]->regs[r].offset + m.disp;
-					if (slot >= 0 && slot <= 248 && slot % 8 == 0) after[dst] = {slot == index ? 2 : 1, slot, 0};
-				} else if (r >= 0 && before[r][0] == 4 && m.disp == layout[2] && width == layout[3])
-					after[dst] = {width == 4 ? 5 : 6, before[r][1], before[r][2]};
+				const auto* load = loadAt(n);
+				if (!load) continue;
+				const auto base = load->address.base.id, destination = load->target.id;
+				const auto displacement = load->address.displacement;
+				if (base < 31 && frames[n]->regs[base].kind == Stack && load->bytes == 8) {
+					const auto slot = frames[n]->regs[base].offset + displacement;
+					if (slot >= 0 && slot <= 248 && slot % 8 == 0) after[destination] = {slot == index ? 2 : 1, slot, 0};
+				} else if (base < 31 && before[base][0] == 4 && displacement == layout[2] && load->bytes == layout[3])
+					after[destination] = {load->bytes == 4 ? 5 : 6, before[base][1], before[base][2]};
 			}
 			std::vector<uint64_t> successors;
 			const bool branch = i.id == ARM64_INS_B || i.id == ARM64_INS_CBZ || i.id == ARM64_INS_CBNZ || i.id == ARM64_INS_TBZ || i.id == ARM64_INS_TBNZ;
@@ -244,7 +258,7 @@ std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
 			}
 		}
 		std::optional<int64_t> arrayInput;
-		for (size_t n = 0; valid && n < count; ++n) if (states[n] && raw[n].id == ARM64_INS_RET) {
+		for (size_t n = 0; valid && n < count; ++n) if (states[n] && returns(n)) {
 			const auto value = (*states[n])[0];
 			if (value[0] != 6 || value[2] != index || value[1] == index || (arrayInput && *arrayInput != value[1])) valid = false;
 			else arrayInput = value[1];
@@ -524,6 +538,15 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 		if (const auto summary = ProveArrayReturn(raw, count, incoming, profile, arrayBudget)) {
 			result.arrayReturns.emplace(entry, summary->inputs);
 			JsonArraySummary(out, entry, *summary);
+		}
+		if (const auto summary = ProveArrayLength(raw, count, profile)) {
+			result.arrayLengths.emplace(entry, ArrayLengthEffect{summary->arraySpOffset, summary->writtenRegisters});
+			const auto& layout = *profile.arrayLengthLayout;
+			out << ",\"array_length\":{\"array_sp_offset\":" << summary->arraySpOffset << ",\"array_class_id\":" << layout.classId
+				<< ",\"result_register\":\"x0\",\"result_representation\":\"" << (layout.bytes == 4 ? "zero_extended_smi" : "smi")
+				<< "\",\"heap_effect\":\"read_only\",\"may_fault\":true,\"written_registers\":" << summary->writtenRegisters << ",\"proof\":[";
+			for (size_t j = 0; j < summary->proof.size(); ++j) { if (j) out << ','; out << summary->proof[j]; }
+			out << "]}";
 		}
 		out << '}';
 		result.certificates.emplace(entry, out.str()); return true;

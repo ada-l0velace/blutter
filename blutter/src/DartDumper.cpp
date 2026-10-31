@@ -135,6 +135,7 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		if (!object.IsSmi()) { if (comma) of << ','; comma = true; of << '[' << i << ',' << object.GetClassId() << ']'; }
 	}
 	of << "],\"word_return_register\":" << (dart::CallingConventions::kReturnReg == dart::R0 ? "\"x0\"" : "null");
+	of << ",\"stack_limit_offset\":" << TargetThreadOffset(dart::Thread::stack_limit_offset());
 	of << ",\"pool_code_entries\":[";
 	comma = false;
 	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
@@ -208,6 +209,8 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	of << ",\"array_body_contract\":[";
 	if (!arrayAllocation.IsNull()) of << arrayAllocation.EntryPoint() - app.base() << ',' << dart::AllocateArrayABI::kLengthReg << ','
 		<< dart::Array::data_offset() - dart::kHeapObjectTag << ',' << dart::compiler::target::kCompressedWordSize << ',' << dart::kSmiTagShift;
+	of << "],\"array_length_layout\":[" << dart::kArrayCid << ',' << dart::Array::length_offset() - dart::kHeapObjectTag << ','
+		<< dart::compiler::target::kCompressedWordSize << ',' << dart::kSmiTagShift;
 	of << "],\"allocation_body_bounds\":[";
 	bool bodyComma = false;
 	auto auditBody = [&](const dart::Code& code, const dart::Class& cls) {
@@ -724,8 +727,12 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	SnapshotAnalysis::Profile profile{profileName, ARM64_REG_X27, ARM64_REG_X26,
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
 	profile.dispatchRegister = ARM64_REG_X21;
+	profile.stackLimitOffset = TargetThreadOffset(dart::Thread::stack_limit_offset());
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
 	if constexpr (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28) profile.heapBitsRegister = ARM64_REG_X28;
+	static_assert(dart::SP == dart::R15);
+	profile.arrayLengthLayout = SnapshotAnalysis::ArrayLengthLayout{dart::kArrayCid,
+		AOT_Array_length_offset - dart::kHeapObjectTag, dart::compiler::target::kCompressedWordSize, dart::kSmiTagShift};
 	profile.dispatchOrigin = dart::DispatchTable::kOriginElement;
 	profile.classIdShift = dart::UntaggedObject::ClassIdTag::shift();
 	profile.classIdBits = dart::UntaggedObject::ClassIdTag::bitsize();

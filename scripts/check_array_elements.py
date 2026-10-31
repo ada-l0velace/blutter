@@ -17,6 +17,7 @@ class ArrayTrace:
         self.packed, self.cells, self.roots, self.words = {}, {}, set(), {}
         self.packed_indices = {}
         self.input_binding = entry_input is not None
+        self.input_offset = entry_input['sp_offset'] if entry_input is not None else None
         if entry_input is not None:
             self.seed = (0, entry_input['length'])
             self.aliases.clear()
@@ -32,6 +33,15 @@ class ArrayTrace:
         self.words.clear()
         self.packed_indices.clear()
         self.input_binding = False
+        self.input_offset = None
+
+    def continue_length_call(self, writes):
+        # The verified leaf has no writes/allocating calls. Keep only the
+        # limited array facts represented by the producer's one-edge handoff.
+        self.aliases = {r: value for r, value in self.aliases.items() if not writes & (1 << r)}
+        self.packed.clear()
+        self.packed_indices.clear()
+        self.words.clear()
 
     def address(self, ins, memory):
         base = self.aliases.get(self.number(ins, memory.mem.base))

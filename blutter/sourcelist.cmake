@@ -47,6 +47,10 @@ set(SRCS
     NativeIr.h
     Arm64Ir.cpp
     Arm64Ir.h
+    ArrayLengthAnalysis.cpp
+    ArrayLengthAnalysis.h
+    StackCheckAnalysis.cpp
+    StackCheckAnalysis.h
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
 	ReceiverAnalysis.cpp

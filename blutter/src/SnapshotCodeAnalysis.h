@@ -34,6 +34,14 @@ struct PoolSlot {
 struct ArrayReturnInput {
 	int64_t arraySpOffset, indexSpOffset;
 };
+// Matched runtime layout, not an inferred callee effect. The relation applies
+// only to inputs of this exact class, on normal return.
+struct ArrayLengthLayout {
+	uint32_t classId;
+	int64_t displacement;
+	unsigned bytes, smiShift;
+};
+struct ArrayLengthEffect { int64_t arraySpOffset; uint32_t writtenRegisters; };
 struct Profile {
 	std::string name;
 	arm64_reg poolRegister;
@@ -81,6 +89,9 @@ struct Profile {
 	std::map<uint64_t, std::pair<int64_t, int64_t>> allocationBodyBounds;
 	// entry, length GPR, data displacement, element bytes, Smi shift.
 	std::vector<int64_t> arrayBodyContract;
+	std::optional<ArrayLengthLayout> arrayLengthLayout;
+	std::map<uint64_t, ArrayLengthEffect> arrayLengthEffects;
+	std::optional<int64_t> stackLimitOffset;
 	// Matched compressed-pointer reconstruction register; optional.
 	arm64_reg heapBitsRegister = ARM64_REG_INVALID;
 };
@@ -165,6 +176,14 @@ struct IndexedReturn {
 	uint64_t callee, allocation, index;
 	uint32_t classId;
 	std::vector<uint64_t> proof;
+	std::optional<int64_t> entryInputSpOffset;
+};
+struct ArrayLengthReturn {
+	uint64_t callee, length;
+	int64_t inputSpOffset;
+	std::optional<uint64_t> allocation;
+	std::optional<int64_t> entryInputSpOffset;
+	std::vector<uint64_t> proof;
 };
 struct Edge {
 	uint64_t site;
@@ -188,6 +207,7 @@ struct Edge {
 	std::optional<ForwardedReturn> forwardedReturn;
 	std::vector<ArrayArgument> arrayArguments;
 	std::optional<IndexedReturn> indexedReturn;
+	std::optional<ArrayLengthReturn> arrayLengthReturn;
 };
 
 class Analyzer {

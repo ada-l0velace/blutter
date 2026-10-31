@@ -41,6 +41,22 @@ target_include_directories(arm64_ir_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 target_link_libraries(arm64_ir_test PRIVATE capstone)
 add_test(NAME native_ir COMMAND native_ir_test)
 add_test(NAME arm64_ir COMMAND arm64_ir_test)
+add_executable(array_length_test unit/array_length_test.cpp "${BLUTTER_SOURCE_DIR}/ArrayLengthAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(array_length_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(array_length_test PRIVATE capstone)
+add_test(NAME array_length COMMAND array_length_test)
+add_executable(stack_check_test unit/stack_check_test.cpp "${BLUTTER_SOURCE_DIR}/StackCheckAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(stack_check_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(stack_check_test PRIVATE capstone)
+add_test(NAME stack_check COMMAND stack_check_test)
+add_executable(entry_predicate_test unit/entry_predicate_test.cpp "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(entry_predicate_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(entry_predicate_test PRIVATE capstone)
+add_test(NAME entry_predicate COMMAND entry_predicate_test)
+
+
 
 add_test(NAME arm64_analyzer COMMAND arm64_analyzer_test)
 add_test(NAME arm64_decoder COMMAND arm64_decoder_test)
@@ -78,6 +94,6 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
 
 foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
-        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test)
+        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test)
     blutter_instrument_test_target(${target})
 endforeach()
