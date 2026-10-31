@@ -338,4 +338,9 @@ def check_call_effects(graph, read, decode, trusted, audit):
                 assert entails((state, slots), states[next_site]), 'Forged callee frame/return invariant'
                 pending.append(next_site)
         assert reached == states.keys() and returns, 'Unreachable effect state or no proved normal return'
+        if certificate.get('array_return') is not None:
+            assert graph.get('format', 4) >= 14
+            from check_array_returns import check_array_return
+            check_array_return(certificate['array_return'], code, states, graph['receiver_metadata'], audit, nonreturning)
+
     return set(effects), instructions_checked

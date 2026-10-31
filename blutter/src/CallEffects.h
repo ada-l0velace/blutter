@@ -5,6 +5,7 @@ namespace SnapshotAnalysis {
 struct CallEffectResult {
 	std::map<uint64_t, std::string> certificates;
 	std::map<uint64_t, int64_t> forwardedInputs;
+	std::map<uint64_t, ArrayReturnInput> arrayReturns;
 	size_t attempted = 0, steps = 0;
 };
 // Prove caller-frame/class preservation. A call-free body can additionally

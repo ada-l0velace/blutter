@@ -126,10 +126,155 @@ void JsonState(std::ostream& out, uint64_t site, const State& state) {
 	}
 	out << "]]";
 }
+// A separate, optional must-analysis. Its budget cannot weaken frame proofs.
+// Symbols: input, bounded tagged index, untagged index, address, packed value,
+// full element. The two operands are physical entry-stack offsets.
+using ArraySymbol = std::array<int64_t, 3>;
+using ArrayState = std::array<ArraySymbol, 31>;
+struct ArraySummary {
+	ArrayReturnInput inputs;
+	std::vector<std::optional<ArrayState>> states;
+};
+std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
+	const std::vector<std::optional<State>>& frames, const Profile& profile, size_t& budget) {
+	const auto& layout = profile.arrayBodyContract;
+	if (layout.empty() || profile.wordReturnRegister != ARM64_REG_X0 ||
+		(layout[3] == 4 && profile.heapBitsRegister != ARM64_REG_X28)) return {};
+	std::set<int64_t> candidates;
+	bool elementLoad = false;
+	for (size_t n = 0; n < count; ++n) if (frames[n]) {
+		const auto& d = raw[n].detail->arm64;
+		if ((raw[n].id != ARM64_INS_LDR && raw[n].id != ARM64_INS_LDUR) || d.op_count != 2 ||
+			d.operands[0].type != ARM64_OP_REG || d.operands[1].type != ARM64_OP_MEM || d.writeback || d.operands[1].mem.index) continue;
+		const auto& m = d.operands[1].mem; const int r = Reg(m.base);
+		elementLoad |= m.disp == layout[2] && Bytes(d.operands[0].reg) == layout[3];
+		if (r >= 0 && frames[n]->regs[r].kind == Stack && Bytes(d.operands[0].reg) == 8) {
+			const auto slot = frames[n]->regs[r].offset + m.disp;
+			if (slot >= 0 && slot <= 248 && slot % 8 == 0) candidates.insert(slot);
+		}
+	}
+	if (!elementLoad) return {};
+	const uint64_t entry = raw[0].address;
+	for (const auto index : candidates) {
+		std::vector<std::optional<ArrayState>> states(count); states[0] = ArrayState{};
+		std::deque<size_t> pending{0}; bool valid = true;
+		auto merge = [&](size_t n, const ArrayState& value) {
+			if (!states[n]) { states[n] = value; pending.push_back(n); return; }
+			auto common = *states[n];
+			for (unsigned r = 0; r < 31; ++r) if (common[r] != value[r]) common[r] = {};
+			if (common != *states[n]) { states[n] = common; pending.push_back(n); }
+		};
+		while (valid && !pending.empty()) {
+			if (!budget) return {};
+			--budget;
+			const auto n = pending.front(); pending.pop_front();
+			if (!frames[n]) { valid = false; break; }
+			const auto& i = raw[n]; const auto& d = i.detail->arm64;
+			const auto before = *states[n]; auto after = before;
+			std::set<int> writes;
+			for (unsigned j = 0; j < i.detail->regs_write_count; ++j)
+				if (const int r = Reg(static_cast<arm64_reg>(i.detail->regs_write[j])); r >= 0) writes.insert(r);
+			const bool flags = i.id == ARM64_INS_CMP || i.id == ARM64_INS_CMN || i.id == ARM64_INS_TST || i.id == ARM64_INS_CCMP || i.id == ARM64_INS_CCMN;
+			for (unsigned j = 0; j < d.op_count; ++j) {
+				const auto& op = d.operands[j];
+				if (!flags && op.type == ARM64_OP_REG && (op.access & CS_AC_WRITE)) if (const int r = Reg(op.reg); r >= 0) writes.insert(r);
+				if (op.type == ARM64_OP_MEM && d.writeback) if (const int r = Reg(op.mem.base); r >= 0) writes.insert(r);
+			}
+			for (const auto r : writes) after[r] = {};
+			if (i.id == ARM64_INS_BL || i.id == ARM64_INS_BLR) {
+				const int r = d.op_count == 1 && d.operands[0].type == ARM64_OP_REG ? Reg(d.operands[0].reg) : -1;
+				const uint64_t target = i.id == ARM64_INS_BL ? static_cast<uint64_t>(d.operands[0].imm) :
+					r >= 0 && frames[n]->regs[r].kind == Entry ? static_cast<uint64_t>(frames[n]->regs[r].offset) : UINT64_MAX;
+				if (profile.nonReturningCalls.contains(target)) continue;
+				valid = false; break;
+			}
+			if (i.id == ARM64_INS_RET || i.id == ARM64_INS_BRK || i.id == ARM64_INS_HLT) continue;
+			const int dst = d.op_count && d.operands[0].type == ARM64_OP_REG ? Reg(d.operands[0].reg) : -1;
+			if (i.id == ARM64_INS_MOV && d.op_count == 2 && dst >= 0 && d.operands[1].type == ARM64_OP_REG && !d.operands[1].shift.type && !d.operands[1].ext) {
+				const int r = Reg(d.operands[1].reg);
+				if (r >= 0 && Bytes(d.operands[0].reg) == Bytes(d.operands[1].reg) &&
+					(Bytes(d.operands[0].reg) == 8 || before[r][0] == 2 || before[r][0] == 3)) after[dst] = before[r];
+			}
+			if (i.id == ARM64_INS_SBFX && d.op_count == 4 && dst >= 0 && Bytes(d.operands[0].reg) == 8 &&
+				d.operands[1].type == ARM64_OP_REG && Bytes(d.operands[1].reg) == 8 && d.operands[2].type == ARM64_OP_IMM && d.operands[2].imm == 1 &&
+				d.operands[3].type == ARM64_OP_IMM && d.operands[3].imm == 31) {
+				const int r = Reg(d.operands[1].reg);
+				if (r >= 0 && before[r][0] == 2) after[dst] = {3, index, 0};
+			}
+			if (i.id == ARM64_INS_ADD && d.op_count == 3 && dst >= 0 && Bytes(d.operands[0].reg) == 8 &&
+				d.operands[1].type == ARM64_OP_REG && Bytes(d.operands[1].reg) == 8 && !d.operands[1].shift.type && !d.operands[1].ext &&
+				d.operands[2].type == ARM64_OP_REG && Bytes(d.operands[2].reg) == 8 && !d.operands[2].ext) {
+				const int a = Reg(d.operands[1].reg), b = Reg(d.operands[2].reg);
+				if (a >= 0 && b >= 0 && d.operands[2].shift.type == ARM64_SFT_LSL) {
+					if (before[a][0] == 1 && before[b] == ArraySymbol{3, index, 0} && d.operands[2].shift.value == (layout[3] == 4 ? 2U : 3U))
+						after[dst] = {4, before[a][1], index};
+					if (before[a][0] == 5 && d.operands[2].reg == profile.heapBitsRegister && d.operands[2].shift.value == 32 && layout[3] == 4)
+						after[dst] = {6, before[a][1], before[a][2]};
+				}
+			}
+			for (unsigned j = 0; j < d.op_count; ++j) if (d.operands[j].type == ARM64_OP_MEM) {
+				const auto& m = d.operands[j].mem; const int r = Reg(m.base);
+				const bool stack = r >= 0 && frames[n]->regs[r].kind == Stack && !m.index;
+				// Frame proof already bounds own-frame stores. No heap writes or
+				// returning calls are permitted by this stronger relation.
+				if (!Load(i.id)) { if (!stack) valid = false; continue; }
+				if ((i.id != ARM64_INS_LDR && i.id != ARM64_INS_LDUR) || d.op_count != 2 || dst < 0 || d.writeback || m.index) continue;
+				const auto width = Bytes(d.operands[0].reg);
+				if (stack && width == 8) {
+					const auto slot = frames[n]->regs[r].offset + m.disp;
+					if (slot >= 0 && slot <= 248 && slot % 8 == 0) after[dst] = {slot == index ? 2 : 1, slot, 0};
+				} else if (r >= 0 && before[r][0] == 4 && m.disp == layout[2] && width == layout[3])
+					after[dst] = {width == 4 ? 5 : 6, before[r][1], before[r][2]};
+			}
+			std::vector<uint64_t> successors;
+			const bool branch = i.id == ARM64_INS_B || i.id == ARM64_INS_CBZ || i.id == ARM64_INS_CBNZ || i.id == ARM64_INS_TBZ || i.id == ARM64_INS_TBNZ;
+			if (branch) {
+				successors.push_back(d.operands[d.op_count-1].imm);
+				if (i.id != ARM64_INS_B || (d.cc != ARM64_CC_INVALID && d.cc != ARM64_CC_AL)) successors.push_back(i.address + 4);
+				if ((i.id == ARM64_INS_TBZ || i.id == ARM64_INS_TBNZ) && d.op_count == 3 && d.operands[0].type == ARM64_OP_REG &&
+					d.operands[1].type == ARM64_OP_IMM && d.operands[1].imm == 0) {
+					const int r = Reg(d.operands[0].reg);
+					if (r >= 0 && before[r] == ArraySymbol{2, index, 0})
+						successors = {i.id == ARM64_INS_TBZ ? static_cast<uint64_t>(d.operands[2].imm) : i.address + 4};
+				}
+			} else successors.push_back(i.address + 4);
+			for (const auto next : successors) {
+				if (next < entry || (next-entry) % 4 || (next-entry)/4 >= count) { valid = false; break; }
+				merge((next-entry)/4, after);
+			}
+		}
+		std::optional<int64_t> arrayInput;
+		for (size_t n = 0; valid && n < count; ++n) if (states[n] && raw[n].id == ARM64_INS_RET) {
+			const auto value = (*states[n])[0];
+			if (value[0] != 6 || value[2] != index || value[1] == index || (arrayInput && *arrayInput != value[1])) valid = false;
+			else arrayInput = value[1];
+		}
+		if (valid && arrayInput) return ArraySummary{{*arrayInput, index}, std::move(states)};
+	}
+	return {};
+}
+void JsonArraySummary(std::ostream& out, uint64_t entry, const ArraySummary& summary) {
+	out << ",\"array_return\":{\"array_sp_offset\":" << summary.inputs.arraySpOffset << ",\"index_sp_offset\":" << summary.inputs.indexSpOffset
+		<< ",\"index_representation\":\"smi\",\"index_min\":0,\"index_max\":31,\"states\":[";
+	bool first = true;
+	for (size_t n = 0; n < summary.states.size(); ++n) if (summary.states[n]) {
+		if (!first) out << ',';
+		first = false; out << '[' << entry+n*4 << ",[";
+		bool firstReg = true;
+		for (unsigned r = 0; r < 31; ++r) if ((*summary.states[n])[r][0]) {
+			if (!firstReg) out << ',';
+			firstReg = false; const auto v = (*summary.states[n])[r];
+			out << '[' << r << ',' << v[0] << ',' << v[1] << ',' << v[2] << ']';
+		}
+		out << "]]";
+	}
+	out << "]}";
+}
 }
 
 CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t>>& bytes, const Profile& profile) {
 	CallEffectResult result;
+	size_t arrayBudget = 300000;
 	if (profile.poolRegister != ARM64_REG_X27 || profile.threadRegister != ARM64_REG_X26) return result;
 	for (const auto& [entry, contract] : profile.nonReturningCalls)
 		if (contract != "range_error_without_fpu" || profile.allocationReturns.contains(entry) || profile.framePreservingCalls.contains(entry)) return result;
@@ -375,6 +520,10 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 		if (forwards && forwarded) {
 			result.forwardedInputs.emplace(entry, *forwarded);
 			out << ",\"return_input\":" << *forwarded;
+		}
+		if (const auto summary = ProveArrayReturn(raw, count, incoming, profile, arrayBudget)) {
+			result.arrayReturns.emplace(entry, summary->inputs);
+			JsonArraySummary(out, entry, *summary);
 		}
 		out << '}';
 		result.certificates.emplace(entry, out.str()); return true;

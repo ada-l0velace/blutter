@@ -43,6 +43,10 @@ set(SRCS
     ElfHelper.h
     FridaWriter.cpp
     FridaWriter.h
+    NativeIr.cpp
+    NativeIr.h
+    Arm64Ir.cpp
+    Arm64Ir.h
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
 	ReceiverAnalysis.cpp

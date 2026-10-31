@@ -29,6 +29,11 @@ struct PoolSlot {
 	// not a promise that the runtime has not patched this entry.
 	std::map<int64_t, uint64_t> entryPoints;
 };
+// Conditional normal-return relation. The caller must prove a fresh array and
+// an in-bounds Smi index in [0,31]; this is not a source return-type signature.
+struct ArrayReturnInput {
+	int64_t arraySpOffset, indexSpOffset;
+};
 struct Profile {
 	std::string name;
 	arm64_reg poolRegister;
@@ -69,12 +74,15 @@ struct Profile {
 	// a source return type or describe floating/pair results.
 	arm64_reg wordReturnRegister = ARM64_REG_INVALID;
 	std::map<uint64_t, int64_t> forwardedReturnInputs;
+	std::map<uint64_t, ArrayReturnInput> arrayReturnInputs;
 	// Reviewed unary round leaf wrapper: thread entry, vm_tag, saved limit, Dart tag.
 	std::vector<int64_t> leafMathContract;
 	// Tagged-pointer-relative writable body intervals, excluding object headers.
 	std::map<uint64_t, std::pair<int64_t, int64_t>> allocationBodyBounds;
 	// entry, length GPR, data displacement, element bytes, Smi shift.
 	std::vector<int64_t> arrayBodyContract;
+	// Matched compressed-pointer reconstruction register; optional.
+	arm64_reg heapBitsRegister = ARM64_REG_INVALID;
 };
 struct Reference {
 	uint64_t site;
@@ -129,9 +137,32 @@ struct EntryStackLoad {
 	unsigned width;
 	std::vector<uint64_t> proof;
 };
+struct ArrayArgument {
+	int64_t spOffset;
+	uint64_t allocation;
+	uint64_t length;
+	std::map<int64_t, uint32_t> elements;
+	std::vector<uint64_t> proof;
+};
+struct ArrayInputBinding {
+	int64_t spOffset;
+	uint64_t length;
+	std::map<int64_t, uint32_t> elements;
+};
+struct ArrayElementRead {
+	int64_t inputSpOffset, index;
+	uint32_t classId;
+	std::string reg;
+	std::vector<uint64_t> proof;
+};
 struct ForwardedReturn {
 	uint64_t callee;
 	int64_t inputSpOffset;
+	uint32_t classId;
+	std::vector<uint64_t> proof;
+};
+struct IndexedReturn {
+	uint64_t callee, allocation, index;
 	uint32_t classId;
 	std::vector<uint64_t> proof;
 };
@@ -155,6 +186,8 @@ struct Edge {
 	std::optional<StaticDispatch> staticDispatch;
 	std::vector<StackInput> stackInputs;
 	std::optional<ForwardedReturn> forwardedReturn;
+	std::vector<ArrayArgument> arrayArguments;
+	std::optional<IndexedReturn> indexedReturn;
 };
 
 class Analyzer {

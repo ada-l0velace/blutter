@@ -204,7 +204,8 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	auditPredefined(arrayAllocation, dart::kArrayCid);
 	if (closureAllocation) auditPredefined(*closureAllocation, dart::kClosureCid);
 	auditPredefined(mintAllocation, dart::kMintCid);
-	of << "],\"array_body_contract\":[";
+	of << "],\"heap_bits_register\":" << (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28 ? "\"x28\"" : "null");
+	of << ",\"array_body_contract\":[";
 	if (!arrayAllocation.IsNull()) of << arrayAllocation.EntryPoint() - app.base() << ',' << dart::AllocateArrayABI::kLengthReg << ','
 		<< dart::Array::data_offset() - dart::kHeapObjectTag << ',' << dart::compiler::target::kCompressedWordSize << ',' << dart::kSmiTagShift;
 	of << "],\"allocation_body_bounds\":[";
@@ -724,6 +725,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
 	profile.dispatchRegister = ARM64_REG_X21;
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
+	if constexpr (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28) profile.heapBitsRegister = ARM64_REG_X28;
 	profile.dispatchOrigin = dart::DispatchTable::kOriginElement;
 	profile.classIdShift = dart::UntaggedObject::ClassIdTag::shift();
 	profile.classIdBits = dart::UntaggedObject::ClassIdTag::bitsize();

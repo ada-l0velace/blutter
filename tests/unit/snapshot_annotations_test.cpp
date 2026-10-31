@@ -5,6 +5,7 @@
 #include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <cstdlib>
 
 // Standalone harness: no Dart runtime, SDK layout, or deserializer involved.
 int main(int argc, char** argv)
@@ -39,6 +40,7 @@ int main(int argc, char** argv)
 			}};
 		profile.dispatchRegister = ARM64_REG_X21;
 		profile.wordReturnRegister = ARM64_REG_X0;
+		profile.heapBitsRegister = ARM64_REG_X28;
 		profile.dispatchOrigin = 4;
 		profile.dispatchEntries = {0x2000, 0x2004, {}, 0x3000, 0x2000, 0x2004, 0x2000, 0x2004, 0xb000};
 		profile.dispatchNullTarget = 0x3000;
@@ -54,6 +56,10 @@ int main(int argc, char** argv)
 		profile.leafMathContract = {0x80, 0x88, 0x90, 8};
 		profile.allocationBodyBounds = {{0x2000, {7, 31}}, {0x7000, {7, 15}}, {0x8000, {7, 39}}};
 		profile.arrayBodyContract = {0x6000, 2, 15, 4, 1};
+		if (const char* width = std::getenv("BLUTTER_TEST_ARRAY_BYTES")) {
+			if (std::string(width) == "8") { profile.arrayBodyContract[3] = 8; profile.heapBitsRegister = ARM64_REG_INVALID; }
+			else if (std::string(width) != "4") throw std::runtime_error("Unsupported test array width");
+		}
 		profile.poolHeapClass = [](int64_t index) -> std::optional<uint32_t> {
 			if (index == 3 || index == 4) return 1;
 			if (index == 5) return 2;

@@ -1,6 +1,7 @@
 #include "SnapshotCodeAnalysis.h"
 #include "ReceiverAnalysis.h"
 #include "CallEffects.h"
+#include "Arm64Ir.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -154,50 +155,19 @@ std::optional<Constant> ArithmeticOperand(const cs_arm64_op& op, unsigned width,
 std::optional<Constant> ConstantResult(const cs_insn& instruction,
 	const std::array<std::optional<Constant>, 31>& constants)
 {
-	const auto& d = instruction.detail->arm64;
-	if (d.op_count < 2 || d.operands[0].type != ARM64_OP_REG || RegNumber(d.operands[0].reg) < 0) return {};
-	const auto width = RegWidth(d.operands[0].reg);
-	const uint64_t mask = width == 8 ? UINT64_MAX : UINT32_MAX;
-	std::optional<Constant> result;
-	const auto& source = d.operands[1];
-	if (instruction.id == ARM64_INS_MOV && d.op_count == 2) {
-		if (source.type == ARM64_OP_IMM) result = Constant{static_cast<uint64_t>(source.imm) & mask, {}};
-		else if (source.type == ARM64_OP_REG && RegWidth(source.reg) == width) {
-			if (source.reg == ARM64_REG_XZR || source.reg == ARM64_REG_WZR) result = Constant{0, {}};
-			else if (const int r = RegNumber(source.reg); r >= 0) result = constants[r];
-		}
-	} else if ((instruction.id == ARM64_INS_MOVZ || instruction.id == ARM64_INS_MOVN || instruction.id == ARM64_INS_MOVK) &&
-		d.op_count == 2 && source.type == ARM64_OP_IMM && source.imm >= 0 && source.imm <= 0xffff &&
-		(source.shift.type == ARM64_SFT_INVALID || source.shift.type == ARM64_SFT_LSL)) {
-		const unsigned shift = source.shift.type == ARM64_SFT_INVALID ? 0 : source.shift.value;
-		if (shift % 16 == 0 && shift < width * 8) {
-			const auto value = static_cast<uint64_t>(source.imm) << shift;
-			if (instruction.id == ARM64_INS_MOVK) {
-				result = constants[RegNumber(d.operands[0].reg)];
-				if (result) result->bits = (result->bits & ~(uint64_t{0xffff} << shift)) | value;
-			} else result = Constant{instruction.id == ARM64_INS_MOVN ? ~value : value, {}};
-		}
-	}
-	else if ((instruction.id == ARM64_INS_ADD || instruction.id == ARM64_INS_SUB) && d.op_count == 3 &&
-		source.type == ARM64_OP_REG && RegWidth(source.reg) == width) {
-		const auto left = RegisterValue(source.reg, constants);
-		const auto right = ArithmeticOperand(d.operands[2], width, constants);
-		if (left && right)
-			result = Constant{instruction.id == ARM64_INS_ADD ? left->bits + right->bits : left->bits - right->bits,
-				MergeProof(left->proof, right->proof)};
-	} else if (instruction.id == ARM64_INS_UBFX && d.op_count == 4 && source.type == ARM64_OP_REG &&
-		RegWidth(source.reg) == width && d.operands[2].type == ARM64_OP_IMM && d.operands[3].type == ARM64_OP_IMM) {
-		const auto value = RegisterValue(source.reg, constants);
-		const auto lsb = d.operands[2].imm, size = d.operands[3].imm;
-		if (value && lsb >= 0 && size > 0 && size < 64 && lsb + size <= width * 8)
-			result = Constant{(value->bits >> lsb) & ((uint64_t{1} << size) - 1), value->proof};
-	}
-	if (result) {
-		if (result->proof.size() >= 64) return {};
-		result->bits &= mask;
-		result->proof.push_back(instruction.address);
-	}
-	return result;
+	const auto ir = LowerArm64(instruction);
+	if (!ir) return {};
+	const auto effects = NativeIr::GetEffects(*ir);
+	if (!effects.destination || effects.destination->id >= constants.size()) return {};
+	std::vector<uint64_t> proof;
+	const auto value = NativeIr::Evaluate(*ir, [&](NativeIr::RegisterView reg) -> std::optional<uint64_t> {
+		if (reg.id >= constants.size() || !constants[reg.id]) return {};
+		proof = MergeProof(proof, constants[reg.id]->proof);
+		return constants[reg.id]->bits;
+	});
+	if (!value || proof.size() >= 64) return {};
+	proof.push_back(ir->source.address);
+	return Constant{*value, std::move(proof)};
 }
 // Keep an unknown extracted bitfield plus a signed affine offset. No object
 // identity, receiver class, branch constraint, or cross-block fact is assumed.
@@ -305,6 +275,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		const auto effects = AnalyzeCallEffects(contextBytes, profile);
 		callEffectCertificates = effects.certificates;
 		profile.forwardedReturnInputs = effects.forwardedInputs;
+		profile.arrayReturnInputs = effects.arrayReturns;
 		callEffectAttempts = effects.attempted; callEffectSteps = effects.steps;
 		for (const auto& [entry, certificate] : effects.certificates) profile.frameSafeCallees.insert(entry);
 		callEffectsPrepared = true;
@@ -568,6 +539,14 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 			if (!comment.empty()) comment += " | ";
 			comment += std::format("x0 forwards callee entry SP+{:#x} (heap class {:#x})", found->second.inputSpOffset, found->second.classId);
 		}
+		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.indexedReturns.find(edges[n].site); found != receiver.indexedReturns.end()) {
+			edges[n].indexedReturn = found->second;
+			auto& comment = comments[edges[n].site];
+			if (!comment.empty()) comment += " | ";
+			comment += std::format("x0 returns array[{}] (heap class {:#x})", found->second.index, found->second.classId);
+		}
+		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.arrayArguments.find(edges[n].site); found != receiver.arrayArguments.end())
+			edges[n].arrayArguments = found->second;
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
 	}
@@ -586,6 +565,18 @@ void Analyzer::Write(const std::string& filename) const
 		std::sort(bindings.begin(), bindings.end());
 		groups[{*edge.target, std::move(bindings)}].push_back(edge.site);
 	}
+	// These bindings do not change the existing scalar context groups or budget.
+	using ArrayBindings = std::tuple<uint64_t, Bindings, int64_t, uint64_t, std::map<int64_t, uint32_t>>;
+	std::map<ArrayBindings, std::vector<uint64_t>> arrayGroups;
+	for (const auto& edge : edges) if (edge.kind == "call" && edge.target && !edge.stackInputs.empty() && contextBytes.contains(*edge.target)) {
+		Bindings bindings;
+		for (const auto& input : edge.stackInputs) bindings.emplace_back(input.spOffset, input.kind, input.value);
+		std::sort(bindings.begin(), bindings.end());
+		for (const auto& input : edge.arrayArguments) {
+			ArrayBindings key{*edge.target, bindings, input.spOffset, input.length, input.elements};
+			if (arrayGroups.size() < 4096 || arrayGroups.contains(key)) arrayGroups[std::move(key)].push_back(edge.site);
+		}
+	}
 	struct Context {
 		uint64_t payload;
 		std::vector<uint64_t> callers;
@@ -593,10 +584,19 @@ void Analyzer::Write(const std::string& filename) const
 		ReceiverAnalysisResult analysis;
 	};
 	std::vector<Context> contexts;
+	std::map<std::pair<uint64_t, Bindings>, std::map<uint64_t, uint64_t>> scalarResolutions;
+	struct ArrayContext {
+		uint64_t payload;
+		std::vector<uint64_t> callers;
+		std::vector<StackInput> inputs;
+		ArrayInputBinding binding;
+		ReceiverAnalysisResult analysis;
+	};
+	std::vector<ArrayContext> arrayContexts;
 	auto checkedPoolClasses = receiverPoolClasses;
 	size_t attempted = 0, remainingSteps = 20000000;
 	struct Decoder { csh handle = 0; ~Decoder() { if (handle) cs_close(&handle); } } decoder;
-	if (!groups.empty()) {
+	if (!groups.empty() || !arrayGroups.empty()) {
 		if (cs_open(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, &decoder.handle) != CS_ERR_OK ||
 			cs_option(decoder.handle, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) throw std::runtime_error("Cannot initialize context decoder");
 	}
@@ -616,11 +616,39 @@ void Analyzer::Write(const std::string& filename) const
 			if (globallyResolved.contains(it->first) && globallyResolved.at(it->first) == it->second.snapshotTarget) it = analysis.resolutions.erase(it); else ++it;
 		if (analysis.resolutions.empty() && analysis.forwardedReturns.empty()) continue;
 		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		for (const auto& [site, resolution] : analysis.resolutions) scalarResolutions[key][site] = resolution.snapshotTarget;
 		contexts.push_back({payload, callers, std::move(inputs), std::move(analysis)});
+	}
+	size_t arrayAttempted = 0, arrayRemainingSteps = 20000000;
+	for (const auto& [key, callers] : arrayGroups) {
+		if (arrayAttempted >= 4096 || !arrayRemainingSteps) break;
+		++arrayAttempted;
+		const auto& [payload, bindings, offset, length, elements] = key;
+		const auto& bytes = contextBytes.at(payload);
+		cs_insn* raw = nullptr;
+		const auto count = cs_disasm(decoder.handle, bytes.data(), bytes.size(), payload, 0, &raw);
+		const std::shared_ptr<cs_insn> instructions(raw, [count](cs_insn* p) { cs_free(p, count); });
+		std::vector<StackInput> inputs;
+		for (const auto& [at, kind, value] : bindings) inputs.push_back({at, kind, value, {}});
+		ArrayInputBinding binding{offset, length, elements};
+		ReceiverAnalysisResult analysis;
+		if (count * 4 == bytes.size()) analysis = AnalyzeReceivers(raw, count, profile, receiverEntries, &inputs, &arrayRemainingSteps, &binding);
+		if (analysis.arrayReads.empty()) analysis = {}; // Bindings alone do not establish a read or callee effect.
+		else {
+			const auto previous = scalarResolutions.find({payload, bindings});
+			for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
+				const auto site = it->first, target = it->second.snapshotTarget;
+				if ((globallyResolved.contains(site) && globallyResolved.at(site) == target) ||
+					(previous != scalarResolutions.end() && previous->second.contains(site) && previous->second.at(site) == target)) it = analysis.resolutions.erase(it);
+				else ++it;
+			}
+			checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
+		}
+		arrayContexts.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis)});
 	}
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":12,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":15,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -691,6 +719,22 @@ void Analyzer::Write(const std::string& filename) const
 		}
 		out << "],\"forwarded_return\":";
 		if (edge.forwardedReturn) Forwarded(out, *edge.forwardedReturn); else out << "null";
+		out << ",\"indexed_return\":";
+		if (edge.indexedReturn) {
+			const auto& value = *edge.indexedReturn;
+			out << "{\"callee\":" << value.callee << ",\"allocation\":" << value.allocation << ",\"index\":" << value.index << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"proof\":";
+			Proof(out, value.proof); out << '}';
+		} else out << "null";
+		out << ",\"array_arguments\":[";
+		for (size_t n = 0; n < edge.arrayArguments.size(); ++n) {
+			if (n) out << ',';
+			const auto& value = edge.arrayArguments[n];
+			out << "{\"sp_offset\":" << value.spOffset << ",\"allocation\":" << value.allocation << ",\"length\":" << value.length << ",\"elements\":[";
+			bool first = true;
+			for (const auto& [index, cid] : value.elements) { if (!first) out << ','; first = false; out << '[' << index << ',' << cid << ']'; }
+			out << "],\"proof\":"; Proof(out, value.proof); out << '}';
+		}
+		out << ']';
 		out << '}';
 	}
 	out << "],\"entry_stack_loads\":[";
@@ -746,6 +790,7 @@ void Analyzer::Write(const std::string& filename) const
 	bool first = true;
 	for (const auto& [slot, cid] : checkedPoolClasses) { if (!first) out << ','; first = false; out << '[' << slot << ',' << cid << ']'; }
 	out << "],\"word_return_register\":" << (profile.wordReturnRegister == ARM64_REG_X0 ? "\"x0\"" : "null");
+	out << ",\"heap_bits_register\":" << (profile.heapBitsRegister == ARM64_REG_X28 ? "\"x28\"" : "null");
 	out << ",\"allocation_returns\":["; first = true;
 	for (const auto& [address, cid] : profile.allocationReturns) { if (!first) out << ','; first = false; out << '[' << address << ',' << cid << ']'; }
 	out << "],\"thread_heap_classes\":["; first = true;
@@ -796,6 +841,39 @@ void Analyzer::Write(const std::string& filename) const
 	out << "],\"context_analysis\":{\"candidate_groups\":" << groups.size() << ",\"attempted_groups\":" << attempted
 		<< ",\"transfer_steps\":" << 20000000 - remainingSteps << ",\"cached_bytes\":" << contextBytesSize
 		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"cache_limit\":33554432}";
-	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not general working registers, source return types or heap contents. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
+	out << ",\"array_contexts\":[";
+	for (size_t n = 0; n < arrayContexts.size(); ++n) {
+		if (n) out << ',';
+		const auto& context = arrayContexts[n];
+		out << "{\"payload\":" << context.payload << ",\"callers\":"; Proof(out, context.callers);
+		out << ",\"inputs\":[";
+		for (size_t k = 0; k < context.inputs.size(); ++k) {
+			if (k) out << ',';
+			const auto& input = context.inputs[k];
+			out << "{\"sp_offset\":" << input.spOffset << ",\"kind\":" << Quoted(input.kind) << ",\"value\":" << Quoted(std::format("{:#x}", input.value)) << '}';
+		}
+		out << "],\"array_input\":{\"sp_offset\":" << context.binding.spOffset << ",\"length\":" << context.binding.length << ",\"elements\":[";
+		bool firstElement = true;
+		for (const auto& [index, cid] : context.binding.elements) {
+			if (!firstElement) out << ','; firstElement = false; out << '[' << index << ',' << cid << ']';
+		}
+		out << "]},\"scope\":\"entry_block\",\"status\":" << Quoted(context.analysis.arrayReads.empty() ? "bound_only" : "read_proved") << ",\"array_reads\":[";
+		bool firstRead = true;
+		for (const auto& [site, read] : context.analysis.arrayReads) {
+			if (!firstRead) out << ','; firstRead = false;
+			out << "{\"site\":" << site << ",\"input_sp_offset\":" << read.inputSpOffset << ",\"index\":" << read.index << ",\"class_id\":" << read.classId
+				<< ",\"register\":" << Quoted(read.reg) << ",\"proof\":"; Proof(out, read.proof); out << '}';
+		}
+		out << "],\"resolutions\":["; bool firstResolution = true;
+		for (const auto& [site, value] : context.analysis.resolutions) {
+			if (!firstResolution) out << ','; firstResolution = false;
+			out << "{\"site\":" << site << ",\"load\":" << value.load << ",\"index\":" << value.index << ",\"table_index\":" << value.tableIndex
+				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":"; Proof(out, value.proof); out << '}';
+		}
+		out << "],\"certificate\":" << (context.analysis.certificate.empty() ? "null" : context.analysis.certificate) << '}';
+	}
+	out << "],\"array_context_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << arrayAttempted
+		<< ",\"transfer_steps\":" << 20000000 - arrayRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000}";
+	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Callee effects preserve caller-frame classes, not general working registers, source return types or heap contents. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block. Calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block read certificate. Input contents are discarded at calls and branch boundaries; entry backedges disable this consumer. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

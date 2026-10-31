@@ -35,6 +35,14 @@ def query(graph, target, limit=20):
             context_by_caller[caller] = resolutions
             returns_by_caller[caller] = [dict(v, site=hex(v['site']), callee=hex(v['callee']))
                                          for v in context.get('forwarded_returns', [])]
+    arrays_by_caller = {}
+    selected_arrays = [c for c in graph.get('array_contexts', []) if c['payload'] == target]
+    for context in selected_arrays:
+        item = {k: context[k] for k in ('array_input', 'scope', 'status')}
+        item['reads'] = [dict(v, site=hex(v['site'])) for v in context['array_reads']]
+        item['dispatches'] = [dict(v, site=hex(v['site']), load=hex(v['load']), snapshot_target=hex(v['snapshot_target'])) for v in context['resolutions']]
+        for caller in context['callers']:
+            arrays_by_caller.setdefault(caller, []).append(item)
     calls = []
     for edge in callers[:limit]:
         values = []
@@ -49,6 +57,9 @@ def query(graph, target, limit=20):
                       'source_label': nodes.get(edge['source'], {}).get('label', ''), 'stack_inputs': values,
                       'context_dispatches': context_by_caller.get(edge['site'], []),
                       'forwarded_return': edge.get('forwarded_return'),
+                      'indexed_return': edge.get('indexed_return'),
+                      'array_contexts': arrays_by_caller.get(edge['site'], []),
+                      'array_arguments': [dict(v, allocation=hex(v['allocation'])) for v in edge.get('array_arguments', [])],
                       'context_forwarded_returns': returns_by_caller.get(edge['site'], [])})
     effect = next((c for c in graph.get('call_effects', []) if c['payload'] == target), {})
     result_forwarding = ({'register': graph['receiver_metadata']['word_return_register'],
@@ -58,10 +69,16 @@ def query(graph, target, limit=20):
             'callers_with_observations': sum(bool(e.get('stack_inputs')) for e in callers),
             'callers_with_context_dispatches': sum(bool(v) for v in context_by_caller.values()),
             'callers_with_context_forwarded_returns': sum(bool(v) for v in returns_by_caller.values()),
+            'callers_with_array_arguments': sum(bool(e.get('array_arguments')) for e in callers),
+            'array_context_count': len(selected_arrays),
+            'callers_with_array_contexts': len(arrays_by_caller),
+            'array_context_reads': sum(len(c['array_reads']) for c in selected_arrays),
+            'array_result': {k: v for k, v in effect['array_return'].items() if k != 'states'} if effect.get('array_return') else None,
             'result_forwarding': result_forwarding, 'calls': calls,
             'limits': 'Partial recent stores and physical entry-stack loads only. A matched slot does not establish '
                       'a complete parameter list. result_forwarding is a checked physical word relation, '
-                      'not a source return type. context_dispatches and context_forwarded_returns are separate bounded '
+                      'not a source return type. array_arguments are partial proved element classes at the call boundary; '
+                      'array_contexts separately bind selected inputs and may prove entry-block reads. bound_only establishes supplied contents, not a callee read or effects. context_dispatches and context_forwarded_returns are separate bounded '
                       'caller-specific analyses; the query itself does not solve or verify them. Interior-entry '
                       'calls have no payload-entry SP mapping. Omitted callers/slots are unknown.'}
 

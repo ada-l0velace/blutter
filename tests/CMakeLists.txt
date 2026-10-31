@@ -34,6 +34,14 @@ target_include_directories(snapshot_code_ranges_test PRIVATE "${BLUTTER_SOURCE_D
 add_executable(read_unaligned_test unit/read_unaligned_test.cpp)
 target_include_directories(read_unaligned_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 
+add_executable(native_ir_test unit/native_ir_test.cpp "${BLUTTER_SOURCE_DIR}/NativeIr.cpp")
+target_include_directories(native_ir_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+add_executable(arm64_ir_test unit/arm64_ir_test.cpp "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(arm64_ir_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(arm64_ir_test PRIVATE capstone)
+add_test(NAME native_ir COMMAND native_ir_test)
+add_test(NAME arm64_ir COMMAND arm64_ir_test)
+
 add_test(NAME arm64_analyzer COMMAND arm64_analyzer_test)
 add_test(NAME arm64_decoder COMMAND arm64_decoder_test)
 add_executable(arm64_boxing_test integration/arm64_boxing_test.cpp
@@ -70,6 +78,6 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
 
 foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
-        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test)
+        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test)
     blutter_instrument_test_target(${target})
 endforeach()

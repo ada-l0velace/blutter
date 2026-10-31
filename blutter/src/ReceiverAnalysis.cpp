@@ -31,6 +31,8 @@ struct State {
 	// Heap classes of full-width spills in the active payload frame. Values
 	// and object identities are deliberately not reconstructed from a class.
 	std::map<int64_t, Fact> spills;
+	// One-instruction handoff from the allocation call to its return block.
+	Fact freshArray;
 	bool operator==(const State&) const = default;
 };
 struct Block { size_t first, end; bool entry; std::optional<State> in; };
@@ -146,11 +148,147 @@ Fact Meet(const Fact& a, const Fact& b)
 	result.proof = Union(a.proof, b.proof);
 	return result.proof.size() <= 128 ? result : Fact{};
 }
+// Contents and identities are confined to one basic block following a matched
+// allocator. No allocation-site identity is carried around a loop or across calls.
+struct LocalArray {
+	Fact seed;
+	bool entryBinding = false;
+	int64_t inputOffset = 0;
+	std::array<Fact, 31> aliases, compressed;
+	std::map<int64_t, Fact> cells;
+	std::map<int64_t, Fact> roots, words;
+	void Begin(const Fact& fresh, int resultReg) {
+		if (fresh.kind != Word || resultReg < 0) return;
+		*this = {}; seed = fresh; aliases[resultReg] = {Word, 0, 0, 0, fresh.proof};
+	}
+	void BeginInput(const ArrayInputBinding& input, const Profile& profile) {
+		*this = {}; entryBinding = true; inputOffset = input.spOffset;
+		seed = {Word, input.length}; roots[input.spOffset] = {Word};
+		for (const auto& [index, cid] : input.elements)
+			cells[profile.arrayBodyContract[2] + index * profile.arrayBodyContract[3]] = {Object, cid};
+	}
+	std::optional<int64_t> Address(const cs_arm64_op& memory, bool writeback) const {
+		const int r = Number(memory.mem.base);
+		if (writeback || memory.mem.index != ARM64_REG_INVALID || r < 0 || aliases[r].kind != Word) return {};
+		return Add(std::bit_cast<int64_t>(aliases[r].value), memory.mem.disp);
+	}
+	Fact Load(const cs_insn& i, const Profile& profile) const {
+		const auto& d = i.detail->arm64;
+		if (seed.kind != Word || d.op_count != 2 || d.operands[1].type != ARM64_OP_MEM ||
+			(i.id != ARM64_INS_LDR && i.id != ARM64_INS_LDUR) || Width(d.operands[0].reg) / 8 != profile.arrayBodyContract[3]) return {};
+		const auto at = Address(d.operands[1], d.writeback);
+		if (!at || !cells.contains(*at)) return {};
+		const auto r = Number(d.operands[1].mem.base);
+		auto value = cells.at(*at);
+		// Internal packed-value metadata, removed before publishing an ordinary class fact.
+		if (entryBinding) value.aux = (*at - profile.arrayBodyContract[2]) / profile.arrayBodyContract[3] + 1;
+		value.proof = Union(value.proof, aliases[r].proof);
+		return Proven(std::move(value), i.address);
+	}
+	Fact Result(const cs_insn& i, const Profile& profile, bool heapFixed) const {
+		const auto& d = i.detail->arm64;
+		if (seed.kind != Word) return {};
+		if (profile.arrayBodyContract[3] == 8) return Load(i, profile);
+		if (heapFixed && i.id == ARM64_INS_ADD && d.op_count == 3 && d.operands[0].type == ARM64_OP_REG &&
+			Width(d.operands[0].reg) == 64 && d.operands[1].type == ARM64_OP_REG && Width(d.operands[1].reg) == 64 &&
+			d.operands[2].type == ARM64_OP_REG && d.operands[2].reg == profile.heapBitsRegister &&
+			d.operands[2].ext == ARM64_EXT_INVALID && d.operands[2].shift.type == ARM64_SFT_LSL && d.operands[2].shift.value == 32) {
+			const int r = Number(d.operands[1].reg);
+			if (r >= 0) return Proven(compressed[r], i.address);
+		}
+		return {};
+	}
+	void Step(const State& before, const cs_insn& i, const Profile& profile) {
+		if (seed.kind != Word) return;
+		const auto sp = before.regs[15];
+		for (auto it = roots.begin(); it != roots.end();)
+			if (sp.kind != Stack || sp.aux != 0 || it->first < std::bit_cast<int64_t>(sp.value)) it = roots.erase(it); else ++it;
+		for (auto it = words.begin(); it != words.end();)
+			if (sp.kind != Stack || sp.aux != 0 || it->first < std::bit_cast<int64_t>(sp.value)) it = words.erase(it); else ++it;
+		if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || OpaqueMemory(i)) { *this = {}; return; }
+		const auto& d = i.detail->arm64;
+		Fact alias, packed;
+		const int dst = d.op_count && d.operands[0].type == ARM64_OP_REG ? Number(d.operands[0].reg) : -1;
+		if (i.id == ARM64_INS_MOV && d.op_count == 2 && dst >= 0 && d.operands[1].type == ARM64_OP_REG) {
+			const int src = Number(d.operands[1].reg);
+			if (src >= 0 && Width(d.operands[0].reg) == Width(d.operands[1].reg)) {
+				if (Width(d.operands[0].reg) == 64) alias = Proven(aliases[src], i.address);
+				packed = Proven(compressed[src], i.address);
+			}
+		}
+		if ((i.id == ARM64_INS_ADD || i.id == ARM64_INS_SUB) && d.op_count == 3 && dst >= 0 && Width(d.operands[0].reg) == 64 &&
+			d.operands[1].type == ARM64_OP_REG && Width(d.operands[1].reg) == 64 && d.operands[2].type == ARM64_OP_IMM &&
+			d.operands[2].imm >= 0 && d.operands[2].imm <= 4095 && d.operands[2].shift.type == ARM64_SFT_INVALID) {
+			const int src = Number(d.operands[1].reg);
+			if (src >= 0 && aliases[src].kind == Word) {
+				const auto at = Add(std::bit_cast<int64_t>(aliases[src].value), (i.id == ARM64_INS_ADD ? 1 : -1) * d.operands[2].imm);
+				if (at && *at >= -4096 && *at <= 4096) alias = Proven({Word, std::bit_cast<uint64_t>(*at), 0, 0, aliases[src].proof}, i.address);
+			}
+		}
+		if (profile.arrayBodyContract[3] == 4) if (const auto value = Load(i, profile); value.kind == Object) packed = value;
+		if ((i.id == ARM64_INS_LDR || i.id == ARM64_INS_LDUR) && d.op_count == 2 && dst >= 0 && Width(d.operands[0].reg) == 64 && d.operands[1].type == ARM64_OP_MEM && !d.writeback) {
+			const auto& m = d.operands[1]; const auto base = Read(before, m.mem.base);
+			if (base.kind == Stack && base.aux == 0 && m.mem.index == ARM64_REG_INVALID)
+				if (const auto at = Add(std::bit_cast<int64_t>(base.value), m.mem.disp); at && roots.contains(*at))
+					alias = Proven({Word, 0, 0, 0, Union(roots.at(*at).proof, base.proof)}, i.address);
+		}
+		for (unsigned n = 0; n < d.op_count; ++n) if (d.operands[n].type == ARM64_OP_MEM && MemoryWrite(i, d.operands[n])) {
+			const auto& m = d.operands[n]; const auto base = Read(before, m.mem.base);
+			unsigned width = d.op_count && d.operands[0].type == ARM64_OP_REG ? Width(d.operands[0].reg) / 8 : 0;
+			if (i.id == ARM64_INS_STRB || i.id == ARM64_INS_STURB) width = 1;
+			if (i.id == ARM64_INS_STRH || i.id == ARM64_INS_STURH) width = 2;
+			const bool pair = i.id == ARM64_INS_STP;
+			const bool plain = i.id == ARM64_INS_STR || i.id == ARM64_INS_STUR || pair || i.id == ARM64_INS_STRB || i.id == ARM64_INS_STURB || i.id == ARM64_INS_STRH || i.id == ARM64_INS_STURH;
+			const auto at = Address(m, d.writeback);
+			const auto stackAt = Add(std::bit_cast<int64_t>(base.value), m.mem.disp);
+			bool ownFrameWriteback = false;
+			if (entryBinding && d.writeback && Number(m.mem.base) == 15 && base.kind == Stack && base.aux == 0 && stackAt && width && plain) {
+				const bool post = n + 2 == d.op_count && d.operands[n+1].type == ARM64_OP_IMM;
+				if (post || n + 1 == d.op_count) {
+					const auto next = Add(std::bit_cast<int64_t>(base.value), post ? d.operands[n+1].imm : m.mem.disp);
+					ownFrameWriteback = next && *next >= -(1 << 20) && *next <= 0 &&
+						*stackAt >= std::min(std::bit_cast<int64_t>(base.value), *next) && *stackAt <= -static_cast<int64_t>(width * (pair ? 2 : 1));
+				}
+			}
+			if (base.kind == Stack && base.aux == 0 && (!d.writeback || ownFrameWriteback) && m.mem.index == ARM64_REG_INVALID && plain && width && stackAt && *stackAt <= INT64_MAX - width * (pair ? 2 : 1)) {
+				for (auto it = roots.begin(); it != roots.end();) if (*stackAt < it->first + 8 && it->first < *stackAt + width * (pair ? 2 : 1)) it = roots.erase(it); else ++it;
+				for (auto it = words.begin(); it != words.end();) if (*stackAt < it->first + 8 && it->first < *stackAt + width * (pair ? 2 : 1)) it = words.erase(it); else ++it;
+				if (width == 8) for (unsigned part = 0; part < (pair ? 2U : 1U); ++part) {
+					const auto constant = Read(before, d.operands[part].reg);
+					if (constant.kind == Word && words.size() < 64) {
+						auto value = constant; value.proof = Union(value.proof, base.proof);
+						value = Proven(std::move(value), i.address);
+						if (value.kind == Word) words[*stackAt + part * 8] = std::move(value);
+					}
+					const int r = Number(d.operands[part].reg);
+					if (r >= 0 && aliases[r].kind == Word && aliases[r].value == 0 && roots.size() < 64) {
+						const auto root = Proven({Word, 0, 0, 0, Union(aliases[r].proof, base.proof)}, i.address);
+						if (root.kind == Word) roots[*stackAt + part * 8] = root;
+					}
+				}
+			} else if (at && plain && width && *at >= profile.arrayBodyContract[2] && *at <= profile.arrayBodyContract[2] + static_cast<int64_t>(seed.value) * profile.arrayBodyContract[3] - width * (pair ? 2 : 1)) {
+				for (auto it = cells.begin(); it != cells.end();) if (*at < it->first + profile.arrayBodyContract[3] && it->first < *at + width * (pair ? 2 : 1)) it = cells.erase(it); else ++it;
+				if (width == profile.arrayBodyContract[3] && (*at - profile.arrayBodyContract[2]) % width == 0) for (unsigned part = 0; part < (pair ? 2U : 1U); ++part) {
+					const int r = Number(d.operands[part].reg);
+					if (r < 0) continue;
+					auto value = before.regs[r];
+					if (value.kind != Object && width == 4) value = compressed[r];
+					value.proof = Union(value.proof, aliases[Number(m.mem.base)].proof);
+					value = Proven(std::move(value), i.address);
+					if (value.kind == Object) cells[*at + part * width] = std::move(value);
+				}
+			} else { *this = {}; return; }
+		}
+		for (const int r : Writes(i)) { aliases[r] = {}; compressed[r] = {}; }
+		if (dst >= 0 && Writes(i).contains(dst)) { aliases[dst] = std::move(alias); compressed[dst] = std::move(packed); }
+	}
+};
 bool Join(std::optional<State>& destination, const State& source)
 {
 	if (!destination) { destination = source; return true; }
 	auto merged = *destination;
 	for (unsigned r = 0; r < 31; ++r) merged.regs[r] = Meet(merged.regs[r], source.regs[r]);
+	merged.freshArray = Meet(merged.freshArray, source.freshArray);
 	for (auto it = merged.liveInputs.begin(); it != merged.liveInputs.end();)
 		if (!source.liveInputs.contains(*it)) it = merged.liveInputs.erase(it); else ++it;
 	for (auto it = merged.spills.begin(); it != merged.spills.end();) {
@@ -172,7 +310,7 @@ void JsonFact(std::ostream& out, unsigned reg, const Fact& f)
 
 ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t count,
 	const Profile& profile, const std::set<uint64_t>& externalEntries,
-	const std::vector<StackInput>* inputs, size_t* sharedSteps)
+	const std::vector<StackInput>* inputs, size_t* sharedSteps, const ArrayInputBinding* arrayInput)
 {
 	ReceiverAnalysisResult result;
 	if (!count || count > 16384 || profile.poolSlotSize != 8 || !profile.classIdBits || profile.classIdBits > 32 ||
@@ -196,12 +334,26 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		}
 	}
 	const auto start = instructions[0].address, end = start + count * 4;
+	const auto& array = profile.arrayBodyContract;
+	const bool arrayEnabled = array.size() == 5 && profile.allocationReturns.contains(array[0]) && array[1] >= 0 && array[1] <= 14 &&
+		array[2] >= 7 && array[2] <= (1 << 20) && (array[3] == 4 || array[3] == 8) && array[4] == 1;
+	if (arrayInput) {
+		if (!inputs || !arrayEnabled || arrayInput->spOffset < 0 || arrayInput->spOffset > 248 || arrayInput->spOffset % 8 ||
+			arrayInput->length > 32 || arrayInput->elements.empty() || arrayInput->elements.size() > 32 ||
+			!inputValues.contains(arrayInput->spOffset) || inputValues.at(arrayInput->spOffset) != Fact{Object, profile.allocationReturns.at(array[0])}) return result;
+		for (const auto& [index, cid] : arrayInput->elements)
+			if (index < 0 || static_cast<uint64_t>(index) >= arrayInput->length || cid > Mask(profile.classIdBits)) return result;
+	}
 	std::set<size_t> leaders{0};
 	std::set<size_t> calledEntries;
 	std::set<int> written;
 	for (size_t n = 0; n < count; ++n) {
 		const auto& i = instructions[n];
 		if (!i.detail || i.size != 4 || i.address != start + n * 4) return result;
+		// Reinitializing entry contents on a backedge would invent preservation.
+		if (arrayInput && Group(i, CS_GRP_JUMP) && !Group(i, CS_GRP_CALL))
+			for (unsigned j = 0; j < i.detail->arm64.op_count; ++j)
+				if (i.detail->arm64.operands[j].type == ARM64_OP_IMM && static_cast<uint64_t>(i.detail->arm64.operands[j].imm) == start) return result;
 		const auto writes = Writes(i);
 		written.insert(writes.begin(), writes.end());
 		if (externalEntries.contains(i.address)) leaders.insert(n);
@@ -273,8 +425,41 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (value.kind != Object) return {};
 		return std::pair{value, ForwardedReturn{*target, input, static_cast<uint32_t>(value.value), value.proof}};
 	};
-	auto execute = [&](State state, const cs_insn& i) {
+	auto indexedAt = [&](const State& state, const cs_insn& i, const LocalArray& contents) -> std::optional<std::pair<Fact, IndexedReturn>> {
+		if (profile.wordReturnRegister != ARM64_REG_X0 || contents.seed.kind != Word || contents.entryBinding) return {};
+		const auto& d = i.detail->arm64;
+		if (d.op_count != 1) return {};
+		std::optional<uint64_t> target; std::vector<uint64_t> targetProof;
+		if (i.id == ARM64_INS_BL && d.operands[0].type == ARM64_OP_IMM) target = d.operands[0].imm;
+		if (i.id == ARM64_INS_BLR && d.operands[0].type == ARM64_OP_REG) {
+			const auto value = Read(state, d.operands[0].reg);
+			if (value.kind == Target && value.value < profile.dispatchEntries.size()) { target = profile.dispatchEntries[value.value]; targetProof = value.proof; }
+		}
+		if (!target || !profile.frameSafeCallees.contains(*target) || !profile.arrayReturnInputs.contains(*target)) return {};
+		const auto& contract = profile.arrayReturnInputs.at(*target); const auto sp = state.regs[15];
+		if (sp.kind != Stack || sp.aux != 0 || std::bit_cast<int64_t>(sp.value) > -16) return {};
+		for (unsigned r = 0; r < 31; ++r) if (r != 15 && r != 29 && state.regs[r].kind == Stack) return {};
+		const auto arrayAt = Add(std::bit_cast<int64_t>(sp.value), contract.arraySpOffset);
+		const auto indexAt = Add(std::bit_cast<int64_t>(sp.value), contract.indexSpOffset);
+		if (!arrayAt || !indexAt || !contents.roots.contains(*arrayAt) || !contents.words.contains(*indexAt)) return {};
+		const auto index = contents.words.at(*indexAt);
+		if (index.kind != Word || index.value > 62 || index.value % 2 || index.value / 2 >= contents.seed.value) return {};
+		const auto at = profile.arrayBodyContract[2] + static_cast<int64_t>(index.value / 2) * profile.arrayBodyContract[3];
+		if (!contents.cells.contains(at)) return {};
+		auto value = contents.cells.at(at);
+		for (const auto& proof : {sp.proof, contents.seed.proof, contents.roots.at(*arrayAt).proof, index.proof, targetProof}) value.proof = Union(value.proof, proof);
+		value = Proven(std::move(value), i.address);
+		if (value.kind != Object) return {};
+		return std::pair{value, IndexedReturn{*target, contents.seed.origin, index.value / 2, static_cast<uint32_t>(value.value), value.proof}};
+	};
+	const bool heapFixed = profile.heapBitsRegister == ARM64_REG_X28 && !written.contains(28);
+	auto execute = [&](State state, const cs_insn& i, LocalArray& contents) {
+		if (arrayEnabled) contents.Begin(state.freshArray, Number(profile.allocationResultRegister));
+		state.freshArray = {};
 		const auto forwarded = forwardedAt(state, i);
+		const auto indexed = indexedAt(state, i, contents);
+		const auto element = contents.Result(i, profile, heapFixed);
+		const auto length = arrayEnabled ? state.regs[array[1]] : Fact{};
 		const auto& d = i.detail->arm64;
 		// BLR may overwrite its own source (LR), so capture the proven dispatch
 		// target before applying architectural writes.
@@ -368,6 +553,8 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				}
 			}
 		}
+		if (element.kind == Object) { produced = element; produced.aux = 0; }
+		contents.Step(state, i, profile);
 		// An unknown write may alias a known object's header. Stores to the
 		// managed stack, or beyond a known object's header, preserve its class.
 		bool unsafeStore = OpaqueMemory(i);
@@ -474,6 +661,10 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				if (allocation != profile.allocationReturns.end() && reg >= 0) state.regs[reg] = {Object, allocation->second, 0, 0, {i.address}};
 			}
 			if (forwarded && preserves) state.regs[0] = forwarded->first;
+			if (indexed && preserves) state.regs[0] = indexed->first;
+			if (arrayEnabled && i.id == ARM64_INS_BL && d.op_count == 1 && d.operands[0].type == ARM64_OP_IMM && d.operands[0].imm == array[0] &&
+				length.kind == Word && length.value <= 64 && length.value % 2 == 0)
+				state.freshArray = Proven({Word, length.value / 2, 0, i.address, length.proof}, i.address);
 		}
 		const auto sp = state.regs[15];
 		if (sp.kind != Stack || sp.aux != 0) state.spills.clear();
@@ -547,16 +738,20 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	while (!work.empty()) {
 		const auto current = work.front(); work.pop_front(); queued[current] = false;
 		auto state = *blocks[current].in;
+		LocalArray contents;
+		if (arrayInput && blocks[current].first == 0) contents.BeginInput(*arrayInput, profile);
 		for (size_t n = blocks[current].first; n < blocks[current].end; ++n) {
 			if (++steps > 1000000 || (sharedSteps && !*sharedSteps)) return {};
 			if (sharedSteps) --*sharedSteps;
-			state = execute(std::move(state), instructions[n]);
+			state = execute(std::move(state), instructions[n], contents);
 		}
 		for (auto& [next, incoming] : successors(current, state))
 			if (Join(blocks[next].in, incoming) && !queued[next]) { work.push_back(next); queued[next] = true; }
 	}
 	for (const auto& b : blocks) if (b.in) {
 		auto state = *b.in;
+		LocalArray contents;
+		if (arrayInput && b.first == 0) contents.BeginInput(*arrayInput, profile);
 		// Deliberately local to one basic block. These are recent physical
 		// writes at a call boundary, not a signature or inferred argument count.
 		std::map<int64_t, Fact> recentStores;
@@ -564,13 +759,31 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			const auto& i = instructions[n];
 			const auto& d = i.detail->arm64;
 			const auto sp = state.regs[15];
+			if (arrayEnabled) contents.Begin(state.freshArray, Number(profile.allocationResultRegister));
+			if (contents.entryBinding) {
+				const auto value = contents.Result(i, profile, heapFixed);
+				const int reg = d.op_count && d.operands[0].type == ARM64_OP_REG ? Number(d.operands[0].reg) : -1;
+				if (value.kind == Object && value.aux && reg >= 0 && Width(d.operands[0].reg) == 64)
+					result.arrayReads.emplace(i.address, ArrayElementRead{contents.inputOffset, static_cast<int64_t>(value.aux - 1), static_cast<uint32_t>(value.value), "x" + std::to_string(reg), value.proof});
+			}
 			if (const auto forwarded = forwardedAt(state, i)) result.forwardedReturns.emplace(i.address, forwarded->second);
+			if (const auto indexed = indexedAt(state, i, contents)) result.indexedReturns.emplace(i.address, indexed->second);
 			if (OpaqueMemory(i)) recentStores.clear();
 			if (Group(i, CS_GRP_CALL) && sp.kind == Stack) {
 				for (const auto& [offset, value] : recentStores) {
 					const auto relative = Add(offset, -std::bit_cast<int64_t>(sp.value));
 					if (relative && *relative >= 0 && *relative < 256 && *relative % 8 == 0)
 						result.stackInputs[i.address].push_back({*relative, value.kind == Word ? "word" : "heap_class", value.value, value.proof});
+					if (!inputs && relative && *relative >= 0 && *relative < 256 && *relative % 8 == 0 && contents.seed.kind == Word &&
+						contents.roots.contains(offset) && !contents.cells.empty() && value.kind == Object) {
+						ArrayArgument argument{*relative, contents.seed.origin, contents.seed.value, {}, Union(Union(contents.seed.proof, value.proof), {i.address})};
+						argument.proof = Union(argument.proof, contents.roots.at(offset).proof);
+						for (const auto& [at, element] : contents.cells) {
+							argument.elements.emplace((at - array[2]) / array[3], element.value);
+							argument.proof = Union(argument.proof, element.proof);
+						}
+						if (argument.proof.size() <= 128) result.arrayArguments[i.address].push_back(std::move(argument));
+					}
 				}
 			}
 			for (unsigned m = 0; m < d.op_count; ++m) if (d.operands[m].type == ARM64_OP_MEM) {
@@ -613,11 +826,11 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 					result.resolutions.emplace(i.address, StaticDispatch{f.origin, std::bit_cast<int64_t>(f.aux), f.value, *profile.dispatchEntries[f.value], f.proof});
 				}
 			}
-			state = execute(std::move(state), i);
+			state = execute(std::move(state), i, contents);
 			if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || sp.kind != state.regs[15].kind || sp.aux != state.regs[15].aux) recentStores.clear();
 		}
 	}
-	if (result.resolutions.empty() && result.forwardedReturns.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
+	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
 	std::ostringstream certificate;
 	certificate << "{\"payload\":" << start << ",\"blocks\":[";
 	for (size_t n = 0; n < blocks.size(); ++n) {
@@ -634,7 +847,10 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (b.in) for (const auto offset : b.in->liveInputs) { if (!first) certificate << ','; first = false; certificate << offset; }
 		certificate << "],\"spills\":["; first = true;
 		if (b.in) for (const auto& [offset, value] : b.in->spills) { if (!first) certificate << ','; first = false; certificate << '[' << offset << ',' << value.value << ']'; }
-		certificate << "]}";
+		certificate << "],\"fresh_array\":";
+		if (b.in && b.in->freshArray.kind == Word) certificate << "{\"allocation\":" << b.in->freshArray.origin << ",\"length\":" << b.in->freshArray.value << '}';
+		else certificate << "null";
+		certificate << '}';
 	}
 	certificate << "]}";
 	result.certificate = certificate.str();
