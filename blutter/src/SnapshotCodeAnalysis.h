@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include "NativeReturnContracts.h"
 
 // ARM64 instruction facts. This module has no Dart VM or vendor dependencies.
 namespace SnapshotAnalysis {
@@ -42,6 +43,7 @@ struct ArrayLengthLayout {
 	unsigned bytes, smiShift;
 };
 struct ArrayLengthEffect { int64_t arraySpOffset; uint32_t writtenRegisters; };
+struct CallReturnClass { uint64_t callee; uint32_t classId; };
 struct Profile {
 	std::string name;
 	arm64_reg poolRegister;
@@ -81,6 +83,15 @@ struct Profile {
 	// Optional matched ABI for full-word physical results. This does not imply
 	// a source return type or describe floating/pair results.
 	arm64_reg wordReturnRegister = ARM64_REG_INVALID;
+	// Matched SDK normal-result classes only. No frame, register, allocation
+	// body or heap-preservation effect is implied by membership in this map.
+	std::map<uint64_t, NativeReturnContract> nativeReturnClasses;
+	// Independently checked all-normal-return classes. Like native result-only
+	// contracts, these grant no memory or preserved-register effects.
+	std::map<uint64_t, uint32_t> provedReturnClasses;
+	// Result facts attached to one original direct BL, never to every caller
+	// of a conditionally typed helper. No preservation effect is implied.
+	std::map<uint64_t, CallReturnClass> callReturnClasses;
 	std::map<uint64_t, int64_t> forwardedReturnInputs;
 	std::map<uint64_t, ArrayReturnInput> arrayReturnInputs;
 	// Reviewed unary round leaf wrapper: thread entry, vm_tag, saved limit, Dart tag.
@@ -138,6 +149,17 @@ struct StackInput {
 	int64_t spOffset;
 	std::string kind; // word or heap_class; not a complete Dart argument list.
 	uint64_t value;
+	std::vector<uint64_t> proof;
+};
+// A full-width physical GPR observation, not a source parameter declaration.
+// Reserved VM/frame registers are excluded from caller entry bindings.
+struct RegisterInput {
+	unsigned reg;
+	uint32_t classId;
+	std::vector<uint64_t> proof;
+};
+struct ReturnedClass {
+	uint32_t classId;
 	std::vector<uint64_t> proof;
 };
 struct EntryStackLoad {
@@ -208,6 +230,7 @@ struct Edge {
 	std::vector<ArrayArgument> arrayArguments;
 	std::optional<IndexedReturn> indexedReturn;
 	std::optional<ArrayLengthReturn> arrayLengthReturn;
+	std::vector<RegisterInput> registerInputs;
 };
 
 class Analyzer {
@@ -231,6 +254,7 @@ private:
 	std::set<uint64_t> receiverEntries;
 	std::vector<std::string> receiverCertificates;
 	std::map<int64_t, uint32_t> receiverPoolClasses;
+	std::map<uint64_t, uint32_t> machineReturnClasses;
 	std::vector<EntryStackLoad> entryStackLoads;
 	std::map<uint64_t, std::vector<uint8_t>> contextBytes;
 	size_t contextBytesSize = 0;

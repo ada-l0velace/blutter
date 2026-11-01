@@ -60,6 +60,71 @@ static std::string pythonString(const std::string& value)
 }
 
 #if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+namespace {
+struct VmNativeReturnRecord {
+	SnapshotAnalysis::NativeReturnIdentity identity;
+	uint32_t recognizedValue;
+};
+// Read retained fields before applying the independent identity selector.
+// Include every alias at a candidate entry, including unsupported aliases.
+static std::vector<VmNativeReturnRecord> ReadNativeReturnIdentities(
+	const std::vector<dart::FunctionPtr>& functions, uintptr_t base)
+{
+	auto* zone = dart::Thread::Current()->zone();
+	std::set<uintptr_t> candidates;
+	for (const auto ptr : functions) {
+		const auto& fn = dart::Function::Handle(zone, ptr);
+		if (fn.recognized_kind() == dart::MethodRecognizer::kAllocateOneByteString ||
+			fn.recognized_kind() == dart::MethodRecognizer::kAllocateTwoByteString) candidates.insert(fn.entry_point());
+	}
+	std::vector<VmNativeReturnRecord> result;
+	for (const auto ptr : functions) {
+		const auto& fn = dart::Function::Handle(zone, ptr);
+		if (!candidates.contains(fn.entry_point()) || fn.entry_point() < base) continue;
+		VmNativeReturnRecord record{{}, static_cast<uint32_t>(fn.recognized_kind())};
+		auto& id = record.identity;
+		id.entry = fn.entry_point() - base;
+		id.isNative = fn.is_native();
+		if (fn.recognized_kind() == dart::MethodRecognizer::kAllocateOneByteString) id.recognized = SnapshotAnalysis::NativeReturnKind::OneByteString;
+		if (fn.recognized_kind() == dart::MethodRecognizer::kAllocateTwoByteString) id.recognized = SnapshotAnalysis::NativeReturnKind::TwoByteString;
+		const auto& owner = dart::Class::Handle(zone, fn.Owner());
+		if (!owner.IsNull()) {
+			const auto& library = dart::Library::Handle(zone, owner.library());
+			if (!library.IsNull()) {
+				const auto& url = dart::String::Handle(zone, library.url());
+				if (!url.IsNull()) id.libraryUri = url.ToCString();
+			}
+		}
+		const auto& code = dart::Code::Handle(zone, fn.CurrentCode());
+		if (!code.IsNull() && !code.IsUnknownDartCode() && code.EntryPoint() >= base && code.PayloadStart() >= base &&
+			code.Size() > 0 && static_cast<uint64_t>(code.Size()) <= UINT64_MAX - code.PayloadStart()) {
+			id.codeEntry = code.EntryPoint() - base;
+			id.payload = code.PayloadStart() - base;
+			id.end = id.payload + code.Size();
+			id.ownsCode = code.owner() == fn.ptr();
+		}
+		if (id.isNative) {
+			const auto& data = dart::Object::Handle(zone, fn.ptr()->untag()->data());
+			if (data.IsArray() && dart::Array::Cast(data).Length() > 0) {
+				const auto& name = dart::Object::Handle(zone, dart::Array::Cast(data).At(0));
+				if (name.IsString()) id.nativeName = dart::String::Cast(name).ToCString();
+			}
+		}
+		result.push_back(std::move(record));
+	}
+	return result;
+}
+static std::string JsonNativeText(const std::string& value)
+{
+	std::string result = "\"";
+	for (const unsigned char c : value) {
+		if (c == '\\' || c == '"') { result += '\\'; result += c; }
+		else if (c < 32) result += std::format("\\u{:04x}", c);
+		else result += c;
+	}
+	return result + '"';
+}
+}
 // Optional numerical VM metadata audit, independent of IDA/asm exports.
 void DartDumper::DumpCoverageAudit(const char* filename)
 {
@@ -126,6 +191,18 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		const auto& code = dart::Code::Handle(zone, fn.CurrentCode());
 		of << std::format("{{\"entry\":{},\"unknown_code\":{},\"has_code\":{}}}",
 			fn.entry_point() - app.base(), code.IsUnknownDartCode() ? "true" : "false", fn.HasCode() ? "true" : "false");
+	}
+	of << "],\"native_return_sdk\":[[" << dart::MethodRecognizer::kAllocateOneByteString << ',' << dart::kOneByteStringCid
+		<< ",\"Internal_allocateOneByteString\",\"allocate_one_byte_string\"],[" << dart::MethodRecognizer::kAllocateTwoByteString << ',' << dart::kTwoByteStringCid
+		<< ",\"Internal_allocateTwoByteString\",\"allocate_two_byte_string\"]],\"native_return_identities\":[";
+	comma = false;
+	for (const auto& record : ReadNativeReturnIdentities(visitor.functions, app.base())) {
+		if (comma) of << ','; comma = true;
+		const auto& id = record.identity;
+		of << "{\"entry\":" << id.entry << ",\"code_entry\":" << id.codeEntry << ",\"payload\":" << id.payload << ",\"end\":" << id.end
+			<< ",\"is_native\":" << (id.isNative ? "true" : "false") << ",\"owns_code\":" << (id.ownsCode ? "true" : "false")
+			<< ",\"recognized_kind\":" << record.recognizedValue << ",\"native_name\":" << JsonNativeText(id.nativeName)
+			<< ",\"library_uri\":" << JsonNativeText(id.libraryUri) << '}';
 	}
 	of << "],\"pool_heap_classes\":[";
 	comma = false;
@@ -729,6 +806,23 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	profile.dispatchRegister = ARM64_REG_X21;
 	profile.stackLimitOffset = TargetThreadOffset(dart::Thread::stack_limit_offset());
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
+	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) {
+		class NativeFunctionVisitor : public dart::ObjectVisitor {
+		public:
+			std::vector<dart::FunctionPtr> functions;
+			void VisitObject(dart::ObjectPtr object) override {
+				if (object->IsFunction()) functions.push_back(dart::Function::RawCast(object));
+			}
+		} visitor;
+		dart::HeapIterationScope iteration(thread);
+		iteration.IterateOldObjects(&visitor);
+		std::vector<SnapshotAnalysis::NativeReturnIdentity> identities;
+		for (auto& record : ReadNativeReturnIdentities(visitor.functions, app.base())) identities.push_back(std::move(record.identity));
+		profile.nativeReturnClasses = SnapshotAnalysis::NativeReturnContracts(identities, dart::kOneByteStringCid, dart::kTwoByteStringCid);
+		// Bind selected contracts to exact original payload bounds as well.
+		for (const auto& id : identities) if (profile.nativeReturnClasses.contains(id.entry) &&
+			!std::ranges::any_of(payloads, [&](const auto& p) { return p.start == id.payload && p.end == id.end; })) profile.nativeReturnClasses.erase(id.entry);
+	}
 	if constexpr (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28) profile.heapBitsRegister = ARM64_REG_X28;
 	static_assert(dart::SP == dart::R15);
 	profile.arrayLengthLayout = SnapshotAnalysis::ArrayLengthLayout{dart::kArrayCid,

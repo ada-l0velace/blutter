@@ -71,6 +71,13 @@ int main(int argc, char** argv)
 			profile.dispatchEntries.push_back(0xb100 + entryOffset);
 		}
 		profile.dispatchNullTarget = 0x3000;
+		if (const char* mode = std::getenv("BLUTTER_TEST_NATIVE_RETURNS"); mode && std::string(mode) == "1") {
+			// Authored runtime contracts; opaque fixture callees grant no frame effect.
+			profile.nativeReturnClasses = {{0xd000, {5, "allocate_one_byte_string"}}, {0xe000, {6, "allocate_two_byte_string"}}};
+			profile.dispatchEntries.resize(11);
+			profile.dispatchEntries[9] = 0x2000;
+			profile.dispatchEntries[10] = 0x2004;
+		}
 		profile.classIdShift = 8;
 		profile.classIdBits = 16;
 		profile.nullRegister = ARM64_REG_X22;

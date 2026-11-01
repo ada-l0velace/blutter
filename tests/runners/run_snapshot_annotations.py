@@ -38,6 +38,8 @@ def main():
                         str(root / 'tests/unit/snapshot_annotations_test.cpp'),
                         str(root / 'blutter/src/SnapshotCodeAnalysis.cpp'),
                         str(root / 'blutter/src/ReceiverAnalysis.cpp'),
+                        str(root / 'blutter/src/RegisterContexts.cpp'),
+                        str(root / 'blutter/src/CallResultContexts.cpp'),
                         str(root / 'blutter/src/CallEffects.cpp'),
                         str(root / 'blutter/src/NativeIr.cpp'),
                         str(root / 'blutter/src/Arm64Ir.cpp'),
@@ -45,7 +47,7 @@ def main():
                         str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -74,6 +76,7 @@ def main():
                            '--errors-for-leak-kinds=definite,indirect,possible'] + command
             subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
                 BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
+                BLUTTER_TEST_NATIVE_RETURNS='1' if native_returns else '0',
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
             # The checker verifies inductive invariants instead of reproducing the
@@ -100,6 +103,14 @@ def main():
                              'preserved_call_registers': [[0x7000, 1 << 2], [0x9000, 31]],
                              'nonreturning_calls': [[0xc000, 'range_error_without_fpu']],
                              'frame_preserving_calls': [[0x3000, 'stack_overflow_without_fpu'], [0x9000, 'array_write_barrier'], [0xa000, 'double_to_integer']]}
+            if native_returns:
+                audit['native_return_sdk'] = [[17, 5, 'Internal_allocateOneByteString', 'allocate_one_byte_string'],
+                                              [23, 6, 'Internal_allocateTwoByteString', 'allocate_two_byte_string']]
+                audit['native_return_identities'] = [
+                    {'entry': entry, 'code_entry': entry, 'payload': entry, 'end': entry+8, 'is_native': True,
+                     'owns_code': True, 'recognized_kind': kind, 'native_name': name, 'library_uri': 'dart:_internal'}
+                    for entry, kind, name in [(0xd000, 17, 'Internal_allocateOneByteString'),
+                                              (0xe000, 23, 'Internal_allocateTwoByteString')]]
             def verify(value):
                 return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
             if name == 'prefix-interior-dispatch-entries':
@@ -1418,6 +1429,22 @@ def main():
         chain[0x5800] = leaf
         d = run('callee-depth-bound', call_spill, chain)
         assert not resolved(d) and all(c['depth'] <= 8 for c in d['call_effects'])
+        native_bodies = {0xd000: ['svc #0', 'ret'], 0xe000: ['svc #0', 'ret']}
+        native_dispatch = ['ldur w0, [x0, #-1]', 'ubfx x0, x0, #8, #16', 'ldr x30, [x21, x0, lsl #3]', 'blr x30']
+        for name, target, middle, expected in [
+            ('one', 0xd000, [], 0x2000), ('two', 0xe000, [], 0x2004),
+            ('overwrite', 0xd000, ['mov x0, x2'], None), ('unknown-call', 0xd000, ['bl 0x5000'], None)]:
+            d = run('native-return-'+name, [f'bl {target:#x}'] + middle + native_dispatch,
+                    native_bodies | {0x5000: ['ret']}, native_returns=True)
+            values = [e['static_dispatch']['snapshot_target'] for e in d['edges'] if e.get('static_dispatch')]
+            assert values == ([] if expected is None else [expected])
+            assert sum(e.get('native_return') is not None for e in d['edges']) == 1
+        d = run('native-return-caller-spill-killed',
+                prologue + ['ldr x0, [x27, #40]', 'stur x0, [x29, #-8]', 'bl 0xd000',
+                            'ldur x0, [x29, #-8]'] + native_dispatch, native_bodies, native_returns=True)
+        assert not resolved(d) and all(e['payload'] not in (0xd000, 0xe000) for e in d['call_effects'])
+        from register_context_cases import exercise_register_contexts
+        exercise_register_contexts(run)
         invalid = [str(executable), str(temp / 'invalid.json'), '0x1000', str(temp / '4096.bin'), '0x1000', str(temp / '4096.bin')]
         if args.memcheck:
             invalid = ['valgrind', '--quiet', '--error-exitcode=97', '--leak-check=full',

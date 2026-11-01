@@ -53,7 +53,12 @@ set(SRCS
     StackCheckAnalysis.h
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
+    NativeReturnContracts.h
 	ReceiverAnalysis.cpp
+	RegisterContexts.cpp
+	RegisterContexts.h
+	CallResultContexts.cpp
+	CallResultContexts.h
 	CallEffects.cpp
 	ReceiverAnalysis.h
     SnapshotCodeRanges.h

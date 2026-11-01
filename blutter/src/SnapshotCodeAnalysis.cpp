@@ -1,5 +1,7 @@
 #include "SnapshotCodeAnalysis.h"
 #include "ReceiverAnalysis.h"
+#include "RegisterContexts.h"
+#include "CallResultContexts.h"
 #include "CallEffects.h"
 #include "Arm64Ir.h"
 #include "StackCheckAnalysis.h"
@@ -372,6 +374,9 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 						note(std::format("{} -> {} [payload {:#x}, entry +{:#x}]", edge.kind, Preview(edge.targetLabel), *edge.targetPayload, address - *edge.targetPayload));
 					} else note(std::format("{} -> {:#x} [outside snapshot payloads]", edge.kind, address));
 					edge.registerConstants = callConstants();
+					if (call && profile.wordReturnRegister == ARM64_REG_X0 && profile.nativeReturnClasses.contains(address))
+						note(std::format("normal return x0: heap class {:#x} [matched SDK native contract; caller memory effects unproved]",
+							profile.nativeReturnClasses.at(address).classId));
 					edges.push_back(std::move(edge));
 				}
 			} else if (target.type == ARM64_OP_REG) {
@@ -526,6 +531,15 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 	}
 	if (profile.classIdBits) {
 		auto receiver = AnalyzeReceivers(instructions, count, profile, receiverEntries);
+		for (size_t n = firstEdge; n < edges.size(); ++n)
+			if (const auto found = receiver.registerInputs.find(edges[n].site); found != receiver.registerInputs.end()) edges[n].registerInputs = found->second;
+		for (const auto& [site, value] : receiver.returnClasses) {
+			auto& comment = comments[site];
+			if (!comment.empty()) comment += " | ";
+			comment += std::format("normal-flow return x0: heap class {:#x} [this RET only]", value.classId);
+		}
+		if (receiver.normalReturnClass && !profile.nativeReturnClasses.contains(payloadStart) && !profile.allocationReturns.contains(payloadStart) && !profile.nonReturningCalls.contains(payloadStart))
+			machineReturnClasses.emplace(payloadStart, *receiver.normalReturnClass);
 		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.resolutions.find(edges[n].site); found != receiver.resolutions.end()) {
 			edges[n].staticDispatch = found->second;
 			auto& comment = comments[edges[n].site];
@@ -801,9 +815,21 @@ void Analyzer::Write(const std::string& filename) const
 		checkedPoolClasses.insert(analysis.poolClasses.begin(), analysis.poolClasses.end());
 		arrayResultTraces.push_back({payload, callers, std::move(inputs), std::move(binding), std::move(analysis), path});
 	}
+	Profile registerProfile = prefixProfile;
+	registerProfile.provedReturnClasses = machineReturnClasses;
+	const auto registerContexts = AnalyzeRegisterContexts(edges, contextBytes, std::move(registerProfile), receiverEntries, entryStackLoads);
+	for (const auto& context : registerContexts.contexts)
+		checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
+	Profile resultProfile = prefixProfile;
+	resultProfile.provedReturnClasses = machineReturnClasses;
+	for (const auto& [entry, certificate] : registerContexts.effects) resultProfile.frameSafeCallees.insert(entry);
+	resultProfile.forwardedReturnInputs.insert(registerContexts.forwardedInputs.begin(), registerContexts.forwardedInputs.end());
+	const auto resultContexts = AnalyzeCallResultContexts(edges, contextBytes, std::move(resultProfile), receiverEntries, registerContexts);
+	for (const auto& context : resultContexts.contexts)
+		checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":22,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":24,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -872,6 +898,13 @@ void Analyzer::Write(const std::string& filename) const
 				<< ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << ",\"proof\":";
 			Proof(out, value.proof); out << '}';
 		}
+		out << "],\"register_inputs\":[";
+		for (size_t n = 0; n < edge.registerInputs.size(); ++n) {
+			if (n) out << ',';
+			const auto& value = edge.registerInputs[n];
+			out << "{\"register\":\"x" << value.reg << "\",\"class_id\":" << value.classId << ",\"proof\":";
+			Proof(out, value.proof); out << '}';
+		}
 		out << "],\"forwarded_return\":";
 		if (edge.forwardedReturn) Forwarded(out, *edge.forwardedReturn); else out << "null";
 		out << ",\"indexed_return\":";
@@ -882,6 +915,12 @@ void Analyzer::Write(const std::string& filename) const
 		} else out << "null";
 		out << ",\"array_length_return\":";
 		if (edge.arrayLengthReturn) LengthReturn(out, *edge.arrayLengthReturn); else out << "null";
+		out << ",\"native_return\":";
+		if (edge.kind == "call" && edge.target && profile.wordReturnRegister == ARM64_REG_X0 && profile.nativeReturnClasses.contains(*edge.target)) {
+			const auto& value = profile.nativeReturnClasses.at(*edge.target);
+			out << "{\"callee\":" << *edge.target << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"contract\":" << Quoted(value.contract)
+				<< ",\"condition\":\"normal_return\",\"basis\":\"matched_sdk_native_identity\"}";
+		} else out << "null";
 		out << ",\"array_arguments\":[";
 		for (size_t n = 0; n < edge.arrayArguments.size(); ++n) {
 			if (n) out << ',';
@@ -951,6 +990,13 @@ void Analyzer::Write(const std::string& filename) const
 	out << ",\"heap_bits_register\":" << (profile.heapBitsRegister == ARM64_REG_X28 ? "\"x28\"" : "null");
 	out << ",\"allocation_returns\":["; first = true;
 	for (const auto& [address, cid] : profile.allocationReturns) { if (!first) out << ','; first = false; out << '[' << address << ',' << cid << ']'; }
+	out << "],\"native_return_classes\":["; first = true;
+	for (const auto& [entry, value] : profile.nativeReturnClasses) {
+		if (!first) out << ','; first = false;
+		out << '[' << entry << ',' << value.classId << ',' << Quoted(value.contract) << ']';
+	}
+	out << "],\"machine_return_classes\":["; first = true;
+	for (const auto& [entry, cid] : machineReturnClasses) { if (!first) out << ','; first = false; out << '[' << entry << ',' << cid << ']'; }
 	out << "],\"thread_heap_classes\":["; first = true;
 	for (const auto& [offset, cid] : profile.threadHeapClasses) { if (!first) out << ','; first = false; out << '[' << offset << ',' << cid << ']'; }
 	out << "],\"frame_preserving_calls\":["; first = true;
@@ -1090,6 +1136,54 @@ void Analyzer::Write(const std::string& filename) const
 		<< ",\"transfer_steps\":" << 20000000 - pathRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000}";
 	out << ",\"array_context_analysis\":{\"candidate_groups\":" << arrayGroups.size() << ",\"attempted_groups\":" << arrayAttempted
 		<< ",\"transfer_steps\":" << 20000000 - arrayRemainingSteps << ",\"group_limit\":4096,\"step_limit\":20000000}";
-	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Frame-only callee effects preserve caller-frame classes. Checked length leaves can additionally preserve unwritten working registers and selected array contents; no source return type is inferred. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block and checked unique length-call continuations. Other calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block or checked entry-chain read certificate. length_proved records require a checked length-call result. Exact-target length leaves preserve contents only with a verified argument root and register-write mask at an untargeted immediate normal-return block. Packed values and saved index words are dropped there. Other calls and branch boundaries discard contents; entry backedges disable this consumer. array_path_contexts additionally require their explicit initial-stack-check fallthrough condition, checked against the matched SDK offset and slow stub. They exclude the initial slow edge only; the runtime stub has no asserted heap-preservation contract. They never replace unconditional array_contexts or global dispatch facts. array_entry_traces additionally describe one non-revisiting entry prefix ending at its first proved indexed result. Every chosen branch is concrete or an explicit checked stack condition; later iterations and post-getter execution are outside that scope. array_result_traces separately follow the getter result to the first later call, retaining scalar class/register data provenance and expiring array contents, prior input bindings and spills at the getter. Their stopped indirect target must derive from the result; unrelated or intervening calls produce no result-use claim. prefix_call_effects contain separately proved small callees requested by exact array-bound prefix calls. An interior helper must be an aligned dispatch-table entry within retained payload bytes; containing_payload identifies its unchanged native container and only the entry-to-end suffix is proved. They supplement entry/result traces only, with independent bounded work; original broad effects and ordinary contexts keep their original budgets and assumptions. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
+	out << ",\"register_call_effects\":["; first = true;
+	for (const auto& [entry, certificate] : registerContexts.effects) { if (!first) out << ','; first = false; out << certificate; }
+	out << "],\"register_contexts\":[";
+	for (size_t n = 0; n < registerContexts.contexts.size(); ++n) {
+		if (n) out << ',';
+		const auto& context = registerContexts.contexts[n];
+		out << "{\"payload\":" << context.payload << ",\"callers\":"; Proof(out, context.callers);
+		out << ",\"inputs\":[";
+		for (size_t k = 0; k < context.stackInputs.size(); ++k) {
+			if (k) out << ','; const auto& value = context.stackInputs[k];
+			out << "{\"sp_offset\":" << value.spOffset << ",\"kind\":" << Quoted(value.kind) << ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << '}';
+		}
+		out << "],\"register_inputs\":[";
+		for (size_t k = 0; k < context.registerInputs.size(); ++k) {
+			if (k) out << ','; const auto& value = context.registerInputs[k];
+			out << "{\"register\":\"x" << value.reg << "\",\"class_id\":" << value.classId << '}';
+		}
+		out << "],\"resolutions\":["; first = true;
+		for (const auto& [site, value] : context.analysis.resolutions) {
+			if (!first) out << ','; first = false;
+			out << "{\"site\":" << site << ",\"load\":" << value.load << ",\"index\":" << value.index << ",\"table_index\":" << value.tableIndex
+				<< ",\"snapshot_target\":" << value.snapshotTarget << ",\"proof\":"; Proof(out, value.proof); out << '}';
+		}
+		out << "],\"forwarded_returns\":["; first = true;
+		for (const auto& [site, value] : context.analysis.forwardedReturns) { if (!first) out << ','; first = false; Forwarded(out, value, site); }
+		out << "],\"array_length_returns\":["; first = true;
+		for (const auto& [site, value] : context.analysis.lengthReturns) { if (!first) out << ','; first = false; LengthReturn(out, value, site); }
+		out << "],\"stack_observations\":["; first = true;
+		for (const auto& [site, values] : context.analysis.stackInputs) {
+			if (!first) out << ','; first = false;
+			out << "{\"site\":" << site << ",\"values\":[";
+			for (size_t k = 0; k < values.size(); ++k) {
+				if (k) out << ','; const auto& value = values[k];
+				out << "{\"sp_offset\":" << value.spOffset << ",\"kind\":" << Quoted(value.kind) << ",\"value\":" << Quoted(std::format("{:#x}", value.value)) << ",\"proof\":";
+				Proof(out, value.proof); out << '}';
+			}
+			out << "]}";
+		}
+		out << "],\"normal_return_class\":" << (context.analysis.normalReturnClass ? std::to_string(*context.analysis.normalReturnClass) : "null")
+			<< ",\"certificate\":" << context.analysis.certificate << '}';
+	}
+	out << "],\"register_context_analysis\":{\"candidate_groups\":" << registerContexts.candidateGroups << ",\"attempted_groups\":" << registerContexts.attempted
+		<< ",\"transfer_steps\":" << registerContexts.steps << ",\"effect_attempts\":" << registerContexts.effectAttempts << ",\"effect_steps\":" << registerContexts.effectSteps
+		<< ",\"binding_steps\":" << registerContexts.bindingSteps << ",\"dropped_callers\":" << registerContexts.droppedCallers
+		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"binding_step_limit\":2000000,\"effect_attempt_limit\":128,\"effect_byte_limit\":256,\"round_limit\":3}";
+	out << ",\"call_result_contexts\":"; WriteCallResultContexts(out, resultContexts);
+	out << ",\"call_result_analysis\":{\"candidate_payloads\":" << resultContexts.candidatePayloads << ",\"attempted_payloads\":" << resultContexts.attempted
+		<< ",\"transfer_steps\":" << resultContexts.steps << ",\"dropped_callers\":" << resultContexts.droppedCallers << ",\"payload_limit\":4096,\"step_limit\":20000000}";
+	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Frame-only callee effects preserve caller-frame classes. Checked length leaves can additionally preserve unwritten working registers and selected array contents; no source return type is inferred. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. native_return records are conditional matched-SDK result classes at direct calls, with no caller-frame, register or mutable-heap preservation implied. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block and checked unique length-call continuations. Other calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block or checked entry-chain read certificate. length_proved records require a checked length-call result. Exact-target length leaves preserve contents only with a verified argument root and register-write mask at an untargeted immediate normal-return block. Packed values and saved index words are dropped there. Other calls and branch boundaries discard contents; entry backedges disable this consumer. array_path_contexts additionally require their explicit initial-stack-check fallthrough condition, checked against the matched SDK offset and slow stub. They exclude the initial slow edge only; the runtime stub has no asserted heap-preservation contract. They never replace unconditional array_contexts or global dispatch facts. array_entry_traces additionally describe one non-revisiting entry prefix ending at its first proved indexed result. Every chosen branch is concrete or an explicit checked stack condition; later iterations and post-getter execution are outside that scope. array_result_traces separately follow the getter result to the first later call, retaining scalar class/register data provenance and expiring array contents, prior input bindings and spills at the getter. Their stopped indirect target must derive from the result; unrelated or intervening calls produce no result-use claim. prefix_call_effects contain separately proved small callees requested by exact array-bound prefix calls. An interior helper must be an aligned dispatch-table entry within retained payload bytes; containing_payload identifies its unchanged native container and only the entry-to-end suffix is proved. They supplement entry/result traces only, with independent bounded work; original broad effects and ordinary contexts keep their original budgets and assumptions. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. register_inputs additionally observe full-width heap classes in nonreserved X0 through X14; they are not source signatures. register_contexts have separate bounded work, explicit entry bindings, independent frame proofs and no promotion of conditional results to global helper types. Backward register liveness and observed callee stack loads select relevant bindings without proving types. return_classes describe individual normal RET sites; machine_return_classes additionally require a closed body and agreement at every reached normal return. These result-only summaries grant no preservation effects. call_result_contexts separately consume global or caller-qualified helper results at exact original direct BL sites; their derived caller facts never feed back into the producer proofs. Old scalar/array contexts retain their own inputs and budgets. Dropped register/result callers are counted explicitly. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

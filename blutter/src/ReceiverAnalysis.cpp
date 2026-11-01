@@ -360,13 +360,21 @@ void JsonFact(std::ostream& out, unsigned reg, const Fact& f)
 
 ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t count,
 	const Profile& profile, const std::set<uint64_t>& externalEntries,
-	const std::vector<StackInput>* inputs, size_t* sharedSteps, const ArrayInputBinding* arrayInput, const InitialStackCheck* initialPath, bool firstTraversal, bool followIndexedResult, bool probeMissingEffects)
+	const std::vector<StackInput>* inputs, size_t* sharedSteps, const ArrayInputBinding* arrayInput, const InitialStackCheck* initialPath, bool firstTraversal, bool followIndexedResult, bool probeMissingEffects,
+	const std::vector<RegisterInput>* registerInputs)
 {
 	ReceiverAnalysisResult result;
 	if (!count || count > 16384 || profile.poolSlotSize != 8 || !profile.classIdBits || profile.classIdBits > 32 ||
 		profile.classIdShift > 32 - profile.classIdBits || profile.headerDisplacement < -8 || profile.headerDisplacement > 8) return result;
 	if (instructions[0].address > UINT64_MAX - count * 4 || profile.nullClassId > Mask(profile.classIdBits)) return result;
 	for (const auto& [entry, cid] : profile.allocationReturns) if (cid > Mask(profile.classIdBits)) return result;
+	for (const auto& [entry, contract] : profile.nativeReturnClasses)
+		if (!entry || entry % 4 || !contract.classId || contract.classId > Mask(profile.classIdBits) ||
+			(contract.contract != "allocate_one_byte_string" && contract.contract != "allocate_two_byte_string") ||
+			profile.allocationReturns.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
+	for (const auto& [entry, cid] : profile.provedReturnClasses)
+		if (!entry || entry % 4 || !cid || cid > Mask(profile.classIdBits) || profile.nativeReturnClasses.contains(entry) ||
+			profile.allocationReturns.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
 	for (const auto& [offset, cid] : profile.threadHeapClasses) if (cid > Mask(profile.classIdBits)) return result;
 	for (const auto& [entry, contract] : profile.nonReturningCalls)
 		if (contract != "range_error_without_fpu" || profile.allocationReturns.contains(entry) || profile.framePreservingCalls.contains(entry) || profile.frameSafeCallees.contains(entry)) return result;
@@ -374,8 +382,18 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if ((mask & ((1U << 15) | (1U << 29) | (1U << 30) | (1U << 31))) ||
 			((mask & (1U << 25)) && profile.framePreservingCalls.contains(entry) && profile.framePreservingCalls.at(entry) == "array_write_barrier")) return result;
 	std::map<int64_t, Fact> inputValues;
+	std::map<unsigned, Fact> registerValues;
+	if (registerInputs) {
+		if (profile.wordReturnRegister != ARM64_REG_X0 || registerInputs->empty() || registerInputs->size() > 15 || arrayInput || initialPath || firstTraversal) return result;
+		for (const auto& input : *registerInputs) {
+			if (input.reg > 14 || input.reg == Number(profile.poolRegister) || input.reg == Number(profile.threadRegister) ||
+				input.reg == Number(profile.dispatchRegister) || input.reg == Number(profile.nullRegister) ||
+				!input.classId || input.classId > Mask(profile.classIdBits) || registerValues.contains(input.reg)) return result;
+			registerValues.emplace(input.reg, Fact{Object, input.classId});
+		}
+	}
 	if (inputs) {
-		if (inputs->empty() || inputs->size() > 32) return result;
+		if ((inputs->empty() && !registerInputs) || inputs->size() > 32) return result;
 		for (const auto& input : *inputs) {
 			if (input.spOffset < 0 || input.spOffset >= 256 || input.spOffset % 8 ||
 				(input.kind != "word" && input.kind != "heap_class") ||
@@ -385,6 +403,14 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	}
 	if ((firstTraversal && (!initialPath || !arrayInput)) || ((followIndexedResult || probeMissingEffects) && !firstTraversal) || (followIndexedResult && probeMissingEffects)) return result;
 	const auto start = instructions[0].address, end = start + count * 4;
+	for (const auto& [site, value] : profile.callReturnClasses) {
+		if (profile.wordReturnRegister != ARM64_REG_X0 || site < start || site >= end || (site-start)%4 || !value.classId || value.classId > Mask(profile.classIdBits)) return result;
+		const auto& i = instructions[(site-start)/4];
+		if (!i.detail || i.id != ARM64_INS_BL || i.detail->arm64.op_count != 1 || i.detail->arm64.operands[0].type != ARM64_OP_IMM ||
+			static_cast<uint64_t>(i.detail->arm64.operands[0].imm) != value.callee || profile.allocationReturns.contains(value.callee) || profile.nonReturningCalls.contains(value.callee) ||
+			(profile.nativeReturnClasses.contains(value.callee) && profile.nativeReturnClasses.at(value.callee).classId != value.classId) ||
+			(profile.provedReturnClasses.contains(value.callee) && profile.provedReturnClasses.at(value.callee) != value.classId)) return result;
+	}
 	if (initialPath) {
 		const auto checked = FindInitialStackCheck(instructions, count, profile);
 		for (const auto entry : externalEntries) if (entry > start && entry <= initialPath->site) return result;
@@ -433,7 +459,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	std::vector<size_t> blockOf(count);
 	for (size_t n = 0; n < begins.size(); ++n) {
 		const auto stop = n + 1 < begins.size() ? begins[n + 1] : count;
-		blocks.push_back({begins[n], stop, begins[n] == 0 || (!inputs && (calledEntries.contains(begins[n]) || externalEntries.contains(start + begins[n] * 4))), {}});
+		blocks.push_back({begins[n], stop, begins[n] == 0 || (!inputs && !registerInputs && (calledEntries.contains(begins[n]) || externalEntries.contains(start + begins[n] * 4))), {}});
 		for (size_t k = begins[n]; k < stop; ++k) blockOf[k] = n;
 	}
 	State seed;
@@ -789,6 +815,14 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				const auto allocation = profile.allocationReturns.find(d.operands[0].imm);
 				const int reg = Number(profile.allocationResultRegister);
 				if (allocation != profile.allocationReturns.end() && reg >= 0) state.regs[reg] = {Object, allocation->second, 0, 0, {i.address}};
+				const auto native = profile.nativeReturnClasses.find(d.operands[0].imm);
+				if (profile.wordReturnRegister == ARM64_REG_X0 && native != profile.nativeReturnClasses.end())
+					state.regs[0] = {Object, native->second.classId, 0, 0, {i.address}};
+				const auto returned = profile.provedReturnClasses.find(d.operands[0].imm);
+				if (profile.wordReturnRegister == ARM64_REG_X0 && returned != profile.provedReturnClasses.end())
+					state.regs[0] = {Object, returned->second, 0, 0, {i.address}};
+				if (const auto bound = profile.callReturnClasses.find(i.address); bound != profile.callReturnClasses.end())
+					state.regs[0] = {Object, bound->second.classId, 0, 0, {i.address}};
 			}
 			if (forwarded && preserves) state.regs[0] = forwarded->first;
 			if (indexed && preserves) state.regs[0] = indexed->first;
@@ -899,6 +933,9 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	std::vector<bool> queued(blocks.size());
 	for (size_t n = 0; n < blocks.size(); ++n) if (blocks[n].entry) {
 		auto entry = seed;
+		// These bindings belong only to this invocation's payload entry. The
+		// invariant seed used after calls must never recreate an entry value.
+		if (!blocks[n].first) for (const auto& [reg, value] : registerValues) entry.regs[reg] = value;
 		// Interior entries do not establish the payload entry's frame base.
 		if (blocks[n].first) { entry.regs[15].aux = 2; entry.regs[29].aux = 3; }
 		blocks[n].in = entry; work.push_back(n); queued[n] = true;
@@ -932,6 +969,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (probeMissingEffects) unresolved.missingArrayEffect = result.missingArrayEffect;
 		return unresolved;
 	}
+	std::set<uint64_t> normalReturns;
 	for (const auto& b : blocks) if (b.in) {
 		auto state = *b.in;
 		LocalArray contents;
@@ -944,6 +982,19 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			const auto& i = instructions[n];
 			const auto& d = i.detail->arm64;
 			const auto sp = state.regs[15];
+			if (i.id == ARM64_INS_RET && (d.op_count == 0 || (d.op_count == 1 && d.operands[0].reg == ARM64_REG_X30))) {
+				normalReturns.insert(i.address);
+				if (profile.wordReturnRegister == ARM64_REG_X0 && state.regs[0].kind == Object && state.regs[0].value) {
+					const auto value = Proven(state.regs[0], i.address);
+					if (!value.proof.empty()) result.returnClasses.emplace(i.address, ReturnedClass{static_cast<uint32_t>(value.value), value.proof});
+				}
+			}
+			if (!inputs && !registerInputs && Group(i, CS_GRP_CALL) && profile.wordReturnRegister == ARM64_REG_X0)
+				for (unsigned reg = 0; reg < 15; ++reg) {
+					const auto& value = state.regs[reg];
+					if (reg != poolReg && reg != threadReg && reg != dispatchReg && reg != nullReg && value.kind == Object && value.value && !value.proof.empty())
+						result.registerInputs[i.address].push_back({reg, static_cast<uint32_t>(value.value), value.proof});
+				}
 			if (arrayEnabled) contents.Begin(state.freshArray, Number(profile.allocationResultRegister));
 			if (contents.entryBinding) {
 				const auto value = contents.Result(i, profile, heapFixed);
@@ -1016,7 +1067,28 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || sp.kind != state.regs[15].kind || sp.aux != state.regs[15].aux) recentStores.clear();
 		}
 	}
-	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && result.lengthReturns.empty() && (inputs || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
+	// A local RET fact does not describe escaping branches or a tail call.
+	// Require a closed normal-flow body and agreement at every reached return.
+	bool closed = !initialPath && !firstTraversal && !normalReturns.empty();
+	for (size_t n = 0; n < count; ++n) {
+		const auto& i = instructions[n]; const auto& d = i.detail->arm64;
+		if (Group(i, CS_GRP_RET) && (i.id != ARM64_INS_RET || (d.op_count && (d.op_count != 1 || d.operands[0].reg != ARM64_REG_X30)))) closed = false;
+		if (Group(i, CS_GRP_JUMP) && !Group(i, CS_GRP_CALL)) {
+			if (!d.op_count || d.operands[d.op_count-1].type != ARM64_OP_IMM) closed = false;
+			else {
+				const auto target = static_cast<uint64_t>(d.operands[d.op_count-1].imm);
+				if (target < start || target >= end || (target-start)%4) closed = false;
+			}
+		}
+	}
+	const auto& last = instructions[count-1]; const auto& ld = last.detail->arm64;
+	const bool stops = Terminal(last) || (last.id == ARM64_INS_B && (ld.cc == ARM64_CC_INVALID || ld.cc == ARM64_CC_AL)) ||
+		(last.id == ARM64_INS_BL && ld.op_count == 1 && ld.operands[0].type == ARM64_OP_IMM && profile.nonReturningCalls.contains(ld.operands[0].imm));
+	if (closed && stops && result.returnClasses.size() == normalReturns.size()) {
+		const auto cid = result.returnClasses.begin()->second.classId;
+		if (std::all_of(result.returnClasses.begin(), result.returnClasses.end(), [&](const auto& entry) { return entry.second.classId == cid; })) result.normalReturnClass = cid;
+	}
+	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && result.lengthReturns.empty() && result.returnClasses.empty() && result.registerInputs.empty() && ((inputs || registerInputs) || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
 	std::ostringstream certificate;
 	certificate << "{\"payload\":" << start << ",\"blocks\":[";
 	for (size_t n = 0; n < blocks.size(); ++n) {
@@ -1040,7 +1112,15 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (b.in && b.in->arrayContinuation) certificate << b.in->arrayContinuation->site; else certificate << "null";
 		certificate << '}';
 	}
-	certificate << "]}";
+	certificate << "],\"return_classes\":[";
+	bool firstReturn = true;
+	for (const auto& [site, value] : result.returnClasses) {
+		if (!firstReturn) certificate << ','; firstReturn = false;
+		certificate << "{\"site\":" << site << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"proof\":[";
+		for (size_t n = 0; n < value.proof.size(); ++n) { if (n) certificate << ','; certificate << value.proof[n]; }
+		certificate << "]}";
+	}
+	certificate << "],\"normal_return_class\":" << (result.normalReturnClass ? std::to_string(*result.normalReturnClass) : "null") << '}';
 	result.certificate = certificate.str();
 	return result;
 }

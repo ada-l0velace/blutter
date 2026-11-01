@@ -96,6 +96,13 @@ def heap_field(base, operand, writeback, header, enabled):
 
 
 def check_receivers(graph, read, decode, audit):
+    from check_native_returns import check_native_returns
+    native_returns, native_return_calls = check_native_returns(graph, read, audit or {})
+    from check_register_inputs import register_claims, check_register_bindings, machine_returns, check_return_summary, REGISTERS
+    register_observations = register_claims(graph)
+    machine_return_classes = machine_returns(graph)
+    from check_call_results import check_result_bindings
+    result_contexts = check_result_bindings(graph, machine_return_classes)
     modern = graph.get('format', 4) >= 5
     spill_enabled = graph.get('format', 4) >= 7
     heap_address_enabled = graph.get('format', 4) >= 8
@@ -116,6 +123,7 @@ def check_receivers(graph, read, decode, audit):
     assert len(return_claims) == sum(e.get('forwarded_return') is not None for e in graph['edges'])
     certificates = graph.get('receiver_certificates', [])
     contexts = graph.get('call_contexts', [])
+    register_contexts = graph.get('register_contexts', [])
     array_contexts = graph.get('array_contexts', [])
     path_contexts = graph.get('array_path_contexts', [])
     entry_traces = graph.get('array_entry_traces', [])
@@ -131,9 +139,10 @@ def check_receivers(graph, read, decode, audit):
     assert len(load_claims) == len(graph.get('entry_stack_loads', []))
     assert modern or not stack_claims and not load_claims
     assert len({c['payload'] for c in certificates}) == len(certificates)
-    if not claims and not stack_claims and not load_claims and not return_claims and not length_claims and not array_claims and not indexed_claims and not contexts and not array_contexts and not path_contexts and not entry_traces and not result_traces and not graph.get('call_effects') and not graph.get('prefix_call_effects') and not graph.get('receiver_metadata', {}).get('nonreturning_calls'):
+    if not result_contexts and not register_observations and not machine_return_classes and not register_contexts and not any(c.get('return_classes') for c in certificates) and not claims and not stack_claims and not load_claims and not return_claims and not length_claims and not array_claims and not indexed_claims and not contexts and not array_contexts and not path_contexts and not entry_traces and not result_traces and not graph.get('call_effects') and not graph.get('prefix_call_effects') and not graph.get('receiver_metadata', {}).get('nonreturning_calls'):
         assert not certificates
-        return {'receiver_claims_checked': 0, 'receiver_incoming_edges_checked': 0}
+        return {'receiver_claims_checked': 0, 'receiver_incoming_edges_checked': 0,
+                'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls}
     assert audit, 'Receiver checking requires the separate VM audit'
     metadata, profile = graph['receiver_metadata'], graph['profile']
     if graph.get('format', 4) >= 18:
@@ -173,6 +182,16 @@ def check_receivers(graph, read, decode, audit):
         assert type(entry) is int and type(parent) is int and parent in prefix_nodes
         assert 0 < prefix_nodes[parent]['end']-entry <= 256
     prefix_safe, prefix_instructions = check_call_effects(dict(graph, call_effects=prefix_certificates), read, decode, set(allocations) | set(preserving_calls), audit, allow_interior_entries=True)
+    register_certificates = graph.get('register_call_effects', [])
+    assert graph.get('format', 4) >= 24 or not register_certificates
+    assert len(register_certificates) <= 128
+    for effect in register_certificates:
+        entry, parent = effect['payload'], effect.get('containing_payload', effect['payload'])
+        assert type(entry) is int and type(parent) is int and parent in prefix_nodes
+        assert 0 < prefix_nodes[parent]['end']-entry <= 256
+    register_safe, register_effect_instructions = check_call_effects(
+        dict(graph, call_effects=register_certificates), read, decode, set(allocations) | set(preserving_calls), audit, allow_interior_entries=True)
+    register_forwarded = {c['payload']: c['return_input'] for c in register_certificates if c.get('return_input') is not None}
     legacy_safe = safe_callees
     heap_bits = metadata.get('heap_bits_register')
     assert heap_bits is None or graph.get('format', 4) >= 13 and heap_bits == 'x28' and audit.get('heap_bits_register') == heap_bits
@@ -183,6 +202,7 @@ def check_receivers(graph, read, decode, audit):
     array_returns = {c['payload']: c['array_return'] for c in graph.get('call_effects', []) if c.get('array_return') is not None}
     verified_indexed = set()
     return_inputs = {c['payload']: c['return_input'] for c in graph.get('call_effects', []) if c.get('return_input') is not None}
+    legacy_return_inputs = return_inputs
     length_effects = {c['payload']: c['array_length'] for c in graph.get('call_effects', []) if c.get('array_length') is not None} if graph.get('format', 4) >= 17 else {}
     legacy_arrays, legacy_lengths = array_returns, length_effects
     prefix_arrays = {c['payload']: c['array_return'] for c in prefix_certificates if c.get('array_return') is not None}
@@ -197,6 +217,9 @@ def check_receivers(graph, read, decode, audit):
     assert {v for v in external if image_start <= v < image_end} == {v for v in metadata['entries'] if image_start <= v < image_end}
     verified, incoming_checks, blocks_checked = {}, 0, 0
     verified_stacks, verified_loads, verified_returns = set(), set(), set()
+    verified_registers, register_stack_count, return_class_count = set(), 0, 0
+    result_stack_count, result_array_count, result_element_count, result_dispatch_count = 0, 0, 0, 0
+    register_context_callers = check_register_bindings(graph, stack_claims, register_observations)
     context_return_count = 0
     context_results, context_callers, context_keys = 0, set(), set()
     from check_array_contexts import check_array_bindings
@@ -233,15 +256,23 @@ def check_receivers(graph, read, decode, audit):
         assert len({r['site'] for r in context.get('forwarded_returns', [])}) == len(context.get('forwarded_returns', []))
         checks.append((context['certificate'], context))
 
+    checks.extend((c['certificate'], c) for c in register_contexts)
+    checks.extend((c['certificate'], c) for c in result_contexts)
     checks.extend((c['certificate'], c) for c in array_contexts + path_contexts + entry_traces + result_traces if c['certificate'] is not None)
 
     for certificate, context in checks:
+        register_mode = context is not None and 'register_inputs' in context
+        result_mode = context is not None and 'return_bindings' in context
+        bound_context = context is not None and not result_mode
+        result_bindings = {v['site']: v for v in context['return_bindings']} if result_mode else {}
         array_mode = context is not None and 'array_input' in context
         path = context.get('path_condition') if context else None
         trace = context.get('trace') if context else None
-        safe_callees = legacy_safe | prefix_safe if trace else legacy_safe
-        array_returns = legacy_arrays | prefix_arrays if trace else legacy_arrays
-        length_effects = legacy_lengths | prefix_lengths if trace else legacy_lengths
+        safe_callees = legacy_safe | prefix_safe | register_safe if register_mode or result_mode else legacy_safe | prefix_safe if trace else legacy_safe
+        return_inputs = legacy_return_inputs | register_forwarded if register_mode or result_mode else legacy_return_inputs
+        active_machine_returns = machine_return_classes if register_mode or result_mode else {}
+        array_returns = legacy_arrays | prefix_arrays if trace or result_mode else legacy_arrays
+        length_effects = legacy_lengths | prefix_lengths if trace or result_mode else legacy_lengths
         use_mode = bool(context and context.get('scope') == 'entry_result_use')
         assert not trace or context['scope'] in ('entry_prefix', 'entry_result_use')
         result_origin, result_dependencies = None, 0
@@ -254,7 +285,14 @@ def check_receivers(graph, read, decode, audit):
         active_array_reads = {v['site']: v for v in context['array_reads']} if array_mode else {}
         verified_array_reads = set()
         active_claims = {r['site']: r for r in context['resolutions']} if context else claims
-        active_stacks, active_loads = ({}, {}) if context else (stack_claims, load_claims)
+        active_stacks, active_loads = ({v['site']: v['values'] for v in context['stack_observations']}, {}) if register_mode or result_mode else ({}, {}) if context else (stack_claims, load_claims)
+        active_registers = register_observations if not context else {}
+        active_arrays = {v['site']: v['values'] for v in context['array_observations']} if result_mode else array_claims if not context else {}
+        verified_context_arrays = set()
+        verified_context_stacks = set()
+        physical_returns = {v['site']: v for v in certificate.get('return_classes', [])}
+        assert graph.get('format', 4) >= 24 or not physical_returns and certificate.get('normal_return_class') is None
+        verified_physical_returns, reached_returns = set(), set()
         verified_context = set()
         active_returns = {r['site']: r for r in context.get('forwarded_returns', [])} if context else return_claims
         verified_context_returns = set()
@@ -593,6 +631,14 @@ def check_receivers(graph, read, decode, audit):
                                 state[r] = before[r]
                 if ins.id == a.ARM64_INS_BL and ops[0].imm in allocations:
                     state[int(metadata['allocation_result_register'][1:])] = fact(OBJECT, allocations[ops[0].imm])
+                if ins.id == a.ARM64_INS_BL and ops[0].imm in native_returns:
+                    state[0] = fact(OBJECT, native_returns[ops[0].imm])
+                if ins.id == a.ARM64_INS_BL and ops[0].imm in active_machine_returns:
+                    state[0] = fact(OBJECT, active_machine_returns[ops[0].imm])
+                if result_mode and ins.address in result_bindings:
+                    binding = result_bindings[ins.address]
+                    assert ins.id == a.ARM64_INS_BL and ops[0].imm == binding['callee']
+                    state[0] = fact(OBJECT, binding['class_id'])
                 if forwarded and preserves:
                     state[0] = fact(OBJECT, forwarded[2])
                 if indexed and preserves:
@@ -688,7 +734,7 @@ def check_receivers(graph, read, decode, audit):
         declared, compares, outgoing_edges, inputs, declared_live, declared_spills, declared_fresh = {}, {}, {}, {}, {}, {}, {}
         ordered_blocks = ([block_map[pc] for pc in trace['blocks']] + [b for b in blocks if b['start'] not in trace['blocks']]) if trace else blocks
         for block in ordered_blocks:
-            assert block['entry'] == (block['start'] == start or not context and block['start'] in external)
+            assert block['entry'] == (block['start'] == start or not bound_context and block['start'] in external)
             fresh = block.get('fresh_array')
             assert graph.get('format', 4) >= 13 or fresh is None
             if fresh is not None:
@@ -722,6 +768,9 @@ def check_receivers(graph, read, decode, audit):
                 assert 0 <= number < 31 and bits in (32, 64) and 0 <= value < 1 << bits and site in by_address
             if block['entry']:
                 entry = list(seed)
+                if register_mode and block['start'] == start:
+                    for value in context['register_inputs']:
+                        entry[REGISTERS[value['register']]] = fact(OBJECT, value['class_id'])
                 if modern and block['start'] != start:
                     entry[15], entry[29] = fact(STACK, aux=2), fact(STACK, aux=3)
                 inputs.setdefault(block['start'], []).append((tuple(entry), (), frozenset(input_values), {}, None))
@@ -749,6 +798,23 @@ def check_receivers(graph, read, decode, audit):
             for address in range(block['start'], block['end'], 4):
                 ins = by_address[address]
                 sp = state[15]
+                if int.from_bytes(ins.bytes, 'little') == 0xd65f03c0:
+                    reached_returns.add(address)
+                if address in physical_returns:
+                    claim = physical_returns[address]
+                    assert set(claim) == {'site', 'class_id', 'register', 'proof'}
+                    assert type(claim['site']) is int and type(claim['class_id']) is int
+                    assert int.from_bytes(ins.bytes, 'little') == 0xd65f03c0 and metadata.get('word_return_register') == 'x0'
+                    assert claim['register'] == 'x0' and state[0] == fact(OBJECT, claim['class_id'])
+                    assert 0 < claim['class_id'] < 1 << metadata['class_id_bits']
+                    assert 0 < len(claim['proof']) <= 128 and address in claim['proof'] and all(type(pc) is int and pc in by_address for pc in claim['proof'])
+                    verified_physical_returns.add(address)
+                if address in active_registers:
+                    assert ins.group(cs.CS_GRP_CALL)
+                    for claim in active_registers[address]:
+                        assert state[REGISTERS[claim['register']]] == fact(OBJECT, claim['class_id'])
+                        assert all(type(pc) is int and pc in by_address for pc in claim['proof'])
+                    verified_registers.add(address)
                 if address in active_array_reads:
                     claim = active_array_reads[address]
                     assert all(type(claim[k]) is int for k in ('site', 'input_sp_offset', 'index', 'class_id'))
@@ -797,10 +863,10 @@ def check_receivers(graph, read, decode, audit):
                         verified_context_returns.add(address)
                     else:
                         verified_returns.add(address)
-                if not context and address in array_claims:
+                if address in active_arrays:
                     assert ins.group(cs.CS_GRP_CALL) and sp[0] == STACK and contents.seed is not None
                     offsets = set()
-                    for item in array_claims[address]:
+                    for item in active_arrays[address]:
                         offset = item['sp_offset']
                         assert type(offset) is int and 0 <= offset < 256 and offset % 8 == 0 and offset not in offsets
                         offsets.add(offset)
@@ -812,8 +878,10 @@ def check_receivers(graph, read, decode, audit):
                         for index, cid in elements:
                             assert type(index) is type(cid) is int and 0 <= index < item['length'] and contents.cells.get(array[2]+index*array[3]) == cid
                         assert 0 < len(item['proof']) <= 128 and item['allocation'] in item['proof'] and address in item['proof'] and all(type(p) is int and p in by_address for p in item['proof'])
-                        array_elements_checked += len(elements)
-                    verified_arrays.add(address)
+                        if result_mode: result_element_count += len(elements)
+                        else: array_elements_checked += len(elements)
+                    if result_mode: verified_context_arrays.add(address)
+                    else: verified_arrays.add(address)
                 if ins.id in (a.ARM64_INS_DC, a.ARM64_INS_SYS, a.ARM64_INS_SYSL):
                     stores.clear()
                 if address in active_stacks:
@@ -827,7 +895,8 @@ def check_receivers(graph, read, decode, audit):
                         assert item['kind'] == ('word' if stored[0] == WORD else 'heap_class')
                         assert int(item['value'], 16) == stored[1]
                         assert 0 < len(item['proof']) <= 128 and site in item['proof'] and all(p in by_address for p in item['proof'])
-                    verified_stacks.add(address)
+                    if register_mode or result_mode: verified_context_stacks.add(address)
+                    else: verified_stacks.add(address)
                 if modern:
                     for m, op in enumerate(ins.operands):
                         if op.type != a.ARM64_OP_MEM:
@@ -913,6 +982,16 @@ def check_receivers(graph, read, decode, audit):
                 assert declared_live[address] <= incoming_live
                 assert all(incoming_spills.get(k) == v for k, v in declared_spills[address].items())
                 incoming_checks += 1
+        check_return_summary(certificate, instructions, reached_returns, verified_physical_returns, nonreturning_calls, scoped=bool(path or trace))
+        return_class_count += len(verified_physical_returns)
+        if result_mode:
+            assert verified_context_stacks == set(active_stacks) and verified_context_arrays == set(active_arrays)
+            result_stack_count += sum(map(len, active_stacks.values()))
+            result_array_count += sum(map(len, active_arrays.values()))
+            result_dispatch_count += len(verified_context)
+        if register_mode:
+            assert verified_context_stacks == set(active_stacks), 'Unchecked register-context stack observation'
+            register_stack_count += sum(map(len, active_stacks.values()))
         if use_mode:
             assert result_origin == trace['getter']
             result_use_count += len(verified_context)
@@ -930,7 +1009,7 @@ def check_receivers(graph, read, decode, audit):
                 entry_length_count += len(verified_context_lengths)
             elif path:
                 path_length_count += len(verified_context_lengths)
-            else:
+            elif not register_mode and not result_mode:
                 contextual_lengths += len(verified_context_lengths)
             if array_mode:
                 assert verified_array_reads == set(active_array_reads), 'Missing array read certificate'
@@ -945,7 +1024,7 @@ def check_receivers(graph, read, decode, audit):
                 else:
                     array_context_read_count += len(verified_array_reads)
                     array_context_dispatch_count += len(verified_context)
-            else:
+            elif not register_mode and not result_mode:
                 context_return_count += len(verified_context_returns)
                 context_results += len(verified_context)
     assert set(verified) == set(claims), 'Missing or duplicate receiver certificate'
@@ -955,9 +1034,23 @@ def check_receivers(graph, read, decode, audit):
     assert verified_lengths == set(length_claims), 'Missing length-result certificate'
     assert verified_stacks == set(stack_claims), 'Missing stack-input certificate'
     assert verified_loads == set(load_claims), 'Missing entry-stack-load certificate'
+    assert verified_registers == set(register_observations), 'Missing register observation certificate'
+    assert register_context_callers <= verified_registers, 'Unchecked register-context caller'
     assert context_callers <= verified_stacks, 'Unchecked context caller observations'
     assert array_context_callers <= verified_arrays, 'Unchecked array context caller observations'
     return {'receiver_claims_checked': len(verified), 'receiver_blocks_checked': blocks_checked,
+            'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls,
+            'register_observation_calls_checked': len(verified_registers),
+            'register_observation_classes_checked': sum(map(len, register_observations.values())),
+            'register_contexts_checked': len(register_contexts), 'register_context_callers_checked': len(register_context_callers),
+            'register_context_dispatches_checked': sum(len(c['resolutions']) for c in register_contexts),
+            'register_context_forwarded_returns_checked': sum(len(c.get('forwarded_returns', [])) for c in register_contexts),
+            'register_context_stack_slots_checked': register_stack_count,
+            'register_call_effects_checked': len(register_safe), 'register_effect_instructions_checked': register_effect_instructions,
+            'machine_return_classes_checked': len(machine_return_classes), 'physical_return_classes_checked': return_class_count,
+            'call_result_contexts_checked': len(result_contexts), 'call_result_dispatches_checked': result_dispatch_count,
+            'call_result_stack_slots_checked': result_stack_count, 'call_result_arrays_checked': result_array_count,
+            'call_result_array_elements_checked': result_element_count,
             'receiver_incoming_edges_checked': incoming_checks, 'receiver_pool_class_inputs_checked': len(pools),
             'receiver_allocation_inputs_checked': len(allocations), 'stack_input_calls_checked': len(verified_stacks),
             'stack_input_slots_checked': sum(map(len, stack_claims.values())), 'entry_stack_loads_checked': len(verified_loads),
@@ -969,7 +1062,7 @@ def check_receivers(graph, read, decode, audit):
             'array_return_summaries_checked': len(legacy_arrays),
             'array_length_calls_checked': len(verified_lengths), 'context_array_length_calls_checked': contextual_lengths,
             'indexed_return_calls_checked': len(verified_indexed),
-            'forwarded_input_summaries_checked': len(return_inputs),
+            'forwarded_input_summaries_checked': len(legacy_return_inputs),
             'forwarded_return_calls_checked': len(verified_returns),
             'context_forwarded_returns_checked': context_return_count,
             'array_result_traces_checked': len(result_traces), 'array_result_dispatches_checked': result_use_count,

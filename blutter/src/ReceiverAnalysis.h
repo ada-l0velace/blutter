@@ -9,6 +9,9 @@ struct ReceiverAnalysisResult {
 	std::string certificate;
 	std::map<int64_t, uint32_t> poolClasses;
 	std::map<uint64_t, std::vector<StackInput>> stackInputs;
+	std::map<uint64_t, std::vector<RegisterInput>> registerInputs;
+	std::map<uint64_t, ReturnedClass> returnClasses;
+	std::optional<uint32_t> normalReturnClass;
 	std::vector<EntryStackLoad> entryStackLoads;
 	std::map<uint64_t, ForwardedReturn> forwardedReturns;
 	std::map<uint64_t, std::vector<ArrayArgument>> arrayArguments;
@@ -27,5 +30,6 @@ struct ReceiverAnalysisResult {
 ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t count,
 	const Profile& profile, const std::set<uint64_t>& externalEntries,
 	const std::vector<StackInput>* inputs = nullptr, size_t* sharedSteps = nullptr,
-	const ArrayInputBinding* arrayInput = nullptr, const InitialStackCheck* initialPath = nullptr, bool firstTraversal = false, bool followIndexedResult = false, bool probeMissingEffects = false);
+	const ArrayInputBinding* arrayInput = nullptr, const InitialStackCheck* initialPath = nullptr, bool firstTraversal = false, bool followIndexedResult = false, bool probeMissingEffects = false,
+	const std::vector<RegisterInput>* registerInputs = nullptr);
 }

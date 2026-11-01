@@ -55,6 +55,22 @@ add_executable(entry_predicate_test unit/entry_predicate_test.cpp "${BLUTTER_SOU
 target_include_directories(entry_predicate_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 target_link_libraries(entry_predicate_test PRIVATE capstone)
 add_test(NAME entry_predicate COMMAND entry_predicate_test)
+add_executable(native_returns_test unit/native_returns_test.cpp
+    "${BLUTTER_SOURCE_DIR}/ReceiverAnalysis.cpp" "${BLUTTER_SOURCE_DIR}/CallEffects.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp"
+    "${BLUTTER_SOURCE_DIR}/ArrayLengthAnalysis.cpp" "${BLUTTER_SOURCE_DIR}/StackCheckAnalysis.cpp")
+target_include_directories(native_returns_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(native_returns_test PRIVATE capstone)
+add_test(NAME native_returns COMMAND native_returns_test)
+add_executable(register_inputs_test unit/register_inputs_test.cpp
+    "${BLUTTER_SOURCE_DIR}/ReceiverAnalysis.cpp" "${BLUTTER_SOURCE_DIR}/RegisterContexts.cpp"
+	"${BLUTTER_SOURCE_DIR}/CallResultContexts.cpp"
+    "${BLUTTER_SOURCE_DIR}/CallEffects.cpp" "${BLUTTER_SOURCE_DIR}/NativeIr.cpp"
+    "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp" "${BLUTTER_SOURCE_DIR}/ArrayLengthAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/StackCheckAnalysis.cpp")
+target_include_directories(register_inputs_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(register_inputs_test PRIVATE capstone)
+add_test(NAME register_inputs COMMAND register_inputs_test)
 
 
 
@@ -94,6 +110,6 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
 
 foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
-        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test)
+        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test native_returns_test register_inputs_test)
     blutter_instrument_test_target(${target})
 endforeach()
