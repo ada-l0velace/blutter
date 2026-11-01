@@ -334,6 +334,19 @@ class StackQuery(unittest.TestCase):
         self.assertIn('Scoped array traces: none recorded', render_text(result))
         self.assertNotIn('Getter ', render_text(result))
 
+    def test_unresolved_array_shows_only_known_later_elements(self):
+        self.graph['array_contexts'] = [{'payload': 0x2000, 'callers': [0x1010], 'scope': 'entry_block',
+            'status': 'bound_only', 'array_input': {'sp_offset': 0, 'length': 2, 'elements': [[1, 8]]},
+            'array_reads': [], 'resolutions': []}]
+        before = copy.deepcopy(self.graph)
+        text = render_text(query(self.graph, 0x2000, caller=0x1010))
+        self.assertIn('length=2; known elements: [1]=class 8', text)
+        self.assertIn('entry_block / bound_only', text)
+        self.assertIn('Scoped array traces: none recorded', text)
+        self.assertNotIn('[0]=class', text)
+        self.assertNotIn('Getter ', text)
+        self.assertEqual(self.graph, before)
+
     def test_invalid_caller_filter(self):
         for caller in (0x1018, 0x2000, 0, '0x1010', True):
             with self.subTest(caller=caller), self.assertRaises(ValueError):

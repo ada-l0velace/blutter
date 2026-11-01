@@ -190,21 +190,24 @@ def render_text(result):
             slots = [f"{key}={relation[key]:+d}" for key in ('array_sp_offset', 'index_sp_offset') if key in relation]
             lines.append('      Physical helper slots: '+', '.join(slots))
 
+    def array_input(array):
+        elements = ', '.join(f'[{index}]=class {cid}' for index, cid in array['elements'])
+        lines.append(f"    Array at entry SP{array['sp_offset']:+d}: length={array['length']}; known elements: {elements or 'none recorded'}")
+
     for call in result['calls']:
         lines += ['', f"Caller {call['site']} in {call['source']} ({call['source_label']})"]
         for value in call['stack_inputs']:
             lines.append(f"  Input SP{value['sp_offset']:+d}: {value['kind']}={value['value']}")
         for context in call['array_contexts']:
             lines.append(f"  Ordinary array context: {context['scope']} / {context['status']}")
+            array_input(context['array_input'])
         if not call['array_traces']:
             lines.append('  Scoped array traces: none recorded')
         for context in call['array_traces']:
             lines.append(f"  [{context['collection']}] {context['scope']} / {context['status']}")
             inputs = ', '.join(f"SP{v['sp_offset']:+d} {v['kind']}={v['value']}" for v in context['inputs'])
             lines.append('    Input conditions: '+(inputs or 'none recorded'))
-            array = context['array_input']
-            elements = ', '.join(f'[{index}]=class {cid}' for index, cid in array['elements'])
-            lines.append(f"    Array at entry SP{array['sp_offset']:+d}: length={array['length']}; known elements: {elements or 'none recorded'}")
+            array_input(context['array_input'])
             path = context['path_condition']
             if path:
                 lines.append(f"    Initial stack condition: {path['edge']} at {path['site']}; slow stub {path['stub']}")
