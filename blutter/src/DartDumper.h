@@ -3,6 +3,7 @@
 #include "AnalysisDiagnostics.h"
 #include <filesystem>
 #include <optional>
+#include <map>
 
 class DartDumper
 {
@@ -29,6 +30,7 @@ private:
 	void DumpSnapshotCode(const char* asm_dir);
 	std::vector<std::pair<uint64_t, uint64_t>> snapshotCodeRanges;
 	std::vector<std::pair<uint64_t, uint64_t>> recoveredCodeRanges;
+	std::map<uint64_t, std::vector<std::string>> callerResultNotes;
 #endif
 	std::string getPoolObjectDescription(intptr_t offset, bool simpleForm = true);
 

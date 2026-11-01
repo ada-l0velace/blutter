@@ -71,6 +71,10 @@ add_executable(register_inputs_test unit/register_inputs_test.cpp
 target_include_directories(register_inputs_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 target_link_libraries(register_inputs_test PRIVATE capstone)
 add_test(NAME register_inputs COMMAND register_inputs_test)
+add_executable(call_result_annotations_test unit/call_result_annotations_test.cpp "${BLUTTER_SOURCE_DIR}/CallResultAnnotations.cpp")
+target_include_directories(call_result_annotations_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(call_result_annotations_test PRIVATE capstone)
+add_test(NAME call_result_annotations COMMAND call_result_annotations_test)
 
 
 
@@ -110,6 +114,6 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
 
 foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
-        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test native_returns_test register_inputs_test)
+        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test native_returns_test register_inputs_test call_result_annotations_test)
     blutter_instrument_test_target(${target})
 endforeach()

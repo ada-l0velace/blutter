@@ -233,6 +233,7 @@ struct Edge {
 	std::vector<RegisterInput> registerInputs;
 };
 
+struct CallResultContextResult;
 class Analyzer {
 public:
 	Analyzer(Profile profile, std::vector<Payload> payloads, std::vector<Name> names,
@@ -241,7 +242,8 @@ public:
 	// reached from another payload. Their incoming aliases are not assumed.
 	void RegisterEntries(const cs_insn* instructions, size_t count);
 	std::map<uint64_t, std::string> Analyze(const cs_insn* instructions, size_t count, uint64_t payloadStart);
-	void Write(const std::string& filename) const;
+	void Write(const std::string& filename,
+		const std::function<void(const CallResultContextResult&)>& presentResults = {}) const;
 	const std::vector<Reference>& References() const { return references; }
 	const std::vector<Edge>& Edges() const { return edges; }
 private:

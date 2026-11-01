@@ -588,7 +588,8 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 	return comments;
 }
 
-void Analyzer::Write(const std::string& filename) const
+void Analyzer::Write(const std::string& filename,
+	const std::function<void(const CallResultContextResult&)>& presentResults) const
 {
 	using Bindings = std::vector<std::tuple<int64_t, std::string, uint64_t>>;
 	std::map<std::pair<uint64_t, Bindings>, std::vector<uint64_t>> groups;
@@ -843,6 +844,7 @@ void Analyzer::Write(const std::string& filename) const
 	}
 	for (const auto& context : resultContexts.contexts)
 		checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
+	if (presentResults) presentResults(resultContexts);
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
 	out << "{\"format\":" << (selectedCaller ? 25 : 24) << ",\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)

@@ -60,6 +60,8 @@ set(SRCS
 	RegisterContexts.h
 	CallResultContexts.cpp
 	CallResultContexts.h
+	CallResultAnnotations.cpp
+	CallResultAnnotations.h
 	CallEffects.cpp
 	ReceiverAnalysis.h
     SnapshotCodeRanges.h

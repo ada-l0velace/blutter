@@ -13,6 +13,7 @@
 #include <vm/heap/safepoint.h>
 #include "SnapshotCodeAnalysis.h"
 #include "SnapshotCodeRanges.h"
+#include "CallResultAnnotations.h"
 #endif
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
@@ -637,6 +638,10 @@ const std::string& DartDumper::getQuoteString(dart::Object& obj)
 void DartDumper::DumpCode(const char* out_dir)
 {
 	std::filesystem::create_directory(out_dir);
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+	// Compute checked caller-result facts before either assembly writer uses them.
+	DumpSnapshotCode(out_dir);
+#endif
 
 	Disassembler disasmer;
 
@@ -696,29 +701,32 @@ void DartDumper::DumpCode(const char* out_dir)
 						}
 						}
 
-						of << "    // ";
-
+						std::string rawPrefix = "    // ";
 						if (range.Has(asmText.addr)) {
-							of << "    ";
+							rawPrefix += "    ";
 						}
 						else {
 							while ((*il_itr)->Start() < asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
-									of << "    // ";
+									of << "    // " << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
 								}
 								++il_itr;
 							}
 							if ((*il_itr)->Start() == asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
-									of << "    //     ";
+									of << "    // " << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
+									rawPrefix += "    ";
 									range = (*il_itr)->Range();
 								}
 								++il_itr;
 							}
 						}
 
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+						if (const auto notes = callerResultNotes.find(asmText.addr); notes != callerResultNotes.end())
+							for (const auto& note : notes->second) of << "    // " << note << '\n';
+#endif
+						of << rawPrefix;
 						if (extra.empty())
 							of << std::format("{:#x}: {}\n", asmText.addr, &asmText.text[0]);
 						else
@@ -732,10 +740,9 @@ void DartDumper::DumpCode(const char* out_dir)
 
 			dartCls->PrintFoot(of);
 		}
+		of.close();
+		if (!of) throw std::runtime_error("Cannot write application assembly");
 	}
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
-	DumpSnapshotCode(out_dir);
-#endif
 }
 
 #if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
@@ -1005,6 +1012,14 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	bool comma = false;
 	uint64_t total = 0;
 	uint64_t undecoded = 0;
+	struct AssemblyPayload {
+		intptr_t table;
+		uint32_t index;
+		uint64_t start, end;
+		bool discarded, hasMetadata;
+		std::vector<std::pair<uint64_t, std::string>> comments;
+	};
+	std::vector<AssemblyPayload> assemblyPayloads;
 	for (intptr_t t = 0; !tables.IsNull() && t < tables.Length(); ++t) {
 		const auto& table = dart::InstructionsTable::Handle(thread->zone(),
 			dart::InstructionsTable::RawCast(tables.At(t)));
@@ -1029,9 +1044,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 			if (comma) manifest << ','; comma = true;
 			manifest << std::format("{{\"table\":{},\"index\":{},\"start\":{},\"end\":{},\"discarded_code\":{},\"has_metadata_name\":{}}}",
 				t, i, address, limit, i < table.rodata()->first_entry_with_code ? "true" : "false", hasMetadata ? "true" : "false");
-			assembly << std::format("\n// Table {}, entry {}, {} Code metadata; {}existing export.\n// Payload {:#x}..{:#x}\n",
-				t, i, i < table.rodata()->first_entry_with_code ? "discarded" : "retained", hasMetadata ? "" : "no ", address, limit);
-			if (!hasMetadata) assembly << std::format("// unattributed_code_{:x}\n", address);
+			AssemblyPayload printable{t, i, address, limit, i < table.rodata()->first_entry_with_code, hasMetadata, {}};
 			uint64_t cursor = address;
 			while (cursor < limit) {
 				auto instructions = disassembler.Disasm(
@@ -1043,30 +1056,60 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 						diagnostics->Report(issue);
 					else
 						throw issue;
-					const auto word = *reinterpret_cast<const uint32_t*>(app.base() + cursor);
-					assembly << std::format("    // {:#x}: .word {:#010x} ; undecoded word\n", cursor, word);
 					cursor += 4;
 					++undecoded;
 					continue;
 				}
-				const auto comments = cursor == address && instructions.Count() * 4 == limit - address
+				auto comments = cursor == address && instructions.Count() * 4 == limit - address
 					? annotations.Analyze(instructions.Insns(), instructions.Count(), address)
 					: std::map<uint64_t, std::string>{};
+				for (auto& [site, text] : comments) printable.comments.emplace_back(site, std::move(text));
 				for (size_t n = 0; n < instructions.Count(); ++n) {
 					const auto* instruction = instructions.Ptr(n);
-					assembly << std::format("    // {:#x}: {} {}", instruction->address, instruction->mnemonic, instruction->op_str);
-					if (const auto comment = comments.find(instruction->address); comment != comments.end())
-						assembly << " ; " << comment->second;
-					assembly << '\n';
 					cursor = instruction->address + instruction->size;
 				}
 			}
+			assemblyPayloads.push_back(std::move(printable));
 			++total;
 		}
 	}
 	manifest << std::format("],\"payload_count\":{},\"additional_exports\":{},\"undecoded_words\":{}}}\n",
 		total, recoveredCodeRanges.size(), undecoded);
-	annotations.Write((directory.parent_path() / "snapshot_calls.json").string());
+	annotations.Write((directory.parent_path() / "snapshot_calls.json").string(), [&](const auto& result) {
+		callerResultNotes = SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), [&](uint32_t cid) {
+			return cid < app.classes.size() && app.classes[cid] ? app.classes[cid]->Name() : std::string{};
+		});
+	});
+	// Render original words after the checked result pass. Only disassembly is
+	// repeated here; no receiver/context analysis is rerun for presentation.
+	for (const auto& payload : assemblyPayloads) {
+		assembly << std::format("\n// Table {}, entry {}, {} Code metadata; {}existing export.\n// Payload {:#x}..{:#x}\n",
+			payload.table, payload.index, payload.discarded ? "discarded" : "retained", payload.hasMetadata ? "" : "no ", payload.start, payload.end);
+		if (!payload.hasMetadata) assembly << std::format("// unattributed_code_{:x}\n", payload.start);
+		auto comment = payload.comments.begin();
+		uint64_t cursor = payload.start;
+		while (cursor < payload.end) {
+			auto instructions = disassembler.Disasm(reinterpret_cast<const uint8_t*>(app.base() + cursor), payload.end - cursor, cursor);
+			if (!instructions.Count()) {
+				const auto word = *reinterpret_cast<const uint32_t*>(app.base() + cursor);
+				assembly << std::format("    // {:#x}: .word {:#010x} ; undecoded word\n", cursor, word);
+				cursor += 4;
+				continue;
+			}
+			for (size_t n = 0; n < instructions.Count(); ++n) {
+				const auto* instruction = instructions.Ptr(n);
+				if (const auto notes = callerResultNotes.find(instruction->address); notes != callerResultNotes.end())
+					for (const auto& note : notes->second) assembly << "    // " << note << '\n';
+				assembly << std::format("    // {:#x}: {} {}", instruction->address, instruction->mnemonic, instruction->op_str);
+				while (comment != payload.comments.end() && comment->first < instruction->address) ++comment;
+				if (comment != payload.comments.end() && comment->first == instruction->address) assembly << " ; " << comment->second;
+				assembly << '\n';
+				cursor = instruction->address + instruction->size;
+			}
+		}
+	}
+	assembly.close(); manifest.close();
+	if (!assembly || !manifest) throw std::runtime_error("Cannot write snapshot assembly or inventory");
 	std::cout << std::format("Snapshot annotations: {} call/jump edges, {} pool/thread references\n",
 		annotations.Edges().size(), annotations.References().size());
 	std::cout << std::format("Snapshot code: {} payloads, {} additional anonymous exports, {} undecoded words\n",

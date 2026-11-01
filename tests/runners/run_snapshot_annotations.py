@@ -14,6 +14,7 @@ import argparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 import capstone
 from check_receiver_analysis import check_receivers
+from check_call_result_notes import expected_facts, check_stream
 
 
 def main():
@@ -40,6 +41,7 @@ def main():
                         str(root / 'blutter/src/ReceiverAnalysis.cpp'),
                         str(root / 'blutter/src/RegisterContexts.cpp'),
                         str(root / 'blutter/src/CallResultContexts.cpp'),
+                        str(root / 'blutter/src/CallResultAnnotations.cpp'),
                         str(root / 'blutter/src/CallEffects.cpp'),
                         str(root / 'blutter/src/NativeIr.cpp'),
                         str(root / 'blutter/src/Arm64Ir.cpp'),
@@ -80,6 +82,9 @@ def main():
                 BLUTTER_TEST_ANALYSIS_CALLER='' if selected_caller is None else hex(selected_caller),
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
+            with (temp / 'out.json.asm').open() as assembly:
+                rendered, _ = check_stream(assembly, expected_facts(result))
+            assert set(rendered) == expected_facts(result), 'Missing authored assembly result annotations'
             # The checker verifies inductive invariants instead of reproducing the
             # native worklist solver. Its bytes come from the assembler fixtures.
             decoder = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)

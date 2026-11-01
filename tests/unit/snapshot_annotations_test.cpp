@@ -1,6 +1,7 @@
 #include "SnapshotCodeAnalysis.h"
 #include "ReceiverAnalysis.h"
 #include <fstream>
+#include <format>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include "AnalysisSelection.h"
+#include "CallResultAnnotations.h"
 
 // Standalone harness: no Dart runtime, SDK layout, or deserializer involved.
 int main(int argc, char** argv)
@@ -120,7 +122,16 @@ int main(int argc, char** argv)
 		SnapshotAnalysis::Analyzer analyzer(std::move(profile), std::move(payloads), {{0x2000, "known_function", "function"}}, selectedCaller);
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
 		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);
-		analyzer.Write(argv[1]);
+		SnapshotAnalysis::AssemblyNotes notes;
+		analyzer.Write(argv[1], [&](const auto& result) { notes = SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()); });
+		std::ofstream assembly(std::string(argv[1]) + ".asm");
+		for (const auto& block : blocks) for (size_t n = 0; n < block.count; ++n) {
+			const auto& instruction = block.instructions.get()[n];
+			if (notes.contains(instruction.address)) for (const auto& note : notes.at(instruction.address)) assembly << "    // " << note << '\n';
+			assembly << std::format("    // {:#x}: {} {}\n", instruction.address, instruction.mnemonic, instruction.op_str);
+		}
+		assembly.close();
+		if (!assembly) throw std::runtime_error("Cannot write authored assembly fixture");
 	} catch (const std::exception& error) {
 		std::cerr << error.what() << '\n';
 		return 1;
