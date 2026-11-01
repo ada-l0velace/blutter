@@ -985,7 +985,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		default: return {"unknown", "slot kind unknown"};
 		}
 	};
-	SnapshotAnalysis::Analyzer annotations(std::move(profile), std::move(payloads), std::move(metadataNames));
+	SnapshotAnalysis::Analyzer annotations(std::move(profile), std::move(payloads), std::move(metadataNames), selectedCaller);
 	// A separate first pass records cross-payload entry points before any alias
 	// tracking. Do not carry an alias through a known incoming branch target.
 	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i) {

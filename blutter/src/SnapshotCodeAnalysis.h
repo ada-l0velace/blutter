@@ -235,7 +235,8 @@ struct Edge {
 
 class Analyzer {
 public:
-	Analyzer(Profile profile, std::vector<Payload> payloads, std::vector<Name> names);
+	Analyzer(Profile profile, std::vector<Payload> payloads, std::vector<Name> names,
+		std::optional<uint64_t> selectedCaller = {});
 	// Register all direct destinations before analysis, including destinations
 	// reached from another payload. Their incoming aliases are not assumed.
 	void RegisterEntries(const cs_insn* instructions, size_t count);
@@ -246,6 +247,7 @@ public:
 private:
 	std::optional<size_t> FindPayload(uint64_t address) const;
 	Profile profile;
+	std::optional<uint64_t> selectedCaller;
 	std::vector<Payload> payloads;
 	std::map<int64_t, PoolSlot> poolSlots;
 	std::vector<Reference> references;

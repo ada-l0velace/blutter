@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <algorithm>
+#include "AnalysisSelection.h"
 
 // Standalone harness: no Dart runtime, SDK layout, or deserializer involved.
 int main(int argc, char** argv)
@@ -113,7 +114,10 @@ int main(int argc, char** argv)
 			if ((result.resolutions.size() == 1) != (limit == 100) || (limit < 2 && !result.certificate.empty()))
 				throw std::runtime_error("Context budget published incomplete analysis");
 		}
-		SnapshotAnalysis::Analyzer analyzer(std::move(profile), std::move(payloads), {{0x2000, "known_function", "function"}});
+		std::optional<uint64_t> selectedCaller;
+		if (const auto* value = std::getenv("BLUTTER_TEST_ANALYSIS_CALLER"); value && *value)
+			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(value);
+		SnapshotAnalysis::Analyzer analyzer(std::move(profile), std::move(payloads), {{0x2000, "known_function", "function"}}, selectedCaller);
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
 		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);
 		analyzer.Write(argv[1]);

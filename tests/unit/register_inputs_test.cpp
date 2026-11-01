@@ -1,6 +1,7 @@
 #include "RegisterContexts.h"
 #include "CallEffects.h"
 #include "CallResultContexts.h"
+#include "AnalysisSelection.h"
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -27,13 +28,13 @@ std::vector<uint8_t> Bytes(const std::vector<uint32_t>& words) {
 }
 uint32_t Call(uint64_t site, uint64_t target) { return 0x94000000U | ((target-site)/4 & 0x3ffffff); }
 ReceiverAnalysisResult Analyze(const std::vector<uint32_t>& words, Profile profile = MakeProfile(),
-	const std::vector<RegisterInput>* inputs = nullptr, const std::set<uint64_t>& entries = {}) {
+	const std::vector<RegisterInput>* inputs = nullptr, const std::set<uint64_t>& entries = {}, size_t* remaining = nullptr) {
 	const auto bytes = Bytes(words); csh handle = 0;
 	if (cs_open(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, &handle) != CS_ERR_OK) throw std::runtime_error("decoder");
 	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON); cs_insn* raw = nullptr;
 	const auto count = cs_disasm(handle, bytes.data(), bytes.size(), 0x1000, 0, &raw);
 	Check(count == words.size(), "Authored words must decode completely");
-	auto result = AnalyzeReceivers(raw, count, profile, entries, nullptr, nullptr, nullptr, nullptr, false, false, false, inputs);
+	auto result = AnalyzeReceivers(raw, count, profile, entries, nullptr, remaining, nullptr, nullptr, false, false, false, inputs);
 	cs_free(raw, count); cs_close(&handle); return result;
 }
 const std::vector<uint32_t> dispatch{0xb85ff020, 0xd3485c00, 0xf8607abe, 0xd63f03c0};
@@ -129,6 +130,56 @@ int main() {
 		}
 		const auto bounded=AnalyzeRegisterContexts(many,{{0x2000,Bytes({0xaa0103e0,0xd65f03c0})}},MakeProfile(),{});
 		Check(bounded.candidateGroups==4096 && bounded.contexts.size()==4096 && bounded.droppedCallers==1,"Register group bound reports the omitted caller explicitly");
+		Check(ParseAnalysisCaller("0x1000") == 0x1000 && ParseAnalysisCaller("4096") == 0x1000 && ParseAnalysisCaller("0X1000") == 0x1000,
+			"Selected caller accepts aligned hexadecimal and decimal ELF addresses");
+		for (const auto invalid : {"", "0", "-4", "+4", "0x", "0x1001", " 4096", "4096 ", "1_000", "0x1000junk", "18446744073709551616"}) {
+			bool rejected = false;
+			try { ParseAnalysisCaller(invalid); } catch (const std::invalid_argument&) { rejected = true; }
+			Check(rejected, "Malformed selected address rejected before analysis");
+		}
+		many.clear();
+		std::map<uint64_t,std::vector<uint8_t>> callerBodies;
+		for (unsigned n=0;n<4097;++n) {
+			const uint64_t entry=0x10000+n*16;
+			Edge edge{};edge.site=entry;edge.source=entry;edge.kind="call";edge.target=0x8000;
+			many.push_back(edge);callerBodies.emplace(entry,Bytes({Call(entry,0x8000),0xd65f03c0}));
+		}
+		auto summaries=MakeProfile();summaries.provedReturnClasses[0x8000]=7;
+		const auto broad=AnalyzeCallResultContexts(many,callerBodies,summaries,{},{});
+		Check(broad.attempted==4096 && broad.contexts.size()==4096 && broad.droppedCallers==1,"Broad result budget retains its original boundary");
+		const auto focused=AnalyzeCallResultContexts(many,callerBodies,summaries,{},{},0x20000);
+		Check(focused.attempted==1 && focused.contexts.size()==1 && focused.contexts[0].payload==0x20000 && focused.droppedCallers==0,
+			"Explicit caller selection reaches the payload omitted by the broad result budget");
+		Check(focused.contexts[0].analysis.normalReturnClass==7 && focused.steps<=TargetedResultStepLimit,
+			"Selected result uses the same checked producer within its own work bound");
+		auto exactBoundary=focused;exactBoundary.exhausted=true;
+		Check(CallResultContextStatus(exactBoundary)=="added","A completed selected context remains added at the exact step limit");
+		exactBoundary.contexts.clear();
+		Check(CallResultContextStatus(exactBoundary)=="step_limit","An empty result at the work bound reports the limit");
+		exactBoundary.exhausted=false;exactBoundary.incomplete=true;
+		Check(CallResultContextStatus(exactBoundary)=="no_certificate","Incomplete selected work never reports a new context");
+		exactBoundary.incomplete=false;
+		Check(CallResultContextStatus(exactBoundary)=="no_new_facts","Completed empty selected work reports no new facts");
+		exactBoundary.candidatePayloads=0;
+		Check(CallResultContextStatus(exactBoundary)=="no_return_bindings","Missing producers remain distinct from completed empty work");
+		size_t exactSteps=2;
+		const auto completed=Analyze({0xf9401760,0xd65f03c0},MakeProfile(),nullptr,{},&exactSteps);
+		Check(!completed.certificate.empty() && completed.normalReturnClass==7 && exactSteps==0,
+			"A real receiver proof can complete on its last permitted transfer");
+		size_t shortSteps=1;
+		Check(Analyze({0xf9401760,0xd65f03c0},MakeProfile(),nullptr,{},&shortSteps).certificate.empty(),
+			"One transfer short of completion cannot publish that proof");
+		Check(AnalyzeCallResultContexts(many,callerBodies,MakeProfile(),{},{},0x20000).attempted==0,
+			"Selection cannot create missing producer summaries");
+		Check(AnalyzeCallResultContexts(many,{},summaries,{},{},0x20000).attempted==0,
+			"Selection cannot create missing original bytes");
+		Check(AnalyzeCallResultContexts(many,callerBodies,summaries,{0x20004},{},0x20000).contexts.empty(),
+			"Selected result still rejects an alternate entry that bypasses its producer");
+		callerBodies[0x20000]={0xff,0xff,0xff,0xff};
+		bool decodeRejected=false;
+		try { AnalyzeCallResultContexts(many,callerBodies,summaries,{},{},0x20000); }
+		catch (const std::runtime_error&) { decodeRejected=true; }
+		Check(decodeRejected,"Selected undecodable bytes report an error instead of a success");
 		std::cout << checks << " register and return checks passed\n";
 	} catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

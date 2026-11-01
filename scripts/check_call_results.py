@@ -4,9 +4,32 @@
 def check_result_bindings(graph, machine_returns):
     contexts = graph.get('call_result_contexts', [])
     assert graph.get('format', 4) >= 24 or not contexts
-    assert len(contexts) <= 4096
     edges = {e['site']: e for e in graph['edges']}
     nodes = {n['start'] for n in graph['nodes']}
+    targeted = graph.get('targeted_call_result_analysis')
+    assert len(contexts) <= 4096 + (1 if targeted else 0)
+    if targeted is not None:
+        assert graph.get('format', 4) >= 25
+        assert set(targeted) == {'payload', 'status', 'candidate_payloads', 'attempted_payloads',
+                                 'transfer_steps', 'payload_limit', 'step_limit'}
+        assert type(targeted['payload']) is int and targeted['payload'] in nodes
+        assert targeted['payload'] > 0 and targeted['payload'] % 4 == 0
+        for key in ('candidate_payloads', 'attempted_payloads', 'transfer_steps', 'payload_limit', 'step_limit'):
+            assert type(targeted[key]) is int
+        assert targeted['payload_limit'] == 1 and targeted['step_limit'] == 1000000
+        assert 0 <= targeted['attempted_payloads'] <= targeted['candidate_payloads'] <= 1
+        assert 0 <= targeted['transfer_steps'] <= targeted['step_limit']
+        status = targeted['status']
+        assert status in ('added', 'already_recorded', 'no_retained_bytes', 'unsupported_return_abi',
+                          'no_return_bindings', 'no_new_facts', 'no_certificate', 'step_limit')
+        present = any(c['payload'] == targeted['payload'] for c in contexts)
+        assert present == (status in ('added', 'already_recorded'))
+        if status in ('added', 'no_new_facts', 'no_certificate', 'step_limit'):
+            assert targeted['candidate_payloads'] == targeted['attempted_payloads'] == 1
+        else:
+            assert targeted['candidate_payloads'] == targeted['attempted_payloads'] == targeted['transfer_steps'] == 0
+        if status == 'step_limit':
+            assert targeted['transfer_steps'] == targeted['step_limit']
     conditional = {}
     for context in graph.get('register_contexts', []):
         cid = context['normal_return_class']

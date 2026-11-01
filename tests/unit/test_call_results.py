@@ -66,6 +66,47 @@ class CallResults(unittest.TestCase):
         self.assertIn('Separate caller result propagation', render(result))
         self.assertIn('[register_context]', render(result))
 
+    def selected(self, status='added'):
+        self.graph['format'] = 25
+        self.graph['targeted_call_result_analysis'] = {
+            'payload': 0x1000, 'status': status, 'candidate_payloads': 1,
+            'attempted_payloads': 1, 'transfer_steps': 5, 'payload_limit': 1, 'step_limit': 1000000}
+
+    def test_selected_context_uses_the_same_independent_checks(self):
+        self.selected()
+        self.assertEqual(self.check()['call_result_contexts_checked'], 1)
+        self.graph['call_result_contexts'][0]['return_bindings'][0]['class_id'] = 8
+        with self.assertRaises(AssertionError): self.check()
+
+    def test_complete_selected_context_is_valid_at_the_exact_step_limit(self):
+        self.selected()
+        self.graph['targeted_call_result_analysis']['transfer_steps'] = 1000000
+        self.assertEqual(self.check()['call_result_contexts_checked'], 1)
+
+    def test_selected_metadata_cannot_hide_missing_context_or_change_scope(self):
+        for field, value in [('payload', 0x1004), ('payload', True), ('status', 'complete'),
+                             ('status', 'no_new_facts'), ('payload_limit', 2), ('step_limit', 20000000),
+                             ('attempted_payloads', 0), ('transfer_steps', 1000001), ('transfer_steps', True)]:
+            with self.subTest(field=field, value=value):
+                self.setUp(); self.selected()
+                self.graph['targeted_call_result_analysis'][field] = value
+                with self.assertRaises(AssertionError): self.check()
+        self.setUp(); self.selected(); self.graph['call_result_contexts'] = []
+        with self.assertRaises(AssertionError): self.check()
+
+    def test_selected_failures_do_not_publish_an_invented_context(self):
+        for status in ('no_return_bindings', 'no_retained_bytes', 'unsupported_return_abi'):
+            with self.subTest(status=status):
+                self.setUp(); self.selected(status); self.graph['call_result_contexts'] = []
+                self.graph['targeted_call_result_analysis'].update(candidate_payloads=0, attempted_payloads=0, transfer_steps=0)
+                check_result_bindings(self.graph, {})
+
+    def test_selected_query_explains_status_without_changing_graph(self):
+        self.selected(); before = copy.deepcopy(self.graph)
+        result = query(self.graph, 0x1004)
+        self.assertIn('Selected caller 0x1000: added', render(result))
+        self.assertEqual(self.graph, before)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -8,7 +8,8 @@
 namespace SnapshotAnalysis {
 CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges,
 	const std::map<uint64_t, std::vector<uint8_t>>& bytes, Profile profile,
-	const std::set<uint64_t>& externalEntries, const RegisterContextResult& registers)
+	const std::set<uint64_t>& externalEntries, const RegisterContextResult& registers,
+	std::optional<uint64_t> selectedPayload)
 {
 	CallResultContextResult result;
 	if (profile.wordReturnRegister != ARM64_REG_X0) return result;
@@ -25,6 +26,7 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 	std::map<uint64_t, const Edge*> bySite;
 	for (const auto& edge : edges) {
 		bySite.emplace(edge.site, &edge);
+		if (selectedPayload && edge.source != *selectedPayload) continue;
 		if (edge.kind != "call" || !edge.target || !bytes.contains(edge.source) || profile.allocationReturns.contains(*edge.target) || profile.nonReturningCalls.contains(*edge.target)) continue;
 		const auto known = profile.provedReturnClasses.find(*edge.target);
 		const auto bound = conditional.find(edge.site);
@@ -38,7 +40,8 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 	struct Decoder { csh handle = 0; ~Decoder() { if (handle) cs_close(&handle); } } decoder;
 	if (cs_open(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN, &decoder.handle) != CS_ERR_OK ||
 		cs_option(decoder.handle, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) throw std::runtime_error("Cannot initialize call-result decoder");
-	size_t remaining = 20000000;
+	const size_t stepLimit = selectedPayload ? TargetedResultStepLimit : 20000000;
+	size_t remaining = stepLimit;
 	for (const auto& [entry, bindings] : groups) {
 		if (!remaining) break;
 		++result.attempted;
@@ -47,8 +50,12 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 		const auto& body = bytes.at(entry); cs_insn* raw = nullptr;
 		const auto count = cs_disasm(decoder.handle, body.data(), body.size(), entry, 0, &raw);
 		const std::shared_ptr<cs_insn> owner(raw, [count](cs_insn* p) { cs_free(p, count); });
-		if (count*4 != body.size()) continue;
+		if (count*4 != body.size()) {
+			if (selectedPayload) throw std::runtime_error("Cannot decode selected caller payload");
+			continue;
+		}
 		auto analysis = AnalyzeReceivers(raw, count, profile, externalEntries, nullptr, &remaining);
+		if (analysis.certificate.empty()) result.incomplete = true;
 		bool gain = false;
 		for (auto it = analysis.resolutions.begin(); it != analysis.resolutions.end();) {
 			const auto old = bySite.find(it->first);
@@ -72,7 +79,8 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 		if (analysis.normalReturnClass && !profile.provedReturnClasses.contains(entry)) gain = true;
 		if (gain && !analysis.certificate.empty()) result.contexts.push_back({entry, bindings, std::move(analysis)});
 	}
-	result.steps = 20000000-remaining;
+	result.steps = stepLimit-remaining;
+	result.exhausted = !remaining;
 	return result;
 }
 void WriteCallResultContexts(std::ostream& out, const CallResultContextResult& result)

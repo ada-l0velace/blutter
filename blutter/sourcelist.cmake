@@ -54,6 +54,7 @@ set(SRCS
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
     NativeReturnContracts.h
+    AnalysisSelection.h
 	ReceiverAnalysis.cpp
 	RegisterContexts.cpp
 	RegisterContexts.h

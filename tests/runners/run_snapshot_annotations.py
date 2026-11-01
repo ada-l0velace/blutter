@@ -47,7 +47,7 @@ def main():
                         str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -77,6 +77,7 @@ def main():
             subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
                 BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
                 BLUTTER_TEST_NATIVE_RETURNS='1' if native_returns else '0',
+                BLUTTER_TEST_ANALYSIS_CALLER='' if selected_caller is None else hex(selected_caller),
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
             # The checker verifies inductive invariants instead of reproducing the
@@ -1445,6 +1446,8 @@ def main():
         assert not resolved(d) and all(e['payload'] not in (0xd000, 0xe000) for e in d['call_effects'])
         from register_context_cases import exercise_register_contexts
         exercise_register_contexts(run)
+        from targeted_caller_cases import exercise_targeted_callers
+        exercise_targeted_callers(run)
         invalid = [str(executable), str(temp / 'invalid.json'), '0x1000', str(temp / '4096.bin'), '0x1000', str(temp / '4096.bin')]
         if args.memcheck:
             invalid = ['valgrind', '--quiet', '--error-exitcode=97', '--leak-check=full',

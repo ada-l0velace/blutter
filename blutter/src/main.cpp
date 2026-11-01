@@ -4,6 +4,7 @@
 #include "CodeAnalyzer.h"
 #include "FridaWriter.h"
 #include "args.hxx"
+#include "AnalysisSelection.h"
 #include <filesystem>
 #include <fstream>
 
@@ -24,11 +25,19 @@ int main(int argc, char** argv)
 	args::Group reqGrp(parser, "Required arguments", args::Group::Validators::All);
 	args::ValueFlag<std::string> infile(reqGrp, "infile", "libapp file", { 'i', "in" });
 	args::ValueFlag<std::string> outdir(reqGrp, "outdir", "out path", { 'o', "out"});
+	args::ValueFlag<std::string> analysisCaller(parser, "ELF address", "Supplement call-result analysis for one native payload start", { "analysis-caller" });
 	AnalysisDiagnostics diagnostics(std::cerr);
 	std::filesystem::path outDir;
 
 	try {
 		parser.ParseCLI(argc, argv);
+		std::optional<uint64_t> selectedCaller;
+		if (analysisCaller) {
+			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(args::get(analysisCaller));
+#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+			throw std::runtime_error("Selected caller analysis requires a supported native instructions-table profile");
+#endif
+		}
 
 		auto& libappPath = args::get(infile);
 
@@ -56,7 +65,7 @@ int main(int argc, char** argv)
 		analyzer.AnalyzeAll();
 #endif
 
-		DartDumper dumper{ app, &diagnostics };
+		DartDumper dumper{ app, &diagnostics, selectedCaller };
 #if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
 			dumper.DumpCoverageAudit(audit);

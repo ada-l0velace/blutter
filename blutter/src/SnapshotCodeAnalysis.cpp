@@ -218,8 +218,9 @@ std::optional<IndexExpression> IndexResult(const cs_insn& instruction,
 }
 }
 
-Analyzer::Analyzer(Profile config, std::vector<Payload> ranges, std::vector<Name> names)
-	: profile(std::move(config)), payloads(std::move(ranges))
+Analyzer::Analyzer(Profile config, std::vector<Payload> ranges, std::vector<Name> names,
+	std::optional<uint64_t> selected)
+	: profile(std::move(config)), selectedCaller(selected), payloads(std::move(ranges))
 {
 	if (RegNumber(profile.poolRegister) < 0 || RegNumber(profile.threadRegister) < 0 ||
 		RegNumber(profile.poolRegister) == RegNumber(profile.threadRegister) ||
@@ -232,6 +233,9 @@ Analyzer::Analyzer(Profile config, std::vector<Payload> ranges, std::vector<Name
 		if (payloads[i].end <= payloads[i].start || (i && payloads[i-1].end > payloads[i].start))
 			throw std::runtime_error("Overlapping or unsorted snapshot payloads");
 	}
+	if (selectedCaller && (!*selectedCaller || *selectedCaller % 4 ||
+		std::none_of(payloads.begin(), payloads.end(), [&](const auto& p) { return p.start == *selectedCaller; })))
+		throw std::runtime_error("Analysis caller must identify an original native payload start");
 	std::sort(names.begin(), names.end(), [](const auto& a, const auto& b) {
 		return std::tie(a.address, a.kind, a.text) < std::tie(b.address, b.kind, b.text);
 	});
@@ -824,12 +828,24 @@ void Analyzer::Write(const std::string& filename) const
 	resultProfile.provedReturnClasses = machineReturnClasses;
 	for (const auto& [entry, certificate] : registerContexts.effects) resultProfile.frameSafeCallees.insert(entry);
 	resultProfile.forwardedReturnInputs.insert(registerContexts.forwardedInputs.begin(), registerContexts.forwardedInputs.end());
-	const auto resultContexts = AnalyzeCallResultContexts(edges, contextBytes, std::move(resultProfile), receiverEntries, registerContexts);
+	auto resultContexts = AnalyzeCallResultContexts(edges, contextBytes, selectedCaller ? resultProfile : std::move(resultProfile), receiverEntries, registerContexts);
+	CallResultContextResult targeted;
+	std::string targetedStatus;
+	if (selectedCaller) {
+		if (std::ranges::any_of(resultContexts.contexts, [&](const auto& c) { return c.payload == *selectedCaller; })) targetedStatus = "already_recorded";
+		else if (!contextBytes.contains(*selectedCaller)) targetedStatus = "no_retained_bytes";
+		else if (profile.wordReturnRegister != ARM64_REG_X0) targetedStatus = "unsupported_return_abi";
+		else {
+			targeted = AnalyzeCallResultContexts(edges, contextBytes, std::move(resultProfile), receiverEntries, registerContexts, selectedCaller);
+			targetedStatus = CallResultContextStatus(targeted);
+			for (auto& context : targeted.contexts) resultContexts.contexts.push_back(std::move(context));
+		}
+	}
 	for (const auto& context : resultContexts.contexts)
 		checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":24,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":" << (selectedCaller ? 25 : 24) << ",\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -1184,6 +1200,9 @@ void Analyzer::Write(const std::string& filename) const
 	out << ",\"call_result_contexts\":"; WriteCallResultContexts(out, resultContexts);
 	out << ",\"call_result_analysis\":{\"candidate_payloads\":" << resultContexts.candidatePayloads << ",\"attempted_payloads\":" << resultContexts.attempted
 		<< ",\"transfer_steps\":" << resultContexts.steps << ",\"dropped_callers\":" << resultContexts.droppedCallers << ",\"payload_limit\":4096,\"step_limit\":20000000}";
+	if (selectedCaller) out << ",\"targeted_call_result_analysis\":{\"payload\":" << *selectedCaller << ",\"status\":" << Quoted(targetedStatus)
+		<< ",\"candidate_payloads\":" << targeted.candidatePayloads << ",\"attempted_payloads\":" << targeted.attempted
+		<< ",\"transfer_steps\":" << targeted.steps << ",\"payload_limit\":1,\"step_limit\":" << TargetedResultStepLimit << '}';
 	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Frame-only callee effects preserve caller-frame classes. Checked length leaves can additionally preserve unwritten working registers and selected array contents; no source return type is inferred. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. native_return records are conditional matched-SDK result classes at direct calls, with no caller-frame, register or mutable-heap preservation implied. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block and checked unique length-call continuations. Other calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block or checked entry-chain read certificate. length_proved records require a checked length-call result. Exact-target length leaves preserve contents only with a verified argument root and register-write mask at an untargeted immediate normal-return block. Packed values and saved index words are dropped there. Other calls and branch boundaries discard contents; entry backedges disable this consumer. array_path_contexts additionally require their explicit initial-stack-check fallthrough condition, checked against the matched SDK offset and slow stub. They exclude the initial slow edge only; the runtime stub has no asserted heap-preservation contract. They never replace unconditional array_contexts or global dispatch facts. array_entry_traces additionally describe one non-revisiting entry prefix ending at its first proved indexed result. Every chosen branch is concrete or an explicit checked stack condition; later iterations and post-getter execution are outside that scope. array_result_traces separately follow the getter result to the first later call, retaining scalar class/register data provenance and expiring array contents, prior input bindings and spills at the getter. Their stopped indirect target must derive from the result; unrelated or intervening calls produce no result-use claim. prefix_call_effects contain separately proved small callees requested by exact array-bound prefix calls. An interior helper must be an aligned dispatch-table entry within retained payload bytes; containing_payload identifies its unchanged native container and only the entry-to-end suffix is proved. They supplement entry/result traces only, with independent bounded work; original broad effects and ordinary contexts keep their original budgets and assumptions. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. register_inputs additionally observe full-width heap classes in nonreserved X0 through X14; they are not source signatures. register_contexts have separate bounded work, explicit entry bindings, independent frame proofs and no promotion of conditional results to global helper types. Backward register liveness and observed callee stack loads select relevant bindings without proving types. return_classes describe individual normal RET sites; machine_return_classes additionally require a closed body and agreement at every reached normal return. These result-only summaries grant no preservation effects. call_result_contexts separately consume global or caller-qualified helper results at exact original direct BL sites; their derived caller facts never feed back into the producer proofs. Old scalar/array contexts retain their own inputs and budgets. Dropped register/result callers are counted explicitly. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
 }
 }

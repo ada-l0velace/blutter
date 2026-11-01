@@ -21,13 +21,29 @@ PKG_LIB_DIR = os.path.join(SCRIPT_DIR, 'packages', 'lib')
 BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
 
 
+def analysis_caller_address(value):
+    try:
+        base = 16 if value.startswith(('0x', '0X')) else 10
+        digits = value[2:] if base == 16 else value
+        alphabet = '0123456789abcdefABCDEF' if base == 16 else '0123456789'
+        if not digits or any(c not in alphabet for c in digits):
+            raise ValueError()
+        address = int(digits, base)
+        if not 0 < address < 1 << 64 or address % 4:
+            raise ValueError()
+        return address
+    except (ValueError, AttributeError, TypeError):
+        raise argparse.ArgumentTypeError('Analysis caller must be a positive, aligned ELF virtual address') from None
+
+
 class BlutterInput:
-    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
         self.libapp_path = libapp_path
         self.dart_info = dart_info
         self.outdir = outdir
         self.rebuild_blutter = rebuild_blutter
         self.create_vs_sln = create_vs_sln
+        self.analysis_caller = analysis_caller
 
         vers = dart_info.version.split('.', 2)
         if int(vers[0]) == 2 and int(vers[1]) < 15:
@@ -220,6 +236,8 @@ def build_and_run(input: BlutterInput):
         blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
         dbg_output_path = os.path.abspath(os.path.join(input.outdir, 'out'))
         dbg_cmd_args = f'-i {input.libapp_path} -o {dbg_output_path}'
+        if input.analysis_caller is not None:
+            dbg_cmd_args += f' --analysis-caller {input.analysis_caller:#x}'
 
         vscmd_ver = os.getenv('VSCMD_VER')
         assert vscmd_ver is not None, "Need run blutter in Visual Studio Develeper console"
@@ -243,27 +261,30 @@ def build_and_run(input: BlutterInput):
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
 
         # execute blutter    
-        subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
+        command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir]
+        if input.analysis_caller is not None:
+            command += ['--analysis-caller', hex(input.analysis_caller)]
+        subprocess.run(command, check=True)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
     version, os_name, arch = dart_version.split('_')
     dart_info = DartLibInfo(version, os_name, arch)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
     build_and_run(input)
     
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
     dart_info = get_dart_lib_info(libapp_path, libflutter_path)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
     build_and_run(input)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
     if indir.endswith(".apk"):
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
 
 
 if __name__ == "__main__":
@@ -276,11 +297,13 @@ if __name__ == "__main__":
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
+    parser.add_argument('--analysis-caller', type=analysis_caller_address,
+                        help='Supplement call-result analysis for one native payload start (ELF address, e.g. 0x1000)')
     # rare usage scenario
     parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
     args = parser.parse_args()
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller)

@@ -2,11 +2,13 @@
 #include "DartApp.h"
 #include "AnalysisDiagnostics.h"
 #include <filesystem>
+#include <optional>
 
 class DartDumper
 {
 public:
-	DartDumper(DartApp& app, AnalysisDiagnostics* diagnostics = nullptr) : app(app), diagnostics(diagnostics) {};
+	DartDumper(DartApp& app, AnalysisDiagnostics* diagnostics = nullptr, std::optional<uint64_t> selectedCaller = {})
+		: app(app), diagnostics(diagnostics), selectedCaller(selectedCaller) {};
 
 	void Dump4Ida(std::filesystem::path outDir);
 
@@ -39,6 +41,7 @@ private:
 
 	DartApp& app;
 	AnalysisDiagnostics* diagnostics;
+	std::optional<uint64_t> selectedCaller;
 	// map for object ptr to unescape string with quote
 	std::unordered_map<intptr_t, std::string> quoteStringCache;
 };
