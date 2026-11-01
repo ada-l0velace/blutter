@@ -10,6 +10,33 @@
 
 namespace arm64_patterns {
 
+inline bool NativeCallGuard(std::span<const cs_insn> insns, arm64_reg temporary,
+	arm64_reg thread, int64_t stateOffset, uint16_t trap, arm64_reg target)
+{
+	if (insns.size() < 4 || temporary == target || temporary == thread ||
+		insns[0].address > std::numeric_limits<uint64_t>::max() - 12)
+		return false;
+	for (size_t i = 0; i < 4; ++i)
+		if (!insns[i].detail || insns[i].size != 4 || insns[i].address != insns[0].address + i * 4)
+			return false;
+	const auto& load = insns[0].detail->arm64;
+	const auto& branch = insns[1].detail->arm64;
+	const auto& breakpoint = insns[2].detail->arm64;
+	const auto& call = insns[3].detail->arm64;
+	return insns[0].id == ARM64_INS_LDR && load.op_count == 2 && !load.writeback &&
+		load.operands[0].type == ARM64_OP_REG && load.operands[0].reg == temporary &&
+		load.operands[1].type == ARM64_OP_MEM && load.operands[1].mem.base == thread &&
+		load.operands[1].mem.index == ARM64_REG_INVALID && load.operands[1].mem.disp == stateOffset &&
+		insns[1].id == ARM64_INS_CBZ && branch.op_count == 2 &&
+		branch.operands[0].type == ARM64_OP_REG && branch.operands[0].reg == temporary &&
+		branch.operands[1].type == ARM64_OP_IMM &&
+		static_cast<uint64_t>(branch.operands[1].imm) == insns[3].address &&
+		insns[2].id == ARM64_INS_BRK && breakpoint.op_count == 1 &&
+		breakpoint.operands[0].type == ARM64_OP_IMM && breakpoint.operands[0].imm == trap &&
+		insns[3].id == ARM64_INS_BLR && call.op_count == 1 &&
+		call.operands[0].type == ARM64_OP_REG && call.operands[0].reg == target;
+}
+
 inline bool IsRegisterMove(const cs_insn& insn, arm64_reg source)
 {
 	if (insn.id != ARM64_INS_MOV || !insn.detail) return false;

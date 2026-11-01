@@ -83,6 +83,7 @@ def machine_returns(graph):
     metadata = graph.get('receiver_metadata', {})
     forbidden = set(dict(metadata.get('allocation_returns', []))) | set(dict(metadata.get('nonreturning_calls', [])))
     forbidden.update(row[0] for row in metadata.get('native_return_classes', []))
+    forbidden.update(row[0] for row in metadata.get('sdk_stub_return_classes', []))
     values = {}
     for entry, cid in rows:
         assert type(entry) is int and entry > 0 and entry % 4 == 0 and entry not in values and entry not in forbidden

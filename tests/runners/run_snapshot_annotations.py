@@ -41,6 +41,7 @@ def main():
                         str(root / 'blutter/src/ReceiverAnalysis.cpp'),
                         str(root / 'blutter/src/RegisterContexts.cpp'),
                         str(root / 'blutter/src/CallResultContexts.cpp'),
+                        str(root / 'blutter/src/SdkStubResultAnalysis.cpp'),
                         str(root / 'blutter/src/CallResultAnnotations.cpp'),
                         str(root / 'blutter/src/CallEffects.cpp'),
                         str(root / 'blutter/src/NativeIr.cpp'),
@@ -49,7 +50,7 @@ def main():
                         str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None, sdk_stub_returns=False):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -79,6 +80,7 @@ def main():
             subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
                 BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
                 BLUTTER_TEST_NATIVE_RETURNS='1' if native_returns else '0',
+                BLUTTER_TEST_SDK_STUB_RETURNS='1' if sdk_stub_returns else '0',
                 BLUTTER_TEST_ANALYSIS_CALLER='' if selected_caller is None else hex(selected_caller),
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
             result = json.loads((temp / 'out.json').read_text())
@@ -117,8 +119,43 @@ def main():
                      'owns_code': True, 'recognized_kind': kind, 'native_name': name, 'library_uri': 'dart:_internal'}
                     for entry, kind, name in [(0xd000, 17, 'Internal_allocateOneByteString'),
                                               (0xe000, 23, 'Internal_allocateTwoByteString')]]
+            if sdk_stub_returns:
+                audit.update(sdk_stub_return_sdk=[['allocate_growable_array', 5]],
+                             sdk_stub_return_reference={'entry': 0xf000, 'end': 0xf008, 'kind': 'allocate_growable_array'},
+                             sdk_stub_return_identities=[{'entry': 0xf000, 'payload': 0xf000, 'end': 0xf008,
+                                                          'kind': 'allocate_growable_array'}],
+                             known_stubs=[{'entry': 0xf000, 'size': 8}])
             def verify(value):
+                if sdk_stub_returns:
+                    from check_snapshot_annotations import decode_payload
+                    return check_receivers(value, read, lambda raw, address: decode_payload(decoder, raw, address), audit)
                 return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
+            if name == 'sdk-stub-return-wrapper':
+                for defect in ('summary-class', 'producer-basis', 'caller-basis', 'producer-site',
+                               'phase-budget', 'missing-summary', 'ordinary-promotion', 'duplicate-producer'):
+                    forged = copy.deepcopy(result)
+                    if defect == 'summary-class':
+                        forged['sdk_stub_return_summaries'][0][1] = 6
+                    elif defect == 'producer-basis':
+                        forged['sdk_stub_producer_contexts'][0]['return_bindings'][0]['basis'] = 'sdk_stub_summary'
+                    elif defect == 'caller-basis':
+                        forged['sdk_stub_caller_contexts'][0]['return_bindings'][0]['basis'] = 'machine_return_summary'
+                    elif defect == 'producer-site':
+                        forged['sdk_stub_producer_contexts'][0]['return_bindings'][0]['site'] += 4
+                    elif defect == 'phase-budget':
+                        forged['sdk_stub_result_analysis']['producers']['transfer_steps'] = 20000001
+                    elif defect == 'missing-summary':
+                        forged['sdk_stub_return_summaries'] = []
+                    elif defect == 'ordinary-promotion':
+                        forged['receiver_metadata']['machine_return_classes'].append([0x5000, 5])
+                    else:
+                        forged['sdk_stub_producer_contexts'] *= 2
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('sdk-stub-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged SDK result relation: '+defect)
             if name == 'prefix-interior-dispatch-entries':
                 assert len(result['prefix_call_effects']) == 2, 'Interior helper proofs missing'
                 for defect in ('missing-parent', 'wrong-parent', 'unrecorded-entry', 'legacy-scope', 'legacy-format', 'boolean-parent'):
@@ -1450,6 +1487,31 @@ def main():
                             'ldur x0, [x29, #-8]'] + native_dispatch, native_bodies, native_returns=True)
         assert not resolved(d) and all(e['payload'] not in (0xd000, 0xe000) for e in d['call_effects'])
         from register_context_cases import exercise_register_contexts
+        for name, middle, expected in [('result', [], True), ('overwrite', ['mov x0, x2'], False),
+                                        ('unknown-call', ['bl 0x5000'], False)]:
+            d = run('sdk-stub-return-'+name, ['bl 0xf000'] + middle + native_dispatch,
+                    {0xf000: ['svc #0', 'ret'], 0x5000: ['ret']}, sdk_stub_returns=True)
+            assert bool([v for c in d['sdk_stub_producer_contexts'] for v in c['resolutions']]) == expected
+            assert sum(e.get('sdk_stub_return') is not None for e in d['edges']) == 1
+        d = run('sdk-stub-return-caller-spill-killed',
+                prologue + ['ldr x0, [x27, #40]', 'stur x0, [x29, #-8]', 'bl 0xf000',
+                            'ldur x0, [x29, #-8]'] + native_dispatch,
+                {0xf000: ['svc #0', 'ret']}, sdk_stub_returns=True)
+        assert not resolved(d)
+        d = run('sdk-stub-return-wrapper', prologue + ['bl 0x5000'] + epilogue,
+                {0x5000: prologue + ['bl 0xf000'] + epilogue, 0xf000: ['svc #0', 'ret']}, sdk_stub_returns=True)
+        assert dict(d['sdk_stub_return_summaries']).get(0x5000) == 5
+        recovered = run('sdk-stub-return-ldtr-producer', prologue + ['bl 0xf000', 'ldtr x8, [x8]'] + epilogue,
+                        {0xf000: ['svc #0', 'ret']}, sdk_stub_returns=True)
+        assert dict(recovered['sdk_stub_return_summaries']).get(0x1000) == 5
+        recovered = run('sdk-stub-return-ldtr-caller', prologue + ['bl 0x5000', 'ldtr x8, [x8]'] + epilogue,
+                        {0x5000: prologue + ['bl 0xf000'] + epilogue, 0xf000: ['svc #0', 'ret']}, sdk_stub_returns=True)
+        assert any(c['payload'] == 0x1000 and c['normal_return_class'] == 5 for c in recovered['sdk_stub_caller_contexts'])
+        baseline = run('sdk-stub-return-ordinary-baseline', prologue + ['bl 0x5000'] + epilogue,
+                       {0x5000: prologue + ['bl 0xf000'] + epilogue, 0xf000: ['svc #0', 'ret']})
+        for field in ('call_result_contexts', 'call_result_analysis', 'register_contexts', 'register_context_analysis',
+                      'call_contexts', 'context_analysis', 'array_contexts', 'array_context_analysis'):
+            assert d[field] == baseline[field], 'SDK work displaced ordinary analysis'
         exercise_register_contexts(run)
         from targeted_caller_cases import exercise_targeted_callers
         exercise_targeted_callers(run)

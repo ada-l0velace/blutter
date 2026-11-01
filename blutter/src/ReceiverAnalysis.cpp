@@ -374,7 +374,11 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 			profile.allocationReturns.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
 	for (const auto& [entry, cid] : profile.provedReturnClasses)
 		if (!entry || entry % 4 || !cid || cid > Mask(profile.classIdBits) || profile.nativeReturnClasses.contains(entry) ||
-			profile.allocationReturns.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
+			profile.sdkStubReturnClasses.contains(entry) || profile.allocationReturns.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
+	for (const auto& [entry, value] : profile.sdkStubReturnClasses)
+		if (profile.wordReturnRegister != ARM64_REG_X0 || !entry || entry % 4 || !value.classId || value.classId > Mask(profile.classIdBits) ||
+			value.kind != SdkStubReturnKind::GrowableArray || profile.allocationReturns.contains(entry) ||
+			profile.nativeReturnClasses.contains(entry) || profile.nonReturningCalls.contains(entry)) return result;
 	for (const auto& [offset, cid] : profile.threadHeapClasses) if (cid > Mask(profile.classIdBits)) return result;
 	for (const auto& [entry, contract] : profile.nonReturningCalls)
 		if (contract != "range_error_without_fpu" || profile.allocationReturns.contains(entry) || profile.framePreservingCalls.contains(entry) || profile.frameSafeCallees.contains(entry)) return result;
@@ -409,6 +413,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		if (!i.detail || i.id != ARM64_INS_BL || i.detail->arm64.op_count != 1 || i.detail->arm64.operands[0].type != ARM64_OP_IMM ||
 			static_cast<uint64_t>(i.detail->arm64.operands[0].imm) != value.callee || profile.allocationReturns.contains(value.callee) || profile.nonReturningCalls.contains(value.callee) ||
 			(profile.nativeReturnClasses.contains(value.callee) && profile.nativeReturnClasses.at(value.callee).classId != value.classId) ||
+			(profile.sdkStubReturnClasses.contains(value.callee) && profile.sdkStubReturnClasses.at(value.callee).classId != value.classId) ||
 			(profile.provedReturnClasses.contains(value.callee) && profile.provedReturnClasses.at(value.callee) != value.classId)) return result;
 	}
 	if (initialPath) {
@@ -818,6 +823,9 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				const auto native = profile.nativeReturnClasses.find(d.operands[0].imm);
 				if (profile.wordReturnRegister == ARM64_REG_X0 && native != profile.nativeReturnClasses.end())
 					state.regs[0] = {Object, native->second.classId, 0, 0, {i.address}};
+				const auto sdk = profile.sdkStubReturnClasses.find(d.operands[0].imm);
+				if (profile.consumeSdkStubReturns && profile.wordReturnRegister == ARM64_REG_X0 && sdk != profile.sdkStubReturnClasses.end())
+					state.regs[0] = {Object, sdk->second.classId, 0, 0, {i.address}};
 				const auto returned = profile.provedReturnClasses.find(d.operands[0].imm);
 				if (profile.wordReturnRegister == ARM64_REG_X0 && returned != profile.provedReturnClasses.end())
 					state.regs[0] = {Object, returned->second, 0, 0, {i.address}};

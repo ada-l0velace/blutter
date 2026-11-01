@@ -4,7 +4,10 @@ import shutil
 import stat
 import subprocess
 import sys
-from reader_profiles import reader_profile, SHOREBIRD_BASE
+import re
+import uuid
+from reader_profiles import reader_profile, runtime_profile, RUNTIME_PROFILES
+from reader_cache import source_snapshot_hash, write_verified, library_path
 
 # assume git and cmake (64 bits) command is in PATH
 GIT_CMD = "git"
@@ -35,6 +38,10 @@ def load_source(modname, filename):
 
 class DartLibInfo:
     def __init__(self, version: str, os_name: str, arch: str, has_compressed_ptrs = None, snapshot_hash = None):
+        if (not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?', version) or
+                os_name not in ('android', 'ios') or arch not in ('arm64', 'x64') or
+                snapshot_hash is not None and not re.fullmatch(r'[0-9a-f]{32}', snapshot_hash)):
+            raise ValueError('Invalid Dart reader version, target or snapshot identifier')
         self.version = version
         self.os_name = os_name
         self.arch = arch
@@ -49,7 +56,13 @@ class DartLibInfo:
         self.sdk_key = version
         if self.reader_profile:
             self.sdk_key += f'_shorebird_{snapshot_hash}_{os_name}_{arch}_cp'
+        elif not self.has_compressed_ptrs:
+            self.sdk_key += '_no_compressed_ptrs'
         self.lib_name = f'dartvm{self.sdk_key}_{os_name}_{arch}'
+
+
+class ReaderSourceMismatch(RuntimeError):
+    pass
 
 
 def checkout_dart(info: DartLibInfo):
@@ -72,10 +85,11 @@ def checkout_dart(info: DartLibInfo):
         # since Dart 3.3 "third_party/double-conversion" is moved to outside of "runtime" directory
         subprocess.run([GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'], cwd=clonedir, check=True)
         if info.reader_profile:
+            profile = runtime_profile(info.reader_profile)
             revision = subprocess.check_output([GIT_CMD, 'rev-parse', 'HEAD'], cwd=clonedir, text=True).strip()
-            if revision != SHOREBIRD_BASE:
+            if revision != profile.source_base:
                 raise RuntimeError(f'Unexpected upstream Dart base for Shorebird reader: {revision}')
-            patch = os.path.join(SCRIPT_DIR, 'scripts', 'shorebird_3c9c_runtime.patch')
+            patch = os.path.join(SCRIPT_DIR, 'scripts', profile.patch)
             subprocess.run([GIT_CMD, 'apply', '--check', patch], cwd=clonedir, check=True)
             subprocess.run([GIT_CMD, 'apply', patch], cwd=clonedir, check=True)
         # delete some unnecessary files
@@ -87,6 +101,7 @@ def checkout_dart(info: DartLibInfo):
                     # should ".git" directory be removed?
                     pass
 
+        verify_dart_sources(info, clonedir)
         if info.snapshot_hash is None:
             # if running with Python 3.12, tools/utils.py should be patched to replace imp module with importlib
             # due to its remotion as stated in: https://docs.python.org/3.12/whatsnew/3.12.html#imp
@@ -129,9 +144,44 @@ def checkout_dart(info: DartLibInfo):
                         if pos != -1:
                             mm[pos+1:pos+3] = b'//'
     
+    verify_dart_sources(info, clonedir)
     return clonedir
 
+
+def verify_dart_sources(info: DartLibInfo, directory):
+    try:
+        repository = subprocess.check_output([GIT_CMD, 'rev-parse', '--show-toplevel'], cwd=directory,
+                                             text=True, stderr=subprocess.PIPE).strip()
+    except subprocess.CalledProcessError as error:
+        raise ReaderSourceMismatch('SDK source Git provenance is unavailable') from error
+    if os.path.normcase(os.path.realpath(repository)) != os.path.normcase(os.path.realpath(directory)):
+        raise ReaderSourceMismatch('SDK sources must have their own Git provenance, not the parent repository')
+    revision = subprocess.check_output([GIT_CMD, 'rev-parse', 'HEAD'], cwd=directory, text=True).strip()
+    actual = source_snapshot_hash(directory)
+    if info.reader_profile:
+        profile = runtime_profile(info.reader_profile)
+        if revision != profile.source_base:
+            raise RuntimeError('Unexpected source base for the selected custom reader')
+        patch = os.path.join(SCRIPT_DIR, 'scripts', profile.patch)
+        try:
+            subprocess.run([GIT_CMD, 'apply', '--reverse', '--check', patch], cwd=directory, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            raise ReaderSourceMismatch('Custom reader sources do not match the bundled runtime patch') from error
+    elif info.snapshot_hash is not None and actual != info.snapshot_hash:
+        raise RuntimeError(
+            f'Unsupported snapshot format for upstream Dart {info.version}: '
+            f'input {info.snapshot_hash}, source {actual}. '
+            'Inspect candidate sources with scripts/probe_runtime_sources.py; '
+            'the reader hash will not be replaced.')
+    return {'source_revision': revision, 'source_hash': actual}
+
 def cmake_dart(info: DartLibInfo, target_dir: str):
+    source = verify_dart_sources(info, target_dir)
+    # Regenerate even for an existing checkout: an older build may have relabelled
+    # version.cc without changing the runtime implementation.
+    subprocess.run([sys.executable, MAKE_VERSION_FILE, target_dir,
+                    info.snapshot_hash or source['source_hash']], check=True)
     # Dart 3.11.0+ requires C++20 https://github.com/dart-lang/sdk/commit/3ebbaf08fb9236023b8f37bb9e9de85a9be8e281
     # getting default cpp standard version for Dart SDK from "runtime/tools/run_clang_tidy.dart"
     #   because "build/config/compiler/BUILD.gn" is not fetched
@@ -164,7 +214,8 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # Note: pointer compression feature is set from Flutter and no one change it when building app.
     #       so only one build of Dart runtime is enough
     builddir = os.path.join(BUILD_DIR, info.lib_name)
-    profile_macros = [f'-DBLUTTER_SHOREBIRD_3C9C={"ON" if info.reader_profile else "OFF"}']
+    profile_macros = [f'-D{profile.macro}={"ON" if info.reader_profile == name else "OFF"}'
+                      for name, profile in RUNTIME_PROFILES.items()]
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
         f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + profile_macros,
         cwd=target_dir, check=True)
@@ -173,9 +224,18 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     jobs = ['-j', str(min(16, os.cpu_count() or 1))] if info.reader_profile else []
     subprocess.run([NINJA_CMD] + jobs, cwd=builddir, check=True)
     subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
+    write_verified(library_path(info, os.path.join(target_dir, '..', '..', 'packages'), os.name == 'nt'),
+                   info, 'runtime', source)
 
 def fetch_and_build(info: DartLibInfo):
-    outdir = checkout_dart(info)
+    try:
+        outdir = checkout_dart(info)
+    except ReaderSourceMismatch:
+        old_source = os.path.join(SDK_DIR, 'v'+info.sdk_key)
+        preserved = old_source + '.unverified-' + uuid.uuid4().hex
+        os.rename(old_source, preserved)
+        print(f'Preserved unverified SDK sources at {preserved}; preparing a fresh checkout.')
+        outdir = checkout_dart(info)
     cmake_dart(info, outdir)
 
 if __name__ == "__main__":

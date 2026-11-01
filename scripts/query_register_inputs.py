@@ -22,7 +22,8 @@ def query(graph, site):
         contexts.append({k: context[k] for k in ('payload', 'inputs', 'register_inputs', 'normal_return_class',
                                                  'resolutions', 'stack_observations')})
     result_contexts = []
-    for context in graph.get('call_result_contexts', []):
+    for context in (graph.get('call_result_contexts', []) + graph.get('sdk_stub_producer_contexts', []) +
+                    graph.get('sdk_stub_caller_contexts', [])):
         if context['payload'] != edge['source']:
             continue
         bound = any(v['site'] == site for v in context['return_bindings'])
@@ -32,6 +33,7 @@ def query(graph, site):
             result_contexts.append(dict(payload=context['payload'], return_bindings=context['return_bindings'], **selected))
     result = {'site': site, 'target': edge.get('target'), 'target_label': labels.get(edge.get('target'), ''),
             'register_inputs': edge.get('register_inputs', []), 'native_return': edge.get('native_return'),
+            'sdk_stub_return': edge.get('sdk_stub_return'),
             'callee_normal_return_class': dict(graph['receiver_metadata'].get('machine_return_classes', [])).get(edge.get('target')),
             'contexts': contexts, 'call_result_contexts': result_contexts,
             'limits': 'Partial full-width physical register observations, not complete source arguments. Context results require their explicit caller bindings. Result classes grant no memory or register preservation; unknown remains unknown.'}
@@ -50,6 +52,8 @@ def render(result):
         lines.append('  none recorded')
     if result['native_return']:
         lines.append(f"Matched SDK normal-return X0: class {result['native_return']['class_id']:#x}")
+    if result.get('sdk_stub_return'):
+        lines.append(f"Matched SDK stub normal-return X0: class {result['sdk_stub_return']['class_id']:#x} [return only]")
     if result['callee_normal_return_class'] is not None:
         lines.append(f"Callee all-normal-return X0 summary: class {result['callee_normal_return_class']:#x}")
     for context in result['contexts']:

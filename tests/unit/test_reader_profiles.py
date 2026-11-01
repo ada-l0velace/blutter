@@ -10,10 +10,39 @@ from extract_dart_info import find_snapshot_symbol
 from reader_profiles import (
     SHOREBIRD_ENGINE, SHOREBIRD_HASH, SHOREBIRD_PROFILE,
     reader_profile, verify_engine_profile,
+    RUNTIME_PROFILES, runtime_profile,
 )
 
 
 class ReaderProfiles(unittest.TestCase):
+    def test_every_profile_has_its_own_base_patch_engine_and_target(self):
+        keys = set()
+        for name, profile in RUNTIME_PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(runtime_profile(name), profile)
+                info = DartLibInfo(profile.version, 'android', 'arm64', True, profile.snapshot_hash)
+                self.assertEqual(info.reader_profile, name)
+                self.assertNotIn(info.sdk_key, keys)
+                keys.add(info.sdk_key)
+                self.assertTrue((Path(__file__).resolve().parents[2] / 'scripts' / profile.patch).is_file())
+                flags = {'product', 'no-shared_data', 'compressed-pointers'}
+                verify_engine_profile(name, [profile.engine], flags)
+                for other in RUNTIME_PROFILES.values():
+                    if other != profile:
+                        with self.assertRaises(RuntimeError):
+                            verify_engine_profile(name, [other.engine], flags)
+                for target in [(profile.version, 'ios', 'arm64', True),
+                               (profile.version, 'android', 'x64', True),
+                               (profile.version, 'android', 'arm64', False),
+                               ('0.0.0', 'android', 'arm64', True)]:
+                    with self.assertRaises(RuntimeError):
+                        reader_profile(*target, profile.snapshot_hash)
+                for flag in flags:
+                    with self.assertRaises(RuntimeError):
+                        verify_engine_profile(name, [profile.engine], flags - {flag})
+        with self.assertRaises(ValueError):
+            runtime_profile('authored-unknown-profile')
+
     def test_known_reader(self):
         self.assertEqual(reader_profile('3.13.5', 'android', 'arm64', True,
                                         SHOREBIRD_HASH), SHOREBIRD_PROFILE)

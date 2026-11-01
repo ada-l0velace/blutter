@@ -2,6 +2,7 @@
 #include "ReceiverAnalysis.h"
 #include "RegisterContexts.h"
 #include "CallResultContexts.h"
+#include "SdkStubResultAnalysis.h"
 #include "CallEffects.h"
 #include "Arm64Ir.h"
 #include "StackCheckAnalysis.h"
@@ -381,6 +382,9 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 					if (call && profile.wordReturnRegister == ARM64_REG_X0 && profile.nativeReturnClasses.contains(address))
 						note(std::format("normal return x0: heap class {:#x} [matched SDK native contract; caller memory effects unproved]",
 							profile.nativeReturnClasses.at(address).classId));
+					if (call && profile.sdkStubReturnClasses.contains(address))
+						note(std::format("normal return x0: heap class {:#x} [matched SDK stub contract; caller memory effects unproved]",
+							profile.sdkStubReturnClasses.at(address).classId));
 					edges.push_back(std::move(edge));
 				}
 			} else if (target.type == ARM64_OP_REG) {
@@ -542,7 +546,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 			if (!comment.empty()) comment += " | ";
 			comment += std::format("normal-flow return x0: heap class {:#x} [this RET only]", value.classId);
 		}
-		if (receiver.normalReturnClass && !profile.nativeReturnClasses.contains(payloadStart) && !profile.allocationReturns.contains(payloadStart) && !profile.nonReturningCalls.contains(payloadStart))
+		if (receiver.normalReturnClass && !profile.nativeReturnClasses.contains(payloadStart) && !profile.sdkStubReturnClasses.contains(payloadStart) && !profile.allocationReturns.contains(payloadStart) && !profile.nonReturningCalls.contains(payloadStart))
 			machineReturnClasses.emplace(payloadStart, *receiver.normalReturnClass);
 		for (size_t n = firstEdge; n < edges.size(); ++n) if (const auto found = receiver.resolutions.find(edges[n].site); found != receiver.resolutions.end()) {
 			edges[n].staticDispatch = found->second;
@@ -589,7 +593,8 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 }
 
 void Analyzer::Write(const std::string& filename,
-	const std::function<void(const CallResultContextResult&)>& presentResults) const
+	const std::function<void(const CallResultContextResult&)>& presentResults,
+	const std::function<void(uint64_t)>& reportSdkDecodeFailure) const
 {
 	using Bindings = std::vector<std::tuple<int64_t, std::string, uint64_t>>;
 	std::map<std::pair<uint64_t, Bindings>, std::vector<uint64_t>> groups;
@@ -829,6 +834,11 @@ void Analyzer::Write(const std::string& filename,
 	resultProfile.provedReturnClasses = machineReturnClasses;
 	for (const auto& [entry, certificate] : registerContexts.effects) resultProfile.frameSafeCallees.insert(entry);
 	resultProfile.forwardedReturnInputs.insert(registerContexts.forwardedInputs.begin(), registerContexts.forwardedInputs.end());
+	const auto sdkResults = AnalyzeSdkStubResults(edges, contextBytes, resultProfile, receiverEntries, registerContexts);
+	for (const auto entry : sdkResults.decodeFailures) {
+		if (!reportSdkDecodeFailure) throw std::runtime_error("Cannot decode SDK result producer payload");
+		reportSdkDecodeFailure(entry);
+	}
 	auto resultContexts = AnalyzeCallResultContexts(edges, contextBytes, selectedCaller ? resultProfile : std::move(resultProfile), receiverEntries, registerContexts);
 	CallResultContextResult targeted;
 	std::string targetedStatus;
@@ -844,10 +854,17 @@ void Analyzer::Write(const std::string& filename,
 	}
 	for (const auto& context : resultContexts.contexts)
 		checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
-	if (presentResults) presentResults(resultContexts);
+	for (const auto* collection : {&sdkResults.producers, &sdkResults.callers})
+		for (const auto& context : collection->contexts)
+			checkedPoolClasses.insert(context.analysis.poolClasses.begin(), context.analysis.poolClasses.end());
+	if (presentResults) {
+		presentResults(resultContexts);
+		presentResults(sdkResults.producers);
+		presentResults(sdkResults.callers);
+	}
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":" << (selectedCaller ? 25 : 24) << ",\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":26,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -939,6 +956,12 @@ void Analyzer::Write(const std::string& filename,
 			out << "{\"callee\":" << *edge.target << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"contract\":" << Quoted(value.contract)
 				<< ",\"condition\":\"normal_return\",\"basis\":\"matched_sdk_native_identity\"}";
 		} else out << "null";
+		out << ",\"sdk_stub_return\":";
+		if (edge.kind == "call" && edge.target && profile.sdkStubReturnClasses.contains(*edge.target)) {
+			const auto& value = profile.sdkStubReturnClasses.at(*edge.target);
+			out << "{\"callee\":" << *edge.target << ",\"class_id\":" << value.classId << ",\"register\":\"x0\",\"contract\":\"allocate_growable_array\""
+				<< ",\"condition\":\"normal_return\",\"basis\":\"matched_sdk_stub_identity\"}";
+		} else out << "null";
 		out << ",\"array_arguments\":[";
 		for (size_t n = 0; n < edge.arrayArguments.size(); ++n) {
 			if (n) out << ',';
@@ -1012,6 +1035,11 @@ void Analyzer::Write(const std::string& filename,
 	for (const auto& [entry, value] : profile.nativeReturnClasses) {
 		if (!first) out << ','; first = false;
 		out << '[' << entry << ',' << value.classId << ',' << Quoted(value.contract) << ']';
+	}
+	out << "],\"sdk_stub_return_classes\":["; first = true;
+	for (const auto& [entry, value] : profile.sdkStubReturnClasses) {
+		if (!first) out << ','; first = false;
+		out << '[' << entry << ',' << value.classId << ",\"allocate_growable_array\"]";
 	}
 	out << "],\"machine_return_classes\":["; first = true;
 	for (const auto& [entry, cid] : machineReturnClasses) { if (!first) out << ','; first = false; out << '[' << entry << ',' << cid << ']'; }
@@ -1200,6 +1228,23 @@ void Analyzer::Write(const std::string& filename,
 		<< ",\"binding_steps\":" << registerContexts.bindingSteps << ",\"dropped_callers\":" << registerContexts.droppedCallers
 		<< ",\"group_limit\":4096,\"step_limit\":20000000,\"binding_step_limit\":2000000,\"effect_attempt_limit\":128,\"effect_byte_limit\":256,\"round_limit\":3}";
 	out << ",\"call_result_contexts\":"; WriteCallResultContexts(out, resultContexts);
+	out << ",\"sdk_stub_producer_contexts\":"; WriteCallResultContexts(out, sdkResults.producers);
+	out << ",\"sdk_stub_caller_contexts\":"; WriteCallResultContexts(out, sdkResults.callers);
+	out << ",\"sdk_stub_return_summaries\":["; first = true;
+	for (const auto& [entry, cid] : sdkResults.summaries) {
+		if (!first) out << ','; first = false;
+		out << '[' << entry << ',' << cid << ']';
+	}
+	out << "],\"sdk_stub_decode_failures\":["; first = true;
+	for (const auto entry : sdkResults.decodeFailures) { if (!first) out << ','; first = false; out << entry; }
+	out << "],\"sdk_stub_result_analysis\":{\"producers\":";
+	auto sdkWork = [&](const auto& work) {
+		out << "{\"candidate_payloads\":" << work.candidatePayloads << ",\"attempted_payloads\":" << work.attempted
+			<< ",\"transfer_steps\":" << work.steps << ",\"dropped_callers\":" << work.droppedCallers
+			<< ",\"payload_limit\":4096,\"step_limit\":20000000}";
+	};
+	sdkWork(sdkResults.producers);
+	out << ",\"callers\":"; sdkWork(sdkResults.callers); out << '}';
 	out << ",\"call_result_analysis\":{\"candidate_payloads\":" << resultContexts.candidatePayloads << ",\"attempted_payloads\":" << resultContexts.attempted
 		<< ",\"transfer_steps\":" << resultContexts.steps << ",\"dropped_callers\":" << resultContexts.droppedCallers << ",\"payload_limit\":4096,\"step_limit\":20000000}";
 	if (selectedCaller) out << ",\"targeted_call_result_analysis\":{\"payload\":" << *selectedCaller << ",\"status\":" << Quoted(targetedStatus)

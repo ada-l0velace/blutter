@@ -52,6 +52,57 @@ int main()
 		return 2;
 	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 	try {
+		// Authored guard at a synthetic offset and trap, independent of SDK profiles.
+		const std::vector<uint32_t> guard = {
+			0xf9400000u | ((0x80u / 8) << 10) | (26u << 5) | 16u,
+			0xb4000000u | (2u << 5) | 16u,
+			0xd4200000u | (0x123u << 5), Call(9)};
+		auto matchesGuard = [&](const Decoded& decoded) {
+			return arm64_patterns::NativeCallGuard(decoded.Span(), ARM64_REG_X16,
+				ARM64_REG_X26, 0x80, 0x123, ARM64_REG_X9);
+		};
+		Decoded validGuard(handle, guard);
+		Check(matchesGuard(validGuard), "complete guarded native call");
+		for (size_t count = 0; count < 4; ++count)
+			Check(!arm64_patterns::NativeCallGuard(validGuard.Span().first(count), ARM64_REG_X16,
+				ARM64_REG_X26, 0x80, 0x123, ARM64_REG_X9), "truncated guard is refused");
+		for (size_t index = 0; index < guard.size(); ++index) {
+			auto words = guard;
+			words[index] = 0xd503201f;
+			Decoded changed(handle, words);
+			Check(!matchesGuard(changed), "missing guard instruction is refused");
+		}
+		for (auto [index, word] : std::vector<std::pair<size_t, uint32_t>>{
+			{0, guard[0] ^ 1u}, {0, guard[0] ^ (1u << 5)}, {0, guard[0] ^ (1u << 10)},
+			{0, guard[0] ^ (1u << 30)}, {1, guard[1] ^ (1u << 24)},
+			{1, guard[1] ^ 1u}, {1, guard[1] ^ (1u << 31)}, {1, guard[1] ^ (1u << 5)},
+			{2, guard[2] ^ (1u << 5)}, {3, Call(10)}}) {
+			auto words = guard;
+			words[index] = word;
+			Decoded changed(handle, words);
+			Check(!matchesGuard(changed), "changed guard register/control flow is refused");
+		}
+		validGuard.insns[2].address += 4;
+		Check(!matchesGuard(validGuard), "noncontiguous guard is refused");
+		validGuard.insns[2].address -= 4;
+		validGuard.insns[0].detail->arm64.writeback = true;
+		Check(!matchesGuard(validGuard), "writeback guard is refused");
+		validGuard.insns[0].detail->arm64.writeback = false;
+		Check(!arm64_patterns::NativeCallGuard(validGuard.Span(), ARM64_REG_X9,
+			ARM64_REG_X26, 0x80, 0x123, ARM64_REG_X9), "guard cannot clobber its call target");
+		Check(matchesGuard(validGuard), "refused controls do not mutate the original guard");
+		auto scratchGuard = guard;
+		scratchGuard[0] = (scratchGuard[0] & ~31u) | 17u;
+		scratchGuard[1] = (scratchGuard[1] & ~31u) | 17u;
+		scratchGuard[3] = Call(16);
+		Decoded secondScratch(handle, scratchGuard);
+		Check(arm64_patterns::NativeCallGuard(secondScratch.Span(), ARM64_REG_X17,
+			ARM64_REG_X26, 0x80, 0x123, ARM64_REG_X16), "alternate scratch register preserves the call target");
+		Check(!arm64_patterns::NativeCallGuard(secondScratch.Span(), ARM64_REG_X16,
+			ARM64_REG_X26, 0x80, 0x123, ARM64_REG_X16), "scratch and target cannot alias");
+		Check(!arm64_patterns::NativeCallGuard(secondScratch.Span(), ARM64_REG_X17,
+			ARM64_REG_X26, 0x88, 0x123, ARM64_REG_X16), "another profile's state offset is refused");
+
 		auto gdt = [&](const std::string& name, std::vector<uint32_t> words,
 			std::optional<int64_t> expected, std::optional<int64_t> tmp = std::nullopt, bool usesTmp = false) {
 			Decoded decoded(handle, words);

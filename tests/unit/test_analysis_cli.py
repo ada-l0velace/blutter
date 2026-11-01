@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from blutter import BlutterInput, build_and_run
 from dartvm_fetch_build import DartLibInfo
+from reader_cache import write_verified
 
 
 class AnalysisCliTests(unittest.TestCase):
@@ -19,6 +20,8 @@ class AnalysisCliTests(unittest.TestCase):
         executable = directory / 'synthetic-tool'
         executable.touch()
         request.blutter_file = str(executable)
+        write_verified(executable, info, 'reader',
+                       {'source_revision': '1' * 40, 'source_hash': '0' * 32})
         return request
 
     def test_default_calls_native_tool_with_checked_status(self):

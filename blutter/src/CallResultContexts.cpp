@@ -1,15 +1,17 @@
 #include "CallResultContexts.h"
+#include "Arm64Decode.h"
 #include <algorithm>
 #include <memory>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 namespace SnapshotAnalysis {
 CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges,
 	const std::map<uint64_t, std::vector<uint8_t>>& bytes, Profile profile,
 	const std::set<uint64_t>& externalEntries, const RegisterContextResult& registers,
-	std::optional<uint64_t> selectedPayload)
+	std::optional<uint64_t> selectedPayload, const std::set<uint64_t>* requiredCallees)
 {
 	CallResultContextResult result;
 	if (profile.wordReturnRegister != ARM64_REG_X0) return result;
@@ -24,8 +26,12 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 	for (const auto site : conflicts) conditional.erase(site);
 	std::map<uint64_t, std::vector<ResultBinding>> groups;
 	std::map<uint64_t, const Edge*> bySite;
+	std::set<uint64_t> requiredSources;
+	if (requiredCallees) for (const auto& edge : edges)
+		if (edge.kind == "call" && edge.target && requiredCallees->contains(*edge.target)) requiredSources.insert(edge.source);
 	for (const auto& edge : edges) {
 		bySite.emplace(edge.site, &edge);
+		if (requiredCallees && !requiredSources.contains(edge.source)) continue;
 		if (selectedPayload && edge.source != *selectedPayload) continue;
 		if (edge.kind != "call" || !edge.target || !bytes.contains(edge.source) || profile.allocationReturns.contains(*edge.target) || profile.nonReturningCalls.contains(*edge.target)) continue;
 		const auto known = profile.provedReturnClasses.find(*edge.target);
@@ -48,10 +54,16 @@ CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges
 		profile.callReturnClasses.clear();
 		for (const auto& binding : bindings) profile.callReturnClasses.emplace(binding.site, CallReturnClass{binding.callee, binding.classId});
 		const auto& body = bytes.at(entry); cs_insn* raw = nullptr;
-		const auto count = cs_disasm(decoder.handle, body.data(), body.size(), entry, 0, &raw);
+		size_t count;
+		if (requiredCallees) std::tie(raw, count) = DecodeArm64Instructions(decoder.handle, body.data(), body.size(), entry);
+		else count = cs_disasm(decoder.handle, body.data(), body.size(), entry, 0, &raw);
 		const std::shared_ptr<cs_insn> owner(raw, [count](cs_insn* p) { cs_free(p, count); });
 		if (count*4 != body.size()) {
 			if (selectedPayload) throw std::runtime_error("Cannot decode selected caller payload");
+			if (requiredCallees) {
+				result.decodeFailures.push_back(entry);
+				result.incomplete = true;
+			}
 			continue;
 		}
 		auto analysis = AnalyzeReceivers(raw, count, profile, externalEntries, nullptr, &remaining);
@@ -97,7 +109,9 @@ void WriteCallResultContexts(std::ostream& out, const CallResultContextResult& r
 		for (size_t k = 0; k < context.bindings.size(); ++k) {
 			if (k) out << ','; const auto& value = context.bindings[k];
 			out << "{\"site\":" << value.site << ",\"callee\":" << value.callee << ",\"class_id\":" << value.classId
-				<< ",\"basis\":\"" << (value.conditional ? "register_context" : "machine_return_summary") << "\"}";
+				<< ",\"basis\":\"" << (value.basis == ResultBindingBasis::RegisterContext ? "register_context" :
+					value.basis == ResultBindingBasis::SdkStubIdentity ? "sdk_stub_identity" :
+					value.basis == ResultBindingBasis::SdkStubSummary ? "sdk_stub_summary" : "machine_return_summary") << "\"}";
 		}
 		out << "],\"resolutions\":["; bool first = true;
 		for (const auto& [site, value] : context.analysis.resolutions) {

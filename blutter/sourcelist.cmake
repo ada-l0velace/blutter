@@ -10,6 +10,7 @@ set(SRCS
     Arm64Boxing.h
     Arm64Constants.h
     Arm64Memory.h
+    Arm64Decode.h
     CodeAnalyzer.cpp
     CodeAnalyzer.h
     CodeAnalyzer_arm64.cpp
@@ -54,6 +55,9 @@ set(SRCS
     SnapshotCodeAnalysis.cpp
     SnapshotCodeAnalysis.h
     NativeReturnContracts.h
+    SdkStubReturnContracts.h
+    SdkStubResultAnalysis.h
+    SdkStubResultAnalysis.cpp
     AnalysisSelection.h
 	ReceiverAnalysis.cpp
 	RegisterContexts.cpp

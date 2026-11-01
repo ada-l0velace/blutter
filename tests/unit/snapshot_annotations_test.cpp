@@ -10,6 +10,7 @@
 #include <algorithm>
 #include "AnalysisSelection.h"
 #include "CallResultAnnotations.h"
+#include "Arm64Decode.h"
 
 // Standalone harness: no Dart runtime, SDK layout, or deserializer involved.
 int main(int argc, char** argv)
@@ -28,8 +29,7 @@ int main(int argc, char** argv)
 			std::ifstream input(argv[i + 1], std::ios::binary);
 			if (!input) throw std::runtime_error("Cannot read fixture");
 			std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
-			cs_insn* instructions = nullptr;
-			const auto count = cs_disasm(handle, bytes.data(), bytes.size(), start, 0, &instructions);
+			const auto [instructions, count] = SnapshotAnalysis::DecodeArm64Instructions(handle, bytes.data(), bytes.size(), start);
 			blocks.push_back({std::shared_ptr<cs_insn>(instructions, [count](cs_insn* p) { cs_free(p, count); }), count, start});
 			payloads.push_back({start, start + bytes.size(), {}, ""});
 		}
@@ -62,6 +62,12 @@ int main(int argc, char** argv)
 			}};
 		profile.dispatchRegister = ARM64_REG_X21;
 		profile.wordReturnRegister = ARM64_REG_X0;
+		if (const char* mode = std::getenv("BLUTTER_TEST_SDK_STUB_RETURNS"); mode && std::string(mode) == "1") {
+			std::map<uint64_t, uint64_t> bounds;
+			for (const auto& payload : payloads) bounds.emplace(payload.start, payload.end);
+			profile.sdkStubReturnClasses = SnapshotAnalysis::SdkStubReturnContracts(
+				{{0xf000, 0xf000, 0xf008, SnapshotAnalysis::SdkStubReturnKind::GrowableArray, true}}, 5, bounds, true);
+		}
 		profile.heapBitsRegister = ARM64_REG_X28;
 		profile.dispatchOrigin = 4;
 		profile.dispatchEntries = {0x2000, 0x2004, {}, 0x3000, 0x2000, 0x2004, 0x2000, 0x2004, 0xb000};
@@ -74,6 +80,10 @@ int main(int argc, char** argv)
 			profile.dispatchEntries.push_back(0xb100 + entryOffset);
 		}
 		profile.dispatchNullTarget = 0x3000;
+		if (!profile.sdkStubReturnClasses.empty()) {
+			profile.dispatchEntries.resize(10);
+			profile.dispatchEntries[9] = 0x2000;
+		}
 		if (const char* mode = std::getenv("BLUTTER_TEST_NATIVE_RETURNS"); mode && std::string(mode) == "1") {
 			// Authored runtime contracts; opaque fixture callees grant no frame effect.
 			profile.nativeReturnClasses = {{0xd000, {5, "allocate_one_byte_string"}}, {0xe000, {6, "allocate_two_byte_string"}}};
@@ -123,7 +133,13 @@ int main(int argc, char** argv)
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
 		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);
 		SnapshotAnalysis::AssemblyNotes notes;
-		analyzer.Write(argv[1], [&](const auto& result) { notes = SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()); });
+		analyzer.Write(argv[1], [&](const auto& result) {
+			for (const auto& [site, added] : SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()))
+				for (const auto& line : added) {
+					auto& retained = notes[site];
+					if (std::find(retained.begin(), retained.end(), line) == retained.end()) retained.push_back(line);
+				}
+		});
 		std::ofstream assembly(std::string(argv[1]) + ".asm");
 		for (const auto& block : blocks) for (size_t n = 0; n < block.count; ++n) {
 			const auto& instruction = block.instructions.get()[n];

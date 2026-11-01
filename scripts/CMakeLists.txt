@@ -87,6 +87,13 @@ option(BLUTTER_SHOREBIRD_3C9C "Reader for the verified Shorebird 3c9c snapshot" 
 if (BLUTTER_SHOREBIRD_3C9C)
 	list(APPEND defines BLUTTER_SHOREBIRD_3C9C)
 endif()
+option(BLUTTER_SHOREBIRD_8399 "Reader for the verified Shorebird 8399 snapshot" OFF)
+if (BLUTTER_SHOREBIRD_8399)
+	if (BLUTTER_SHOREBIRD_3C9C)
+		message(FATAL_ERROR "Select only one custom runtime profile")
+	endif()
+	list(APPEND defines BLUTTER_SHOREBIRD_8399)
+endif()
 
 if (MSVC)
 	# remove compiler exception handler options

@@ -2,6 +2,7 @@
 #include "DartDumper.h"
 #include "ReadUnaligned.h"
 #include <bit>
+#include <cstring>
 #include <fstream>
 #include <format>
 #include <set>
@@ -115,6 +116,34 @@ static std::vector<VmNativeReturnRecord> ReadNativeReturnIdentities(
 	}
 	return result;
 }
+// Legacy snapshots can retain byte-identical isolate copies of a VM stub.
+// Select copies only by complete equality to the matched SDK reference, never
+// by the display-name/partial-byte heuristics used for ordinary stub labels.
+static std::vector<SnapshotAnalysis::SdkStubReturnIdentity> ReadSdkStubIdentities(
+    const std::vector<dart::CodePtr>& codes, uintptr_t base, uintptr_t begin, uintptr_t end)
+{
+    std::vector<SnapshotAnalysis::SdkStubReturnIdentity> result;
+    const auto& reference = dart::StubCode::AllocateGrowableArray();
+    if (reference.IsNull() || reference.Size() <= 0 || reference.Size() > (1 << 20)) return result;
+    auto* zone = dart::Thread::Current()->zone();
+    auto append = [&](const dart::Code& code) {
+        const auto entry = code.EntryPoint(), payload = code.PayloadStart();
+        if (code.Size() != reference.Size() || entry < begin || entry >= end ||
+            payload < begin || payload >= end || static_cast<uint64_t>(code.Size()) > end-entry ||
+            static_cast<uint64_t>(code.Size()) > end-payload) return;
+        const bool equal = std::memcmp(reinterpret_cast<const void*>(entry),
+            reinterpret_cast<const void*>(reference.EntryPoint()), code.Size()) == 0;
+        if (equal) result.push_back({entry-base, payload-base, payload-base+code.Size(),
+            SnapshotAnalysis::SdkStubReturnKind::GrowableArray, true});
+    };
+    append(reference);
+    for (const auto ptr : codes) {
+        const auto& code = dart::Code::Handle(zone, ptr);
+        const auto& owner = dart::Object::Handle(zone, code.owner());
+        if (owner.IsNull()) append(code);
+    }
+    return result;
+}
 static std::string JsonNativeText(const std::string& value)
 {
 	std::string result = "\"";
@@ -204,6 +233,23 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 			<< ",\"is_native\":" << (id.isNative ? "true" : "false") << ",\"owns_code\":" << (id.ownsCode ? "true" : "false")
 			<< ",\"recognized_kind\":" << record.recognizedValue << ",\"native_name\":" << JsonNativeText(id.nativeName)
 			<< ",\"library_uri\":" << JsonNativeText(id.libraryUri) << '}';
+	}
+	of << "],\"sdk_stub_return_sdk\":[[\"allocate_growable_array\",";
+	const auto& growableClass = dart::Class::Handle(zone, thread->isolate_group()->class_table()->At(dart::kGrowableObjectArrayCid));
+	of << growableClass.id() << "]],\"sdk_stub_return_reference\":";
+	const auto& growableCode = dart::StubCode::AllocateGrowableArray();
+	if (!growableCode.IsNull() && growableCode.Size() > 0) {
+		of << "{\"entry\":" << growableCode.EntryPoint() - app.base()
+			<< ",\"end\":" << growableCode.EntryPoint() - app.base() + growableCode.Size() << ",\"kind\":\"allocate_growable_array\"}";
+	} else of << "null";
+	of << ",\"sdk_stub_return_identities\":[";
+	const auto image = reinterpret_cast<uintptr_t>(app.isolate_snapshot_instructions);
+	const auto imageSize = *reinterpret_cast<const uintptr_t*>(image);
+	if (imageSize > UINTPTR_MAX-image) throw std::runtime_error("Invalid instructions image size");
+	comma = false;
+	for (const auto& id : ReadSdkStubIdentities(visitor.codes, app.base(), image, image+imageSize)) {
+		if (comma) of << ','; comma = true;
+		of << "{\"entry\":" << id.entry << ",\"payload\":" << id.payload << ",\"end\":" << id.end << ",\"kind\":\"allocate_growable_array\"}";
 	}
 	of << "],\"pool_heap_classes\":[";
 	comma = false;
@@ -803,7 +849,9 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		payloads.push_back({start - app.base(), end - app.base(), {}, ""});
 	}
 	const auto& pool = app.GetObjectPool();
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_8399)
+	const std::string profileName = "shorebird_8399";
+#elif defined(BLUTTER_SHOREBIRD_3C9C)
 	const std::string profileName = "shorebird_3c9c";
 #else
 	const std::string profileName = "dart_aot";
@@ -813,16 +861,25 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	profile.dispatchRegister = ARM64_REG_X21;
 	profile.stackLimitOffset = TargetThreadOffset(dart::Thread::stack_limit_offset());
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
+	static_assert(dart::AllocateObjectABI::kResultReg == dart::R0);
+
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) {
 		class NativeFunctionVisitor : public dart::ObjectVisitor {
 		public:
 			std::vector<dart::FunctionPtr> functions;
+			std::vector<dart::CodePtr> codes;
 			void VisitObject(dart::ObjectPtr object) override {
 				if (object->IsFunction()) functions.push_back(dart::Function::RawCast(object));
+				if (object->IsCode()) codes.push_back(dart::Code::RawCast(object));
 			}
 		} visitor;
 		dart::HeapIterationScope iteration(thread);
 		iteration.IterateOldObjects(&visitor);
+		std::map<uint64_t, uint64_t> bounds;
+		for (const auto& payload : payloads) bounds.emplace(payload.start, payload.end);
+		profile.sdkStubReturnClasses = SnapshotAnalysis::SdkStubReturnContracts(
+			ReadSdkStubIdentities(visitor.codes, app.base(), codeStart, imageEnd),
+			dart::kGrowableObjectArrayCid, bounds, true);
 		std::vector<SnapshotAnalysis::NativeReturnIdentity> identities;
 		for (auto& record : ReadNativeReturnIdentities(visitor.functions, app.base())) identities.push_back(std::move(record.identity));
 		profile.nativeReturnClasses = SnapshotAnalysis::NativeReturnContracts(identities, dart::kOneByteStringCid, dart::kTwoByteStringCid);
@@ -1075,10 +1132,19 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	}
 	manifest << std::format("],\"payload_count\":{},\"additional_exports\":{},\"undecoded_words\":{}}}\n",
 		total, recoveredCodeRanges.size(), undecoded);
+	callerResultNotes.clear();
 	annotations.Write((directory.parent_path() / "snapshot_calls.json").string(), [&](const auto& result) {
-		callerResultNotes = SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), [&](uint32_t cid) {
+		const auto added = SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), [&](uint32_t cid) {
 			return cid < app.classes.size() && app.classes[cid] ? app.classes[cid]->Name() : std::string{};
 		});
+		for (const auto& [site, notes] : added) for (const auto& note : notes) {
+			auto& retained = callerResultNotes[site];
+			if (std::find(retained.begin(), retained.end(), note) == retained.end()) retained.push_back(note);
+		}
+	}, [&](uint64_t entry) {
+		AnalysisIssue issue("sdk-result-decode", entry, "SDK result analysis cannot decode this retained payload");
+		if (diagnostics) diagnostics->Report(issue);
+		else throw issue;
 	});
 	// Render original words after the checked result pass. Only disassembly is
 	// repeated here; no receiver/context analysis is rerun for presentation.

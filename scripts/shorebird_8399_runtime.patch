@@ -1,0 +1,91 @@
+--- a/runtime/vm/app_snapshot.cc
++++ b/runtime/vm/app_snapshot.cc
+@@ -733,6 +733,9 @@
+   }
+
+   ObjectPtr Ref(intptr_t index) const {
++    if (index <= 0 || index > num_objects_) {
++      FATAL("Snapshot reference index out of range: %" Pd, index);
++    }
+     ASSERT(index > 0);
+     ASSERT(index <= num_objects_);
+     return refs_->untag()->element(index);
+@@ -1094,9 +1097,15 @@
+   ~ClassDeserializationCluster() {}
+
+   void ReadAlloc(Deserializer* d) override {
++    const intptr_t reserved_class_index = d->ReadUnsigned();
+     predefined_start_index_ = d->next_index();
+     intptr_t count = d->ReadUnsigned();
+     ClassTable* table = d->isolate_group()->class_table();
++    if (reserved_class_index < kNumPredefinedCids ||
++        reserved_class_index > kClassIdTagMax) {
++      FATAL("Unsupported Shorebird reserved class index");
++    }
++    table->AllocateIndex(reserved_class_index);
+     for (intptr_t i = 0; i < count; i++) {
+       intptr_t class_id = d->ReadCid();
+       ASSERT(table->HasValidClassAt(class_id));
+@@ -7332,6 +7340,11 @@
+
+     // Deserialize dispatch table (when applicable)
+     d->ReadDispatchTable();
++    const intptr_t indirect_static_call_count = d->ReadUnsigned();
++    if (indirect_static_call_count != 0) {
++      FATAL("Unsupported nonempty indirect static call table: %" Pd,
++            indirect_static_call_count);
++    }
+   }
+
+   void PostLoad(Deserializer* d, const Array& refs) override {
+@@ -9788,6 +9801,9 @@
+     }
+
+     // We should have completely filled the ref array.
++    if (next_ref_index_ - kFirstReference != num_objects_) {
++      FATAL("Snapshot object allocation count mismatch");
++    }
+     ASSERT_EQUAL(next_ref_index_ - kFirstReference, num_objects_);
+
+     {
+@@ -9802,6 +9818,9 @@
+     }
+
+     roots->ReadRoots(this);
++    if (stream_.PendingBytes() != 0) {
++      FATAL("Unread snapshot root data: %" Pd, stream_.PendingBytes());
++    }
+
+ #if defined(DEBUG)
+     int32_t section_marker = Read<int32_t>();
+--- a/runtime/vm/stub_code_list.h
++++ b/runtime/vm/stub_code_list.h
+@@ -29,6 +29,7 @@
+ // List of stubs created in the VM isolate, these stubs are shared by different
+ // isolates running in this dart process.
+ #define VM_STUB_CODE_LIST(V)                                                   \
++  V(GetCStackPointer)                                                        \
+   V(JumpToFrame)                                                               \
+   V(RunExceptionHandler)                                                       \
+   V(RunExceptionHandlerUnbox)                                                  \
+@@ -193,6 +194,20 @@
+   V(CheckIsolateFieldAccess)                                                   \
+   V(CheckedStoreIntoShared)                                                    \
+   V(EnsureDeeplyImmutable)                                                     \
++  V(CallClangCodeWithSimulatorArgs)                                          \
++  V(CallSimulatorFromFfiTrampoline)                                          \
++  V(SimulatorCallToRuntime)                                                  \
++  V(SimulatorCallNoScopeNative)                                              \
++  V(SimulatorCallAutoScopeNative)                                            \
++  V(SimulatorCallBootstrapNative)                                            \
++  V(SimulatorCallNativeThroughSafepoint)                                     \
++  V(TransitionDartToCpuIfNeeded)                                             \
++  V(TransitionDartToSimulatorIfNeeded)                                       \
++  V(RunDartOnCPU)                                                            \
++  V(ResumeOnCPU)                                                             \
++  V(ResumeOnSimulator)                                                       \
++  V(SimulatorEnterSafepoint)                                                 \
++  V(SimulatorExitSafepoint)                                                  \
+   V(UnknownDartCode)
+
+ }  // namespace dart

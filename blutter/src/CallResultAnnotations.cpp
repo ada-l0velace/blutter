@@ -50,7 +50,9 @@ AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const 
 			if (edge.kind != "call" || edge.target != binding.callee)
 				throw std::runtime_error("Caller-result annotation does not match its original callee");
 			add(binding.site, std::format("normal-return X0 -> {} [{}]", type(binding.classId),
-				binding.conditional ? "caller-bound helper" : "callee summary"));
+				binding.basis == ResultBindingBasis::RegisterContext ? "caller-bound helper" :
+				binding.basis == ResultBindingBasis::SdkStubIdentity ? "matched SDK stub" :
+				binding.basis == ResultBindingBasis::SdkStubSummary ? "SDK-derived helper" : "callee summary"));
 		}
 		for (const auto& [site, values] : context.analysis.stackInputs) {
 			const auto& edge = call(site);

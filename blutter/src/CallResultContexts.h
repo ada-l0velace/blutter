@@ -4,10 +4,15 @@
 #include <string_view>
 
 namespace SnapshotAnalysis {
+enum class ResultBindingBasis { MachineSummary, RegisterContext, SdkStubIdentity, SdkStubSummary };
 struct ResultBinding {
 	uint64_t site, callee;
 	uint32_t classId;
-	bool conditional;
+	ResultBindingBasis basis;
+	ResultBinding(uint64_t site, uint64_t callee, uint32_t cid, bool conditional)
+		: site(site), callee(callee), classId(cid), basis(conditional ? ResultBindingBasis::RegisterContext : ResultBindingBasis::MachineSummary) {}
+	ResultBinding(uint64_t site, uint64_t callee, uint32_t cid, ResultBindingBasis basis)
+		: site(site), callee(callee), classId(cid), basis(basis) {}
 };
 struct CallResultContext {
 	uint64_t payload;
@@ -18,6 +23,7 @@ struct CallResultContextResult {
 	std::vector<CallResultContext> contexts;
 	size_t candidatePayloads = 0, attempted = 0, steps = 0, droppedCallers = 0;
 	bool incomplete = false, exhausted = false;
+	std::vector<uint64_t> decodeFailures;
 };
 inline constexpr size_t TargetedResultStepLimit = 1000000;
 inline std::string_view CallResultContextStatus(const CallResultContextResult& result)
@@ -34,6 +40,6 @@ inline std::string_view CallResultContextStatus(const CallResultContextResult& r
 CallResultContextResult AnalyzeCallResultContexts(const std::vector<Edge>& edges,
 	const std::map<uint64_t, std::vector<uint8_t>>& bytes, Profile profile,
 	const std::set<uint64_t>& externalEntries, const RegisterContextResult& registers,
-	std::optional<uint64_t> selectedPayload = {});
+	std::optional<uint64_t> selectedPayload = {}, const std::set<uint64_t>* requiredCallees = nullptr);
 void WriteCallResultContexts(std::ostream& out, const CallResultContextResult& result);
 }

@@ -19,10 +19,12 @@ INSTRUCTION = re.compile(r'^\s*//\s*(0x[0-9a-f]+):\s+([a-z][a-z0-9.]*)\b')
 def expected_facts(graph):
     edges = {e['site']: e for e in graph['edges']}
     facts = set()
-    for c in graph.get('call_result_contexts', []):
+    for c in (graph.get('call_result_contexts', []) + graph.get('sdk_stub_producer_contexts', []) +
+              graph.get('sdk_stub_caller_contexts', [])):
         payload = c['payload']
         for b in c['return_bindings']:
-            basis = 'callee summary' if b['basis'] == 'machine_return_summary' else 'caller-bound helper'
+            basis = {'machine_return_summary': 'callee summary', 'register_context': 'caller-bound helper',
+                     'sdk_stub_identity': 'matched SDK stub', 'sdk_stub_summary': 'SDK-derived helper'}[b['basis']]
             facts.add((payload, b['site'], 'normal', b['class_id'], basis))
         for o in c['stack_observations']:
             before = {(v['sp_offset'], v['kind'], int(v['value'], 16)) for v in edges[o['site']]['stack_inputs']}
@@ -53,7 +55,7 @@ def parse_note(line, class_names=None):
         displayed_name = ast.literal_eval(name[1])
         body = body[:name.start()] + body[name.end():]
     cid = None
-    m = re.fullmatch(r'normal-return X0 -> class (0x[0-9a-f]+) \[(callee summary|caller-bound helper)\]', body)
+    m = re.fullmatch(r'normal-return X0 -> class (0x[0-9a-f]+) \[(callee summary|caller-bound helper|matched SDK stub|SDK-derived helper)\]', body)
     if m:
         cid = int(m[1], 16); fact = (payload, site, 'normal', cid, m[2])
     elif (m := re.fullmatch(r'stack Dart SP([+-]\d+) -> (class|word) (0x[0-9a-f]+) \[partial\]', body)):

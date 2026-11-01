@@ -10,6 +10,7 @@ import sys
 import zipfile
 import tempfile
 from dartvm_fetch_build import DartLibInfo
+from reader_cache import read_verified, write_verified, library_path
 
 CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
@@ -217,16 +218,19 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     return info
 
 def build_and_run(input: BlutterInput):
-    if not os.path.isfile(input.blutter_file) or input.rebuild_blutter:
+    runtime_metadata = None
+    if not read_verified(input.blutter_file, input.dart_info, 'reader', input.no_analysis) or input.rebuild_blutter or input.create_vs_sln:
         # before fetch and build, check the existence of compiled library first
         #   so the src and build directories can be deleted
-        if os.name == 'nt':
-            dartlib_file = os.path.join(PKG_LIB_DIR, input.dart_info.lib_name+'.lib')
-        else:
-            dartlib_file = os.path.join(PKG_LIB_DIR, 'lib'+input.dart_info.lib_name+'.a')
-        if not os.path.isfile(dartlib_file):
+        dartlib_file = library_path(input.dart_info, os.path.dirname(PKG_LIB_DIR), os.name == 'nt')
+        runtime_metadata = read_verified(dartlib_file, input.dart_info, 'runtime')
+        if not runtime_metadata:
+            print('Preparing a source-verified runtime; a cached artifact is absent or unverified.')
             from dartvm_fetch_build import fetch_and_build
             fetch_and_build(input.dart_info)
+            runtime_metadata = read_verified(dartlib_file, input.dart_info, 'runtime')
+            if not runtime_metadata:
+                raise RuntimeError('Runtime build did not produce a verified reader artifact')
         
         input.rebuild_blutter = True
 
@@ -259,6 +263,7 @@ def build_and_run(input: BlutterInput):
             # do not use SDK path for checking source code because Blutter does not depended on it and SDK might be removed
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
+            write_verified(input.blutter_file, input.dart_info, 'reader', runtime_metadata, input.no_analysis)
 
         # execute blutter    
         command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir]

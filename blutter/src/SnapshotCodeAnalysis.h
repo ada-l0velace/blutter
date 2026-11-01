@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "NativeReturnContracts.h"
+#include "SdkStubReturnContracts.h"
 
 // ARM64 instruction facts. This module has no Dart VM or vendor dependencies.
 namespace SnapshotAnalysis {
@@ -86,6 +87,10 @@ struct Profile {
 	// Matched SDK normal-result classes only. No frame, register, allocation
 	// body or heap-preservation effect is implied by membership in this map.
 	std::map<uint64_t, NativeReturnContract> nativeReturnClasses;
+	// Exact matched SDK-stub postconditions, separate from native functions and
+	// machine summaries. No frame, register, body or heap effect is implied.
+	std::map<uint64_t, SdkStubReturnContract> sdkStubReturnClasses;
+	bool consumeSdkStubReturns = false;
 	// Independently checked all-normal-return classes. Like native result-only
 	// contracts, these grant no memory or preserved-register effects.
 	std::map<uint64_t, uint32_t> provedReturnClasses;
@@ -243,7 +248,8 @@ public:
 	void RegisterEntries(const cs_insn* instructions, size_t count);
 	std::map<uint64_t, std::string> Analyze(const cs_insn* instructions, size_t count, uint64_t payloadStart);
 	void Write(const std::string& filename,
-		const std::function<void(const CallResultContextResult&)>& presentResults = {}) const;
+		const std::function<void(const CallResultContextResult&)>& presentResults = {},
+		const std::function<void(uint64_t)>& reportSdkDecodeFailure = {}) const;
 	const std::vector<Reference>& References() const { return references; }
 	const std::vector<Edge>& Edges() const { return edges; }
 private:

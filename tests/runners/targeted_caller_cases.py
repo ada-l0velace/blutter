@@ -6,8 +6,8 @@ def exercise_targeted_callers(run):
     caller = ['bl 0x4000', 'ret']
     ordinary = run('selection-default', caller, helper)
     selected = run('selection-already-recorded', caller, helper, selected_caller=0x1000)
-    assert 'targeted_call_result_analysis' not in ordinary and ordinary['format'] == 24
-    assert selected['format'] == 25
+    assert 'targeted_call_result_analysis' not in ordinary and ordinary['format'] == 26
+    assert selected['format'] == 26
     assert selected['targeted_call_result_analysis']['status'] == 'already_recorded'
     assert selected['call_result_contexts'] == ordinary['call_result_contexts']
     assert selected['call_result_analysis'] == ordinary['call_result_analysis']

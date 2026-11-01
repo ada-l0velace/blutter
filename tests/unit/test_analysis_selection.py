@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import blutter
+from dartvm_fetch_build import DartLibInfo
 
 
 class AnalysisSelection(unittest.TestCase):
@@ -22,8 +23,9 @@ class AnalysisSelection(unittest.TestCase):
     def test_native_command_preserves_selection_and_default(self):
         for selected in (None, 0x1000):
             item = SimpleNamespace(blutter_file='reader', rebuild_blutter=False, create_vs_sln=False,
-                                   libapp_path='input library', outdir='output directory', analysis_caller=selected)
-            with patch.object(blutter.os.path, 'isfile', return_value=True), patch.object(blutter.subprocess, 'run') as run:
+                                   libapp_path='input library', outdir='output directory', analysis_caller=selected,
+                                   dart_info=DartLibInfo('3.11.0', 'android', 'arm64', True, '0' * 32), no_analysis=False)
+            with patch.object(blutter, 'read_verified', return_value={'synthetic': True}), patch.object(blutter.subprocess, 'run') as run:
                 blutter.build_and_run(item)
             expected = ['reader', '-i', 'input library', '-o', 'output directory']
             if selected is not None:

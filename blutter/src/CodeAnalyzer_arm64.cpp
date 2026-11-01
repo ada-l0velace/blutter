@@ -652,19 +652,17 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 				INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == TargetThreadOffset(AOT_Thread_vm_tag_offset));
 				++insn;
 
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399)
 				// This Shorebird profile checks the native-call state before BLR.
 				// Require the complete guard and its exact continuation target.
 				if (insn.id() == ARM64_INS_LDR) {
-					INSN_ASSERT(insn.ops(0).reg == ARM64_REG_X17);
-					INSN_ASSERT(insn.ops(1).mem.base == CSREG_DART_THR && insn.ops(1).mem.disp == 0x8f0);
-					++insn;
-					INSN_ASSERT(insn.id() == ARM64_INS_CBZ && insn.ops(0).reg == ARM64_REG_X17);
-					const auto guardTarget = insn.ops(1).imm;
-					++insn;
-					INSN_ASSERT(insn.id() == ARM64_INS_BRK && insn.ops(0).imm == 0xb12a);
-					++insn;
-					INSN_ASSERT(insn.address() == guardTarget);
+					auto* start = insn.Current();
+					const auto remaining = std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1);
+					if (!arm64_patterns::NativeCallGuard(remaining, ARM64_REG_X17, CSREG_DART_THR,
+						TargetNativeCallStateOffset(), 0xb12a, CSREG_DART_TMP))
+						throw AnalysisIssue("unsupported-leaf-runtime-guard", insn.address(),
+							"Native-call state guard does not match the verified leaf runtime call form.");
+					insn.SetCurrent(start + 3);
 				}
 #endif
 				INSN_ASSERT(insn.id() == ARM64_INS_BLR);
@@ -800,7 +798,19 @@ std::unique_ptr<CallLeafRuntimeInstr> FunctionAnalyzer::processCallLeafRuntime(A
 			++insn;
 			save_to_vm_tag = true;
 		}
-		
+
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399)
+		if (save_to_vm_tag && insn.id() == ARM64_INS_LDR) {
+			auto* start = insn.Current();
+			const auto remaining = std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1);
+			if (!arm64_patterns::NativeCallGuard(remaining, CSREG_DART_TMP, CSREG_DART_THR,
+				TargetNativeCallStateOffset(), 0xb129, call_target_reg))
+				throw AnalysisIssue("unsupported-leaf-runtime-guard", insn.address(),
+					"Native-call state guard does not match the verified leaf runtime call form.");
+			insn.SetCurrent(start + 3);
+		}
+#endif
+
 		INSN_ASSERT(insn.id() == ARM64_INS_BLR);
 		INSN_ASSERT(insn.ops(0).reg == call_target_reg);
 		++insn;

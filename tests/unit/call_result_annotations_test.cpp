@@ -42,7 +42,7 @@ int main()
 		for (const auto& [site,lines] : notes) for (const auto& line : lines)
 			Check(line.starts_with("caller-result @") && line.find("[payload 0x1000]")!=std::string::npos,"Every note retains its original caller scope");
 		Check(!Has(BuildCallResultNotes(result,edges),0x1004,"ExampleWidget"),"Absent metadata leaves the numeric class intact");
-		result.contexts[0].bindings[0].conditional=true;
+		result.contexts[0].bindings[0].basis=ResultBindingBasis::RegisterContext;
 		Check(Has(BuildCallResultNotes(result,edges),0x1004,"[caller-bound helper]"),"Conditional helper evidence is not labeled a global callee summary");
 		const auto escaped=BuildCallResultNotes(result,edges,[](uint32_t) { return "Quoted\"\\\nName"; });
 		Check(Has(escaped,0x1004,"\\x0a"),"Metadata newlines cannot inject assembly lines");

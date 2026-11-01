@@ -98,11 +98,15 @@ def heap_field(base, operand, writeback, header, enabled):
 def check_receivers(graph, read, decode, audit):
     from check_native_returns import check_native_returns
     native_returns, native_return_calls = check_native_returns(graph, read, audit or {})
+    from check_sdk_stub_returns import check_sdk_stub_returns
+    sdk_stub_returns, sdk_stub_return_calls = check_sdk_stub_returns(graph, read, audit or {})
     from check_register_inputs import register_claims, check_register_bindings, machine_returns, check_return_summary, REGISTERS
     register_observations = register_claims(graph)
     machine_return_classes = machine_returns(graph)
     from check_call_results import check_result_bindings
     result_contexts = check_result_bindings(graph, machine_return_classes)
+    sdk_callers = {id(c) for c in graph.get('sdk_stub_caller_contexts', [])}
+    sdk_summaries = dict(graph.get('sdk_stub_return_summaries', []))
     modern = graph.get('format', 4) >= 5
     spill_enabled = graph.get('format', 4) >= 7
     heap_address_enabled = graph.get('format', 4) >= 8
@@ -142,7 +146,8 @@ def check_receivers(graph, read, decode, audit):
     if not result_contexts and not register_observations and not machine_return_classes and not register_contexts and not any(c.get('return_classes') for c in certificates) and not claims and not stack_claims and not load_claims and not return_claims and not length_claims and not array_claims and not indexed_claims and not contexts and not array_contexts and not path_contexts and not entry_traces and not result_traces and not graph.get('call_effects') and not graph.get('prefix_call_effects') and not graph.get('receiver_metadata', {}).get('nonreturning_calls'):
         assert not certificates
         return {'receiver_claims_checked': 0, 'receiver_incoming_edges_checked': 0,
-                'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls}
+                'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls,
+                'sdk_stub_return_contracts_checked': len(sdk_stub_returns), 'sdk_stub_return_calls_checked': sdk_stub_return_calls}
     assert audit, 'Receiver checking requires the separate VM audit'
     metadata, profile = graph['receiver_metadata'], graph['profile']
     if graph.get('format', 4) >= 18:
@@ -271,6 +276,8 @@ def check_receivers(graph, read, decode, audit):
         safe_callees = legacy_safe | prefix_safe | register_safe if register_mode or result_mode else legacy_safe | prefix_safe if trace else legacy_safe
         return_inputs = legacy_return_inputs | register_forwarded if register_mode or result_mode else legacy_return_inputs
         active_machine_returns = machine_return_classes if register_mode or result_mode else {}
+        if context is not None and id(context) in sdk_callers:
+            active_machine_returns = machine_return_classes | sdk_summaries
         array_returns = legacy_arrays | prefix_arrays if trace or result_mode else legacy_arrays
         length_effects = legacy_lengths | prefix_lengths if trace or result_mode else legacy_lengths
         use_mode = bool(context and context.get('scope') == 'entry_result_use')
@@ -633,6 +640,8 @@ def check_receivers(graph, read, decode, audit):
                     state[int(metadata['allocation_result_register'][1:])] = fact(OBJECT, allocations[ops[0].imm])
                 if ins.id == a.ARM64_INS_BL and ops[0].imm in native_returns:
                     state[0] = fact(OBJECT, native_returns[ops[0].imm])
+                if ins.id == a.ARM64_INS_BL and ops[0].imm in sdk_stub_returns:
+                    state[0] = fact(OBJECT, sdk_stub_returns[ops[0].imm])
                 if ins.id == a.ARM64_INS_BL and ops[0].imm in active_machine_returns:
                     state[0] = fact(OBJECT, active_machine_returns[ops[0].imm])
                 if result_mode and ins.address in result_bindings:
@@ -1040,6 +1049,7 @@ def check_receivers(graph, read, decode, audit):
     assert array_context_callers <= verified_arrays, 'Unchecked array context caller observations'
     return {'receiver_claims_checked': len(verified), 'receiver_blocks_checked': blocks_checked,
             'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls,
+            'sdk_stub_return_contracts_checked': len(sdk_stub_returns), 'sdk_stub_return_calls_checked': sdk_stub_return_calls,
             'register_observation_calls_checked': len(verified_registers),
             'register_observation_classes_checked': sum(map(len, register_observations.values())),
             'register_contexts_checked': len(register_contexts), 'register_context_callers_checked': len(register_context_callers),
