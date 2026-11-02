@@ -395,7 +395,7 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
 public:
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 	std::vector<dart::FunctionPtr> functionPtrs;
 #endif
 	explicit HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs) : codePtrs(codePtrs) {}
@@ -405,7 +405,7 @@ public:
 	virtual void VisitObject(dart::ObjectPtr obj) {
 		if (obj->IsCode())
 			codePtrs.push_back(dart::Code::RawCast(obj));
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 		if (obj->IsFunction())
 			functionPtrs.push_back(dart::Function::RawCast(obj));
 #endif
@@ -415,7 +415,7 @@ private:
 	std::vector<dart::CodePtr>& codePtrs;
 };
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 static bool hasInstructionsEntry(uintptr_t entry);
 #endif
 
@@ -536,7 +536,7 @@ void DartApp::findFunctionInHeap()
 			//throw std::runtime_error(msg);
 		}
 	}
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 	for (const auto ptr : visitor.functionPtrs) {
 		const auto& function = dart::Function::Handle(zone, ptr);
 		const auto entry = function.entry_point();
@@ -546,7 +546,7 @@ void DartApp::findFunctionInHeap()
 #endif
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 // The VM can retain a Function while discarding its Code object. Such
 // functions are invisible to a Code-only heap scan and to pruned class lists.
 // Keep their real names/owners rather than recovering them as anonymous code.
@@ -636,7 +636,7 @@ void DartApp::finalizeFunctionsInfo()
 	auto& func = dart::Function::Handle();
 	for (auto& [_, dartFn] : functions) {
 		func = dartFn->ptr;
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 		// Anonymous retained Code objects have no Function metadata.
 		if (func.IsNull()) continue;
 #endif

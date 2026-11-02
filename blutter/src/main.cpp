@@ -34,7 +34,7 @@ int main(int argc, char** argv)
 		std::optional<uint64_t> selectedCaller;
 		if (analysisCaller) {
 			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(args::get(analysisCaller));
-#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifndef HAS_INSTRUCTIONS_TABLE_RODATA
 			throw std::runtime_error("Selected caller analysis requires a supported native instructions-table profile");
 #endif
 		}
@@ -66,7 +66,7 @@ int main(int argc, char** argv)
 #endif
 
 		DartDumper dumper{ app, &diagnostics, selectedCaller };
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
 			dumper.DumpCoverageAudit(audit);
 #endif

@@ -1,30 +1,15 @@
 #pragma once
+#include "RuntimeLayout.h"
 
-// Offsets in the app's generated code, separate from the offline reader's
-// native Thread layout. Only this fingerprint's recovered ranges are mapped.
+// Target-code offsets, not the offline reader's native Thread layout.
 inline intptr_t TargetThreadOffset(intptr_t offset)
 {
-#if defined(BLUTTER_SHOREBIRD_3C9C)
-	if (offset >= 0x290 && offset <= 0x700) return offset + 0x10;
-	if (offset >= 0x708 && offset <= 0x8a0) return offset + 0x20;
-	if (offset >= 0x8e0 && offset <= 0x908) return offset + 0x80;
-#elif defined(BLUTTER_SHOREBIRD_8399)
-	if (offset >= 0x290 && offset <= 0x6f0) return offset + 0x10;
-	if (offset >= 0x6f8 && offset <= 0x890) return offset + 0x20;
-	if (offset >= 0x8d0 && offset <= 0x8f8) return offset + 0x80;
-#endif
-	return offset;
+	return TargetRuntime::ThreadOffset(offset);
 }
 
 inline constexpr intptr_t TargetNativeCallStateOffset()
 {
-#if defined(BLUTTER_SHOREBIRD_3C9C)
-	return 0x8f0;
-#elif defined(BLUTTER_SHOREBIRD_8399)
-	return 0x8e0;
-#else
-	return 0;
-#endif
+	return TargetRuntime::layout.nativeCallStateOffset.value_or(0);
 }
 
 const std::string& GetThreadOffsetName(intptr_t offset);

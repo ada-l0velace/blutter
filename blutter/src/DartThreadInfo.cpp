@@ -74,7 +74,7 @@ static void initThreadOffsetNames()
 	LEAF_RUNTIME_ENTRY_LIST(DEFINE_LEFT_FN_INFO);
 #undef DEFINE_LEFT_FN_INFO
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399) || defined(BLUTTER_SHOREBIRD_7D8F)
 	decltype(threadOffsetNames) targetNames;
 	for (const auto& [offset, name] : threadOffsetNames)
 		targetNames.emplace(TargetThreadOffset(offset), name);

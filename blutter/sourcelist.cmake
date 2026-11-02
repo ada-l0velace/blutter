@@ -34,6 +34,8 @@ set(SRCS
     DartStub.h
     DartThreadInfo.cpp
     DartThreadInfo.h
+    RuntimeFeatures.h
+    RuntimeLayout.h
     DartTypes.cpp
     DartTypes.h
     Disassembler.cpp

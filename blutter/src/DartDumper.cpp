@@ -10,7 +10,7 @@
 #include <iostream>
 #include <sstream>
 #include <numeric>
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 #include <vm/heap/safepoint.h>
 #include "SnapshotCodeAnalysis.h"
 #include "SnapshotCodeRanges.h"
@@ -61,7 +61,7 @@ static std::string pythonString(const std::string& value)
 	return result + '"';
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 namespace {
 struct VmNativeReturnRecord {
 	SnapshotAnalysis::NativeReturnIdentity identity;
@@ -446,7 +446,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 			for (auto dartFn : cls->Functions()) {
 				const auto ep = dartFn->Address();
 				auto name = getFunctionName4Ida(*dartFn, cls_prefix);
-#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifndef HAS_INSTRUCTIONS_TABLE_RODATA
 				const auto fnSize = dartFn->Size();
 				if (fnSize > 0) {
 					of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + fnSize);
@@ -480,7 +480,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 		std::replace(name.begin(), name.end(), ' ', '_');
 		of << std::format("idaapi.set_name({:#x}, {})\n", ep,
 			pythonString(std::format("{}_{:x}", name, ep)));
-#if !defined(BLUTTER_SHOREBIRD_3C9C) && !defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifndef HAS_INSTRUCTIONS_TABLE_RODATA
 		// UnknownDartCode can have a negative size sentinel. Keep its name,
 		// but do not emit a backwards IDA range for an unavailable size.
 		if (stub->Size() <= 0)
@@ -502,7 +502,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 	}
 
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 	// Export each VM payload exactly once, including checked-entry prefixes.
 	// Avoid guessed sizes and overlapping duplicate ranges from metadata aliases.
 	for (const auto& [start, end] : snapshotCodeRanges)
@@ -684,7 +684,7 @@ const std::string& DartDumper::getQuoteString(dart::Object& obj)
 void DartDumper::DumpCode(const char* out_dir)
 {
 	std::filesystem::create_directory(out_dir);
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 	// Compute checked caller-result facts before either assembly writer uses them.
 	DumpSnapshotCode(out_dir);
 #endif
@@ -768,7 +768,7 @@ void DartDumper::DumpCode(const char* out_dir)
 							}
 						}
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 						if (const auto notes = callerResultNotes.find(asmText.addr); notes != callerResultNotes.end())
 							for (const auto& note : notes->second) of << "    // " << note << '\n';
 #endif
@@ -791,7 +791,7 @@ void DartDumper::DumpCode(const char* out_dir)
 	}
 }
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 void DartDumper::DumpSnapshotCode(const char* asm_dir)
 {
 	// A VM instructions-table entry is a native payload boundary. It does not
@@ -849,7 +849,9 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		payloads.push_back({start - app.base(), end - app.base(), {}, ""});
 	}
 	const auto& pool = app.GetObjectPool();
-#if defined(BLUTTER_SHOREBIRD_8399)
+#if defined(BLUTTER_SHOREBIRD_7D8F)
+	const std::string profileName = "shorebird_7d8f";
+#elif defined(BLUTTER_SHOREBIRD_8399)
 	const std::string profileName = "shorebird_8399";
 #elif defined(BLUTTER_SHOREBIRD_3C9C)
 	const std::string profileName = "shorebird_3c9c";

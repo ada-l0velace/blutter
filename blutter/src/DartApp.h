@@ -1,4 +1,5 @@
 #pragma once
+#include "RuntimeFeatures.h"
 #include "DartLibrary.h"
 #include "DartClass.h"
 #include "DartFunction.h"
