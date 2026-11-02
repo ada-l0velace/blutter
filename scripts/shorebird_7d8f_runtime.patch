@@ -1,0 +1,76 @@
+diff --git a/runtime/vm/app_snapshot.cc b/runtime/vm/app_snapshot.cc
+index 5de7084..f4c90dd 100644
+--- a/runtime/vm/app_snapshot.cc
++++ b/runtime/vm/app_snapshot.cc
+@@ -728,6 +728,9 @@ class Deserializer : public ThreadStackResource {
+   }
+ 
+   ObjectPtr Ref(intptr_t index) const {
++    if (index <= 0 || index > num_objects_) {
++      FATAL("Snapshot reference index out of range: %" Pd, index);
++    }
+     ASSERT(index > 0);
+     ASSERT(index <= num_objects_);
+     return refs_->untag()->element(index);
+@@ -1084,9 +1087,15 @@ class ClassDeserializationCluster : public DeserializationCluster {
+   ~ClassDeserializationCluster() {}
+ 
+   void ReadAlloc(Deserializer* d) override {
++    const intptr_t reserved_class_index = d->ReadUnsigned();
+     predefined_start_index_ = d->next_index();
+     intptr_t count = d->ReadUnsigned();
+     ClassTable* table = d->isolate_group()->class_table();
++    if (reserved_class_index < kNumPredefinedCids ||
++        reserved_class_index > kClassIdTagMax) {
++      FATAL("Unsupported Shorebird reserved class index");
++    }
++    table->AllocateIndex(reserved_class_index);
+     for (intptr_t i = 0; i < count; i++) {
+       intptr_t class_id = d->ReadCid();
+       ASSERT(table->HasValidClassAt(class_id));
+@@ -9614,6 +9623,9 @@ void Deserializer::Deserialize(DeserializationRoots* roots) {
+     }
+ 
+     // We should have completely filled the ref array.
++    if (next_ref_index_ - kFirstReference != num_objects_) {
++      FATAL("Snapshot object allocation count mismatch");
++    }
+     ASSERT_EQUAL(next_ref_index_ - kFirstReference, num_objects_);
+ 
+     {
+@@ -9628,6 +9640,9 @@ void Deserializer::Deserialize(DeserializationRoots* roots) {
+     }
+ 
+     roots->ReadRoots(this);
++    if (stream_.PendingBytes() != 0) {
++      FATAL("Unread snapshot root data: %" Pd, stream_.PendingBytes());
++    }
+ 
+ #if defined(DEBUG)
+     int32_t section_marker = Read<int32_t>();
+diff --git a/runtime/vm/stub_code_list.h b/runtime/vm/stub_code_list.h
+index 146a9a3..9926a11 100644
+--- a/runtime/vm/stub_code_list.h
++++ b/runtime/vm/stub_code_list.h
+@@ -193,6 +193,20 @@ namespace dart {
+   V(FfiAsyncCallbackSend)                                                      \
+   V(CheckIsolateFieldAccess)                                                   \
+   V(CheckedStoreIntoShared)                                                    \
++  V(CallClangCodeWithSimulatorArgs)                                            \
++  V(CallSimulatorFromFfiTrampoline)                                            \
++  V(SimulatorCallToRuntime)                                                    \
++  V(SimulatorCallNoScopeNative)                                                \
++  V(SimulatorCallAutoScopeNative)                                              \
++  V(SimulatorCallBootstrapNative)                                              \
++  V(SimulatorCallNativeThroughSafepoint)                                       \
++  V(TransitionDartToCpuIfNeeded)                                               \
++  V(TransitionDartToSimulatorIfNeeded)                                         \
++  V(RunDartOnCPU)                                                             \
++  V(ResumeOnCPU)                                                              \
++  V(ResumeOnSimulator)                                                        \
++  V(SimulatorEnterSafepoint)                                                  \
++  V(SimulatorExitSafepoint)                                                   \
+   V(UnknownDartCode)
+ 
+ }  // namespace dart
+

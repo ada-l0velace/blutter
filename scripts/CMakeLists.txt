@@ -94,6 +94,13 @@ if (BLUTTER_SHOREBIRD_8399)
 	endif()
 	list(APPEND defines BLUTTER_SHOREBIRD_8399)
 endif()
+option(BLUTTER_SHOREBIRD_7D8F "Reader for the verified Shorebird 7d8f snapshot" OFF)
+if (BLUTTER_SHOREBIRD_7D8F)
+	if (BLUTTER_SHOREBIRD_3C9C OR BLUTTER_SHOREBIRD_8399)
+		message(FATAL_ERROR "Select only one custom runtime profile")
+	endif()
+	list(APPEND defines BLUTTER_SHOREBIRD_7D8F)
+endif()
 
 if (MSVC)
 	# remove compiler exception handler options

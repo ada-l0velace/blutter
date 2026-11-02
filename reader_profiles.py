@@ -22,6 +22,10 @@ class RuntimeProfile:
 
 
 RUNTIME_PROFILES = {
+    'shorebird_7d8f': RuntimeProfile('3.11.4', '7d8fb82a698d78184f7d1e3bbc00540a',
+                                     'a8578c0205c4f52bc8a0d07c5d75f2a19e208187',
+                                     '02abc57898bebc334a997e609ce5827c8ef207d7',
+                                     'BLUTTER_SHOREBIRD_7D8F', 'shorebird_7d8f_runtime.patch'),
     SHOREBIRD_PROFILE: RuntimeProfile('3.13.5', SHOREBIRD_HASH, SHOREBIRD_ENGINE,
                                      SHOREBIRD_BASE, 'BLUTTER_SHOREBIRD_3C9C',
                                      'shorebird_3c9c_runtime.patch'),
