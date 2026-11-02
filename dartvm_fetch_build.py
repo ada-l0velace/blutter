@@ -65,6 +65,28 @@ class ReaderSourceMismatch(RuntimeError):
     pass
 
 
+def checkout_dart_sources(info: DartLibInfo, directory):
+    if info.reader_profile:
+        profile = runtime_profile(info.reader_profile)
+        subprocess.run([GIT_CMD, 'init', '--quiet', directory], check=True)
+        commands = [
+            ['remote', 'add', 'origin', DART_GIT_URL],
+            ['config', 'remote.origin.promisor', 'true'],
+            ['config', 'remote.origin.partialclonefilter', 'blob:none'],
+            ['fetch', '--depth', '1', '--filter=blob:none', 'origin', profile.source_base],
+            ['sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'],
+            ['-c', 'advice.detachedHead=false', 'checkout', '--detach', profile.source_base],
+        ]
+        for command in commands:
+            subprocess.run([GIT_CMD, *command], cwd=directory, check=True)
+    else:
+        subprocess.run([GIT_CMD, '-c', 'advice.detachedHead=false', 'clone', '-b', info.version,
+                        '--depth', '1', '--filter=blob:none', '--sparse', '--progress',
+                        DART_GIT_URL, directory], check=True)
+        subprocess.run([GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools',
+                        'third_party/double-conversion'], cwd=directory, check=True)
+
+
 def checkout_dart(info: DartLibInfo):
     clonedir = os.path.join(SDK_DIR, 'v'+info.sdk_key)
 
@@ -79,11 +101,7 @@ def checkout_dart(info: DartLibInfo):
     
     # clone Dart source code
     if not os.path.exists(clonedir):
-        # minimum clone repository at the target branch
-        subprocess.run([GIT_CMD, '-c', 'advice.detachedHead=false', 'clone', '-b', info.version, '--depth', '1', '--filter=blob:none', '--sparse', '--progress', DART_GIT_URL, clonedir], check=True)
-        # checkout only needed sources (runtime and tools)
-        # since Dart 3.3 "third_party/double-conversion" is moved to outside of "runtime" directory
-        subprocess.run([GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'], cwd=clonedir, check=True)
+        checkout_dart_sources(info, clonedir)
         if info.reader_profile:
             profile = runtime_profile(info.reader_profile)
             revision = subprocess.check_output([GIT_CMD, 'rev-parse', 'HEAD'], cwd=clonedir, text=True).strip()
