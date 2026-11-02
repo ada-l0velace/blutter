@@ -32,6 +32,25 @@ def find_snapshot_symbol(dynsym):
     return None
 
 
+def has_shorebird_exports(symbols):
+    if symbols is None:
+        return False
+    if symbols.num_symbols() > 1 << 20:
+        raise RuntimeError('Engine symbol table exceeds the detection limit')
+    for name in ('shorebird_init', 'shorebird_current_boot_patch_number'):
+        matches = symbols.get_symbol_by_name(name) or []
+        if not any(symbol['st_shndx'] != 'SHN_UNDEF' and
+                   symbol['st_info']['type'] == 'STT_FUNC' and
+                   symbol['st_info']['bind'] in ('STB_GLOBAL', 'STB_WEAK') for symbol in matches):
+            return False
+    return True
+
+
+def is_shorebird_engine(libflutter_file):
+    with open(libflutter_file, 'rb') as stream:
+        return has_shorebird_exports(ELFFile(stream).get_section_by_name('.dynsym'))
+
+
 def extract_snapshot_hash_flags(libapp_file):
     with open(libapp_file, 'rb') as f:
         elf = ELFFile(f)
@@ -137,7 +156,7 @@ def get_dart_commit(url):
     # TODO: if no revision and version in first 4096 bytes, get the file location from the first zip dir entries at the end of file (less than 256KB)
     return commit_id, dart_version
 
-def extract_dart_info(libapp_file: str, libflutter_file: str):
+def extract_dart_info(libapp_file: str, libflutter_file: str, allow_upstream_lookup=True):
     snapshot_hash, flags = extract_snapshot_hash_flags(libapp_file)
     #print('snapshot hash', snapshot_hash)
     #print(flags)
@@ -147,6 +166,8 @@ def extract_dart_info(libapp_file: str, libflutter_file: str):
     # print('dart version', dart_version)
 
     if dart_version is None:
+        if not allow_upstream_lookup:
+            raise RuntimeError('Engine has no embedded Dart version; upstream SDK lookup is disabled for this engine')
         engine_id, sdk_url, sdk_size = get_dart_sdk_url_size(engine_ids)
         # print(engine_id)
         # print(sdk_url)

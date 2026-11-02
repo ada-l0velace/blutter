@@ -202,13 +202,19 @@ def cmake_blutter(input: BlutterInput):
 
 def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     # getting dart version
-    from extract_dart_info import extract_dart_info
-    dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(libapp_path, libflutter_path)
+    from extract_dart_info import extract_dart_info, is_shorebird_engine
+    shorebird = is_shorebird_engine(libflutter_path)
+    dart_version, snapshot_hash, flags, arch, os_name = extract_dart_info(
+        libapp_path, libflutter_path, allow_upstream_lookup=not shorebird)
     print(f'Dart version: {dart_version}, Snapshot: {snapshot_hash}, Target: {os_name} {arch}')
     print('flags: ' + ' '.join(flags))
 
     has_compressed_ptrs = 'compressed-pointers' in flags
     info = DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+    if shorebird and not info.reader_profile:
+        raise RuntimeError(
+            f'Shorebird engine detected, but snapshot format {snapshot_hash} '
+            f'(Dart {dart_version}) has no verified reader. No upstream runtime will be downloaded.')
     if info.reader_profile:
         from extract_dart_info import extract_libflutter_info
         from reader_profiles import verify_engine_profile
