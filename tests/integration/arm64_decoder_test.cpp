@@ -1,10 +1,12 @@
 #include "pch.h"
 #include "Disassembler.h"
+#include "RawAssembly.h"
 #include <cstring>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
 #include <vector>
+#include <sstream>
 
 static size_t checks = 0;
 static void Check(bool value, const char* message)
@@ -124,11 +126,50 @@ static void StreamAndBoundaries()
 		distinct.FirstPtr()->detail->arm64.operands[1].mem.base == ARM64_REG_SP, "zero register and SP remain distinct");
 }
 
+static void RawLibraryListing()
+{
+	// Authored words, addresses and notes; this is independent of any snapshot.
+	const auto bytes = Bytes({0xd503201f, 0xffffffff, 0xd65f03c0});
+	Disassembler decoder;
+	std::ostringstream output;
+	std::vector<uint64_t> displayed, failures;
+	WriteRawAssembly(output, decoder, bytes, 0x1000,
+		[&](uint64_t address) -> std::string_view {
+			displayed.push_back(address);
+			return address == 0x1008 ? "authored return observation" : "";
+		}, [&](uint64_t address) { failures.push_back(address); });
+	const auto text = output.str();
+	Check(displayed == std::vector<uint64_t>{0x1000, 0x1004, 0x1008}, "raw listing retains order and original addresses");
+	Check(failures == std::vector<uint64_t>{0x1004}, "invalid word is reported once");
+	Check(text.find("0x1000: nop") != std::string::npos, "raw listing retains the valid prefix");
+	Check(text.find("0x1004: .word 0xffffffff ; undecoded word") != std::string::npos, "invalid bytes remain explicit data");
+	Check(text.find("0x1008: ret  ; authored return observation") != std::string::npos, "annotation remains at its original instruction");
+	bool stopped = false;
+	try {
+		WriteRawAssembly(output, decoder, bytes, 0x1000,
+			[](uint64_t) -> std::string_view { return {}; },
+			[](uint64_t) { throw std::runtime_error("authored fatal decoder callback"); });
+	}
+	catch (const std::runtime_error&) { stopped = true; }
+	Check(stopped, "raw renderer propagates a stopping diagnostic");
+	for (const auto [size, address] : std::vector<std::pair<size_t, uint64_t>>{
+		{0, 0x1000}, {3, 0x1000}, {4, 0x1001}, {8, UINT64_MAX - 3}}) {
+		bool refused = false;
+		try {
+			WriteRawAssembly(output, decoder, std::span(bytes).first(size), address,
+				[](uint64_t) -> std::string_view { return {}; }, [](uint64_t) {});
+		}
+		catch (const std::invalid_argument&) { refused = true; }
+		Check(refused, "invalid raw range is rejected");
+	}
+}
+
 int main()
 {
 	try {
 		ValidUnprivilegedLoads();
 		StreamAndBoundaries();
+		RawLibraryListing();
 		std::cout << "ARM64 decoder checks passed: " << checks << '\n';
 		return 0;
 	}

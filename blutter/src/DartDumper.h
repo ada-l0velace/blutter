@@ -26,8 +26,24 @@ public:
 	std::string ObjectToString(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
 
 private:
+	[[noreturn]] void InvalidNativeRange(uint64_t address, const char* reason, const std::string& function = {});
+	void DumpNativeFunction(std::ostream& output, DartFunction& function, Disassembler& decoder);
+	std::string DescribeAssembly(const AsmText& text);
+	std::map<uint64_t, std::vector<std::string>> FunctionObservations(const std::vector<DartFunction*>& functions);
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 	void DumpSnapshotCode(const char* asm_dir);
+	struct LibraryPayload {
+		uint64_t start, end;
+		intptr_t table;
+		uint32_t index;
+		bool discarded;
+		DartFunction* primary;
+		std::vector<DartFunction*> functions;
+		std::vector<std::pair<uint64_t, std::string>> comments;
+	};
+	void DumpLibraryPayload(std::ostream& output, LibraryPayload& payload, Disassembler& decoder);
+	std::map<uint64_t, LibraryPayload> libraryPayloads;
+	std::map<const DartFunction*, uint64_t> functionPayloads;
 	std::vector<std::pair<uint64_t, uint64_t>> snapshotCodeRanges;
 	std::vector<std::pair<uint64_t, uint64_t>> recoveredCodeRanges;
 	std::map<uint64_t, std::vector<std::string>> callerResultNotes;

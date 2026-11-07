@@ -80,9 +80,10 @@ std::string DartLibrary::CreatePath(const char* base_dir)
 		start_pos = url.find("/.dart_tool/") + 1;
 	}
 	else if (url.starts_with("dart:")) {
+		const auto filename = DartLibraryFileName(url);
 		path.append("dart");
 		std::filesystem::create_directories(path);
-		return path.append("/").append(&url[5]).append(".dart");
+		return path.append("/").append(filename);
 	}
 	else {
 		// obfuscated

@@ -2,6 +2,18 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <stdexcept>
+
+inline std::string DartLibraryFileName(std::string_view url)
+{
+	if (!url.starts_with("dart:")) throw std::invalid_argument("Expected a Dart SDK library URL");
+	const auto name = url.substr(5);
+	if (name.empty() || name == "." || name == ".." ||
+		name.find_first_of("/\\:") != std::string_view::npos ||
+		std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+		throw std::invalid_argument("Invalid Dart SDK library filename");
+	return std::string(name) + ".dart";
+}
 
 inline std::string LibraryDisplayName(std::string_view url)
 {

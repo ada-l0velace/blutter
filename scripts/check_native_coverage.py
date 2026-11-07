@@ -16,6 +16,7 @@ from pathlib import Path
 import capstone
 from elftools.elf.elffile import ELFFile
 from check_blutter_output import unprivileged_load_mnemonic
+from native_assembly import native_assembly_streams
 
 
 def main():
@@ -141,30 +142,37 @@ def main():
 
     pattern = re.compile(r'^\s*//\s*(0x[0-9a-f]+): ([a-z][a-z0-9.]*)\s*(.*?)\s*$')
     def assembly_lines():
-        for line in (args.output / 'asm/snapshot_code.asm').open():
-            match = pattern.match(line)
-            if match:
-                yield int(match[1], 16), match[2], match[3].partition(';')[0].strip()
+        for _, stream in native_assembly_streams(args.output, manifest):
+            for line in stream:
+                match = pattern.match(line)
+                if match:
+                    yield int(match[1], 16), match[2], match[3].partition(';')[0].strip()
 
     lines = iter(assembly_lines())
     md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
     instruction_count = 0
-    for start, end in expected:
-        cursor = start
-        for address in range(start, end, 4):
-            word = read(address, 4)
-            instruction = next(md.disasm_lite(word, address), None)
-            actual = next(lines, None)
-            assert actual is not None and actual[0] == address, f'Missing assembly at {address:#x}'
-            if instruction is not None:
-                _, size, mnemonic, operands = instruction
-                assert size == 4 and actual == (address, mnemonic, operands), f'Assembly mismatch at {address:#x}'
-            else:
-                mnemonic = unprivileged_load_mnemonic(word)
-                assert mnemonic and actual[1] == mnemonic, f'Undecoded ELF word at {address:#x}'
+    def check_word(address, actual):
+        word = read(address, 4)
+        instruction = next(md.disasm_lite(word, address), None)
+        assert actual is not None and actual[0] == address, f'Missing assembly at {address:#x}'
+        if instruction is not None:
+            _, size, mnemonic, operands = instruction
+            assert size == 4 and actual == (address, mnemonic, operands), f'Assembly mismatch at {address:#x}'
+        else:
+            mnemonic = unprivileged_load_mnemonic(word)
+            assert mnemonic and actual[1] == mnemonic, f'Undecoded ELF word at {address:#x}'
+
+    if manifest.get('assembly_layout') == 2:
+        # The section reader checks complete, unique ranges in their assigned
+        # files. File order is independent of original instructions-table order.
+        for actual in lines:
+            check_word(actual[0], actual)
             instruction_count += 1
-            cursor += 4
-        assert cursor == end, f'Undecoded ELF bytes at {cursor:#x}'
+    else:
+        for start, end in expected:
+            for address in range(start, end, 4):
+                check_word(address, next(lines, None))
+                instruction_count += 1
     assert next(lines, None) is None, 'Extra/duplicate assembly rows'
     assert instruction_count * 4 == image_end - starts[0]
     assert manifest['undecoded_words'] == 0

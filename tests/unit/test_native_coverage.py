@@ -90,6 +90,31 @@ class Fixture:
 
 
 class NativeCoverageTests(unittest.TestCase):
+    def test_partitioned_library_and_fallback_payloads(self):
+        for defect in (None, 'prefix', 'duplicate', 'destination', 'outside', 'missing', 'path', 'layout'):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary))
+                rows = fixture.assembly.read_text().splitlines(keepends=True)
+                fixture.manifest['assembly_layout'] = 2
+                sections = []
+                for row, lines in zip(fixture.manifest['ranges'], [rows[:3], rows[3:5], rows[5:]]):
+                    row['assembly_file'] = 'snapshot_code.asm' if row['index'] == 1 else 'dart/example.dart'
+                    sections.append(f'// Native payload {row["start"]:#x}..{row["end"]:#x}; authored\n' +
+                                    ''.join(lines) + '// End native payload\n')
+                library = fixture.output / 'asm/dart/example.dart'
+                library.parent.mkdir()
+                library.write_text(sections[0] + sections[2])
+                fixture.assembly.write_text(sections[1])
+                if defect == 'prefix': library.write_text(library.read_text().replace(rows[0], ''))
+                if defect == 'duplicate': library.write_text(library.read_text() + sections[0])
+                if defect == 'destination': fixture.assembly.write_text(sections[1] + sections[0]); library.write_text(sections[2])
+                if defect == 'outside': library.write_text(library.read_text() + rows[0])
+                if defect == 'missing': library.write_text(sections[0])
+                if defect == 'path': fixture.manifest['ranges'][0]['assembly_file'] = '../escape.dart'
+                if defect == 'layout': fixture.manifest['assembly_layout'] = 99
+                result = fixture.run()
+                self.assertEqual(result.returncode == 0, defect is None, result.stderr)
+
     def test_separate_vm_stub_ranges_are_preserved(self):
         for defect in (None, 'lost', 'outside'):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:

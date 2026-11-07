@@ -25,5 +25,19 @@ int main()
 		++checks;
 	}
 	std::cout << "Unaligned field checks passed: " << checks << '\n';
+	for (const auto& [url, expected] : std::array<std::pair<std::string_view, std::string_view>, 3>{{
+		{"dart:core", "core.dart"}, {"dart:isolate", "isolate.dart"}, {"dart:_internal", "_internal.dart"}}}) {
+		if (DartLibraryFileName(url) != expected) return 1;
+		++checks;
+	}
+	for (const auto url : {"dart:", "dart:.", "dart:..", "dart:../escape", "dart:dir/file",
+		"dart:dir\\file", "dart:C:escape", "dart:line\nbreak", "package:authored/unit.dart"}) {
+		bool rejected = false;
+		try { DartLibraryFileName(url); }
+		catch (const std::invalid_argument&) { rejected = true; }
+		if (!rejected) return 1;
+		++checks;
+	}
+	std::cout << "Field and library naming checks passed: " << checks << '\n';
 	return 0;
 }

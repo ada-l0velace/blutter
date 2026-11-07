@@ -2,6 +2,7 @@
 import copy
 from pathlib import Path
 import sys
+import subprocess
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
@@ -9,6 +10,14 @@ from check_call_result_notes import expected_facts, parse_note, check_stream, me
 
 
 class CallResultNotes(unittest.TestCase):
+    def test_output_reader_refuses_disabled_assertions(self):
+        result = subprocess.run([sys.executable, '-O', '-c',
+            "from pathlib import Path; from native_assembly import native_assembly_streams; "
+            "next(native_assembly_streams(Path('.'), {}))"],
+            cwd=Path(__file__).resolve().parents[2] / 'scripts', capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('require assertions', result.stderr)
+
     def setUp(self):
         self.graph = {'edges': [{'site': 0x1010, 'stack_inputs': [], 'array_arguments': []}],
             'call_result_contexts': [{'payload': 0x1000,

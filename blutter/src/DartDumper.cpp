@@ -19,6 +19,8 @@
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
+#include "RawAssembly.h"
+#include "NativePayloadRouting.h"
 
 // New engines split closure allocation into numbered stubs with a different
 // ABI. Do not assign the older, reviewed contract to an unreviewed variant.
@@ -681,6 +683,135 @@ const std::string& DartDumper::getQuoteString(dart::Object& obj)
 	return txt;
 }
 
+void DartDumper::InvalidNativeRange(uint64_t address, const char* reason, const std::string& function)
+{
+	const AnalysisIssue issue("invalid-library-code-range", address, reason, AnalysisIssueKind::Invalid);
+	if (diagnostics) diagnostics->Report(issue, function);
+	throw issue;
+}
+
+void DartDumper::DumpNativeFunction(std::ostream& output, DartFunction& function, Disassembler& decoder)
+{
+	if (function.Size() == 0) return;
+	const auto start = function.Address();
+	const auto size = function.Size();
+	const auto invalidRange = [&](const char* reason) {
+		InvalidNativeRange(start, reason, function.FullName());
+	};
+	if (size < 0 || start % 4 || size % 4 || static_cast<uint64_t>(size) > UINT64_MAX - start)
+		invalidRange("SDK function has an invalid instruction span.");
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
+	const auto containing = std::upper_bound(snapshotCodeRanges.begin(), snapshotCodeRanges.end(), start,
+		[](uint64_t address, const auto& range) { return address < range.first; });
+	bool bounded = containing != snapshotCodeRanges.begin() && start + size <= std::prev(containing)->second;
+	if (!bounded) {
+		for (const auto& [address, stub] : app.stubs) {
+			if (stub->Size() > 0 && start >= address && start - address <= static_cast<uint64_t>(stub->Size()) &&
+				static_cast<uint64_t>(size) <= static_cast<uint64_t>(stub->Size()) - (start - address)) {
+				bounded = true;
+				break;
+			}
+		}
+	}
+	if (!bounded)
+		invalidRange("SDK function exceeds its recorded native payload.");
+#endif
+	output << "    // Native assembly with snapshot annotations; declaration uses retained metadata.\n";
+	WriteRawAssembly(output, decoder,
+		std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(function.MemAddress()), size), start,
+		[&](uint64_t address) -> std::string_view {
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
+			if (const auto notes = callerResultNotes.find(address); notes != callerResultNotes.end())
+				for (const auto& note : notes->second) output << "    // " << note << '\n';
+#endif
+			return {};
+		}, [&](uint64_t address) {
+			const AnalysisIssue issue("undecoded-sdk-instruction", address,
+				"SDK function contains a word the ARM64 decoder cannot decode.");
+			if (diagnostics) diagnostics->Report(issue, function.FullName());
+			else throw issue;
+		});
+}
+
+std::string DartDumper::DescribeAssembly(const AsmText& text)
+{
+	switch (text.dataType) {
+	case AsmText::ThreadOffset: return "THR::" + GetThreadOffsetName(text.threadOffset);
+	case AsmText::PoolOffset: return getPoolObjectDescription(text.poolOffset);
+	case AsmText::Boolean: return text.boolVal ? "true" : "false";
+	case AsmText::Call:
+		if (auto* function = app.GetFunction(text.callAddress)) {
+			auto name = function->FullName();
+			const auto cid = function->ReturnType();
+			if (cid != dart::kIllegalCid) {
+				const auto* cls = app.classes.at(cid);
+				name += std::format(" -> {} (size={:#x})", cls->FullName(), cls->Size());
+			}
+			return name;
+		}
+	}
+	return {};
+}
+
+std::map<uint64_t, std::vector<std::string>> DartDumper::FunctionObservations(const std::vector<DartFunction*>& functions)
+{
+	std::map<uint64_t, std::vector<std::string>> notes;
+#ifndef NO_CODE_ANALYSIS
+	for (auto* function : functions) {
+		const auto* analyzed = function->GetAnalyzedData();
+		if (!analyzed) {
+			if (!function->Class().Library().isInternal && function->Size() > 0) {
+				const AnalysisIssue issue("missing-function-analysis", function->Address(),
+					"Application function has no retained semantic analysis; exporting original native instructions.");
+				if (diagnostics) diagnostics->Report(issue, function->FullName());
+				else throw issue;
+			}
+			continue; // SDK bodies use native observations instead.
+		}
+		const auto origin = functions.size() > 1 ? " [" + function->FullName() + "]" : "";
+		auto add = [&](uint64_t address, std::string text) {
+			auto& at = notes[address];
+			text += origin;
+			if (std::find(at.begin(), at.end(), text) == at.end()) at.push_back(std::move(text));
+		};
+		for (const auto& instruction : analyzed->il_insns)
+			if (instruction->Kind() != ILInstr::Unknown)
+				add(instruction->Start(), "IL: " + instruction->ToString());
+		for (const auto& text : function->GetAnalyzedData()->asmTexts.Data())
+			if (auto description = DescribeAssembly(text); !description.empty())
+				add(text.addr, "Application annotation: " + description);
+	}
+#endif
+	return notes;
+}
+
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
+void DartDumper::DumpLibraryPayload(std::ostream& output, LibraryPayload& payload, Disassembler& decoder)
+{
+	output << std::format("    // Native payload {:#x}..{:#x}; function entry {:#x}.\n",
+		payload.start, payload.end, payload.primary->Address());
+	for (const auto* function : payload.functions)
+		output << std::format("    // Entry {:#x}: {}\n", function->Address(), function->FullName());
+	const auto semantic = FunctionObservations(payload.functions);
+	for (const auto& [address, notes] : semantic)
+		if (address < payload.start || address >= payload.end)
+			InvalidNativeRange(address, "Retained function observation exceeds its native payload.", payload.primary->FullName());
+	auto comment = payload.comments.begin();
+	WriteRawAssembly(output, decoder,
+		std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(app.base() + payload.start), payload.end - payload.start), payload.start,
+		[&](uint64_t address) -> std::string_view {
+			if (const auto found = semantic.find(address); found != semantic.end())
+				for (const auto& note : found->second) output << std::format("    // @function {:#x}: {}\n", address, note);
+			if (const auto found = callerResultNotes.find(address); found != callerResultNotes.end())
+				for (const auto& note : found->second) output << "    // " << note << '\n';
+			while (comment != payload.comments.end() && comment->first < address) ++comment;
+			return comment != payload.comments.end() && comment->first == address ? std::string_view(comment->second) : std::string_view{};
+		}, [](uint64_t) { /* The full-image pass has already reported decode gaps. */ });
+	output << "    // End native payload\n";
+	payload.comments.clear();
+}
+#endif
+
 void DartDumper::DumpCode(const char* out_dir)
 {
 	std::filesystem::create_directory(out_dir);
@@ -692,9 +823,6 @@ void DartDumper::DumpCode(const char* out_dir)
 	Disassembler disasmer;
 
 	for (auto dartLib : app.libs) {
-		if (dartLib->isInternal)
-			continue;
-
 		auto out_file = dartLib->CreatePath(out_dir);
 		std::ofstream of(out_file);
 		dartLib->PrintCommentInfo(of);
@@ -712,6 +840,26 @@ void DartDumper::DumpCode(const char* out_dir)
 				of << "\n";
 			for (auto dartFn : dartCls->Functions()) {
 				dartFn->PrintHead(of);
+#ifdef HAS_INSTRUCTIONS_TABLE_RODATA
+				if (const auto route = functionPayloads.find(dartFn); route != functionPayloads.end()) {
+					if (auto payload = libraryPayloads.find(route->second); payload != libraryPayloads.end()) {
+						if (payload->second.primary == dartFn) DumpLibraryPayload(of, payload->second, disasmer);
+						else of << std::format("    // Native body shared with payload {:#x}; see its primary declaration in this library.\n", route->second);
+					}
+					else {
+						of << std::format("    // Native body: snapshot_code.asm, payload {:#x}; ownership is shared or uncertain.\n", route->second);
+						for (const auto& [address, notes] : FunctionObservations({dartFn}))
+							for (const auto& note : notes) of << std::format("    // @function {:#x}: {}\n", address, note);
+					}
+					dartFn->PrintFoot(of);
+					continue;
+				}
+#endif
+				if (dartLib->isInternal) {
+					DumpNativeFunction(of, *dartFn, disasmer);
+					dartFn->PrintFoot(of);
+					continue;
+				}
 
 #ifndef NO_CODE_ANALYSIS
 				// use as app is loaded at zero
@@ -803,21 +951,39 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	if (!assembly || !manifest) throw std::runtime_error("Cannot create snapshot code output");
 	recoveredCodeRanges.clear();
 	snapshotCodeRanges.clear();
+	libraryPayloads.clear();
+	functionPayloads.clear();
 	std::vector<uint64_t> metadataEntries;
+	std::vector<NativePayloadClaim> ownership;
+	std::vector<DartFunction*> functions;
 	std::vector<SnapshotAnalysis::Name> metadataNames;
-	for (const auto* library : app.libs) {
+	std::vector<std::string> libraryFiles;
+	size_t libraryIndex = 0;
+	for (auto* library : app.libs) {
+		const auto file = std::filesystem::relative(library->CreatePath(asm_dir), directory).generic_string();
+		if (std::find(libraryFiles.begin(), libraryFiles.end(), file) != libraryFiles.end())
+			throw std::runtime_error("Different Dart libraries have the same output path");
+		libraryFiles.push_back(file);
 		for (auto* cls : library->classes) {
-			for (const auto* fn : cls->Functions()) {
+			for (auto* fn : cls->Functions()) {
 				metadataEntries.push_back(fn->Address());
+				ownership.push_back({fn->Address(), libraryIndex});
+				functions.push_back(fn);
 				metadataNames.push_back({fn->Address(), fn->FullName(), "function"});
 			}
 		}
+		++libraryIndex;
 	}
 	for (const auto& [address, stub] : app.stubs) {
 		metadataEntries.push_back(address);
+		ownership.push_back({address, std::nullopt});
 		metadataNames.push_back({address, stub->FullName(), "stub"});
 	}
 	std::sort(metadataEntries.begin(), metadataEntries.end());
+	std::sort(metadataNames.begin(), metadataNames.end(), [](const auto& a, const auto& b) {
+		return std::tie(a.address, a.kind, a.text) < std::tie(b.address, b.kind, b.text);
+	});
+	const auto displayNames = metadataNames;
 	const auto imageStart = reinterpret_cast<uintptr_t>(app.isolate_snapshot_instructions);
 	const auto imageSize = *reinterpret_cast<const uintptr_t*>(imageStart);
 	const auto imageEnd = imageStart + imageSize;
@@ -845,8 +1011,26 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	for (uint32_t i = 0; i < rootTable.rodata()->length; ++i)
 		entries.push_back(rootTable.EntryPointAt(i));
 	const auto inventory = SnapshotCodeRanges(imageStart, codeStart, imageEnd, entries);
+	std::vector<std::pair<uint64_t, uint64_t>> outputRanges;
 	for (const auto& [start, end] : inventory) {
 		payloads.push_back({start - app.base(), end - app.base(), {}, ""});
+		outputRanges.emplace_back(start - app.base(), end - app.base());
+	}
+	const auto destinations = NativePayloadDestinations(outputRanges, ownership);
+	for (auto* function : functions) {
+		const auto next = std::upper_bound(outputRanges.begin(), outputRanges.end(), function->Address(),
+			[](uint64_t address, const auto& range) { return address < range.first; });
+		if (next == outputRanges.begin() || function->Address() >= std::prev(next)->second) continue;
+		const auto index = std::prev(next) - outputRanges.begin();
+		const auto [start, end] = outputRanges[index];
+		functionPayloads.emplace(function, start);
+		if (!destinations[index]) continue;
+		if (!NativeFunctionMatchesPayload(start, end, function->PayloadAddress(), function->PayloadSize(), function->Address()))
+			InvalidNativeRange(function->Address(), "Retained function metadata disagrees with its native payload.", function->FullName());
+		auto [found, inserted] = libraryPayloads.try_emplace(start, LibraryPayload{start, end, 0, 0, false, function, {}, {}});
+		found->second.functions.push_back(function);
+		if (std::tuple(function->Address(), function->FullName()) <
+			std::tuple(found->second.primary->Address(), found->second.primary->FullName())) found->second.primary = function;
 	}
 	const auto& pool = app.GetObjectPool();
 #if defined(BLUTTER_SHOREBIRD_7D8F)
@@ -1060,9 +1244,10 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		auto instructions = disassembler.Disasm(reinterpret_cast<const uint8_t*>(start), end - start, start - app.base());
 		annotations.RegisterEntries(instructions.Insns(), instructions.Count());
 	}
-	assembly << "// Raw native payloads from the VM instructions table.\n"
+	assembly << "// Native fallback payloads from the VM instructions table.\n"
+		"// Payloads with a verified library owner are written in that library's .dart listing.\n"
 		"// Names/types may be unavailable; this file contains no inferred Dart IL.\n";
-	manifest << "{\"format\":1,\"image_start\":" << imageStart - app.base()
+	manifest << "{\"format\":1,\"assembly_layout\":2,\"image_start\":" << imageStart - app.base()
 		<< ",\"image_end\":" << imageEnd - app.base()
 		<< ",\"table_data_address\":" << reinterpret_cast<uintptr_t>(rootTable.rodata()) - app.base()
 		<< ",\"table_length\":" << rootTable.rodata()->length
@@ -1101,8 +1286,9 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 			const bool hasMetadata = name != metadataEntries.end() && *name < limit;
 			if (!hasMetadata) recoveredCodeRanges.emplace_back(address, limit);
 			if (comma) manifest << ','; comma = true;
-			manifest << std::format("{{\"table\":{},\"index\":{},\"start\":{},\"end\":{},\"discarded_code\":{},\"has_metadata_name\":{}}}",
-				t, i, address, limit, i < table.rodata()->first_entry_with_code ? "true" : "false", hasMetadata ? "true" : "false");
+			manifest << std::format("{{\"table\":{},\"index\":{},\"start\":{},\"end\":{},\"discarded_code\":{},\"has_metadata_name\":{},\"assembly_file\":{}}}",
+				t, i, address, limit, i < table.rodata()->first_entry_with_code ? "true" : "false", hasMetadata ? "true" : "false",
+				JsonNativeText(destinations[i] ? libraryFiles[*destinations[i]] : "snapshot_code.asm"));
 			AssemblyPayload printable{t, i, address, limit, i < table.rodata()->first_entry_with_code, hasMetadata, {}};
 			uint64_t cursor = address;
 			while (cursor < limit) {
@@ -1150,10 +1336,21 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	});
 	// Render original words after the checked result pass. Only disassembly is
 	// repeated here; no receiver/context analysis is rerun for presentation.
-	for (const auto& payload : assemblyPayloads) {
-		assembly << std::format("\n// Table {}, entry {}, {} Code metadata; {}existing export.\n// Payload {:#x}..{:#x}\n",
-			payload.table, payload.index, payload.discarded ? "discarded" : "retained", payload.hasMetadata ? "" : "no ", payload.start, payload.end);
+	for (auto& payload : assemblyPayloads) {
+		if (auto target = libraryPayloads.find(payload.start); target != libraryPayloads.end()) {
+			target->second.table = payload.table;
+			target->second.index = payload.index;
+			target->second.discarded = payload.discarded;
+			target->second.comments = std::move(payload.comments);
+			continue;
+		}
+		assembly << std::format("\n// Table {}, entry {}, {} Code metadata; metadata name {}.\n// Payload {:#x}..{:#x}\n",
+			payload.table, payload.index, payload.discarded ? "discarded" : "retained", payload.hasMetadata ? "available" : "unavailable", payload.start, payload.end);
 		if (!payload.hasMetadata) assembly << std::format("// unattributed_code_{:x}\n", payload.start);
+		for (auto name = std::lower_bound(displayNames.begin(), displayNames.end(), payload.start,
+			[](const auto& name, uint64_t address) { return name.address < address; });
+			name != displayNames.end() && name->address < payload.end; ++name)
+			assembly << std::format("// Entry {:#x}: {} ({})\n", name->address, name->text, name->kind);
 		auto comment = payload.comments.begin();
 		uint64_t cursor = payload.start;
 		while (cursor < payload.end) {
@@ -1175,6 +1372,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 				cursor = instruction->address + instruction->size;
 			}
 		}
+		assembly << "// End native payload\n";
 	}
 	assembly.close(); manifest.close();
 	if (!assembly || !manifest) throw std::runtime_error("Cannot write snapshot assembly or inventory");

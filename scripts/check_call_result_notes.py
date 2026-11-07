@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import re
+from native_assembly import native_assembly_streams
 
 
 PREFIX = re.compile(r'^\s*// caller-result @(0x[0-9a-f]+) \[payload (0x[0-9a-f]+)\]: (.*)$')
@@ -129,8 +130,13 @@ def check_output(graph, output):
     expected = expected_facts(graph)
     catalogue = output / 'blutter_frida.js'
     class_names = metadata_class_names(catalogue.read_text()) if catalogue.exists() else None
-    with (output / 'asm/snapshot_code.asm').open() as stream:
-        native, kinds = check_stream(stream, expected, class_names)
+    manifest_path = output / 'snapshot_code.json'
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    native, kinds = Counter(), {}
+    for _, stream in native_assembly_streams(output, manifest):
+        observed, found = check_stream(stream, expected, class_names)
+        native.update(observed)
+        kinds.update(found)
     assert set(native) == expected, 'Native assembly omits a checked result fact'
     typed_count = files = 0
     for path in (output / 'asm').rglob('*.dart'):
