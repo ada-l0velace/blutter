@@ -93,6 +93,7 @@ struct Profile {
 	bool consumeSdkStubReturns = false;
 	// Independently checked all-normal-return classes. Like native result-only
 	// contracts, these grant no memory or preserved-register effects.
+	// A BLR consumer additionally needs a proved pre-call dispatch-table target.
 	std::map<uint64_t, uint32_t> provedReturnClasses;
 	// Result facts attached to one original direct BL, never to every caller
 	// of a conditionally typed helper. No preservation effect is implied.

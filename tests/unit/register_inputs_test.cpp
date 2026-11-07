@@ -2,6 +2,7 @@
 #include "CallEffects.h"
 #include "CallResultContexts.h"
 #include "AnalysisSelection.h"
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -84,6 +85,30 @@ int main() {
 		Check(Analyze(WithDispatch({Call(0x1000,0x7000),0xaa0003e1}), returned).resolutions.size() == 1, "Machine result-only contract reaches dispatch");
 		Check(Analyze(WithDispatch(words), returned, &inputs).resolutions.empty(), "Machine return contract grants no frame effect");
 		Check(AnalyzeCallEffects({{0x1000, Bytes({0xa9bf79fd,0xaa0f03fd,Call(0x1008,0x7000),0xaa1d03ef,0xa8c179fd,0xd65f03c0})}},returned).certificates.empty(), "Return class cannot admit a frame certificate");
+		// Authored dispatch through X30, which BLR itself overwrites.
+		auto indirectWords = frame;
+		indirectWords.insert(indirectWords.end(), dispatch.begin(), dispatch.end());
+		indirectWords.insert(indirectWords.end(), {0xaa1d03ef,0xa8c179fd,0xd65f03c0});
+		auto indirectProfile = MakeProfile(); indirectProfile.provedReturnClasses[0x3000] = 8;
+		const auto indirectResult = Analyze(indirectWords, indirectProfile, &inputs);
+		Check(indirectResult.normalReturnClass == 8, "Resolved indirect call consumes its closed machine result");
+		const auto& indirectProof = indirectResult.returnClasses.at(0x1024).proof;
+		for (const uint64_t site : {0x100c,0x1010,0x1014,0x1018,0x1024})
+			Check(std::find(indirectProof.begin(), indirectProof.end(), site) != indirectProof.end(), "Indirect result retains target and call provenance");
+		Check(!Analyze(indirectWords, MakeProfile(), &inputs).normalReturnClass, "Resolved target alone supplies no result class");
+		Check(!Analyze(indirectWords, indirectProfile).normalReturnClass, "Unresolved target cannot select a result summary");
+		auto wrongSummary = MakeProfile(); wrongSummary.provedReturnClasses[0x3004] = 8;
+		Check(!Analyze(indirectWords, wrongSummary, &inputs).normalReturnClass, "A nearby summary is not an exact target match");
+		auto absentTarget = indirectProfile; absentTarget.dispatchEntries[7].reset();
+		Check(!Analyze(indirectWords, absentTarget, &inputs).normalReturnClass, "Missing dispatch entry cannot supply a result");
+		auto clobberedTarget = indirectWords; clobberedTarget.insert(clobberedTarget.begin()+6,0xd280001e);
+		Check(!Analyze(clobberedTarget, indirectProfile, &inputs).normalReturnClass, "Overwritten BLR source cannot reuse an earlier target");
+		auto savedIndirect = frame; savedIndirect.push_back(0xf81f03a1);
+		savedIndirect.insert(savedIndirect.end(),dispatch.begin(),dispatch.end());
+		savedIndirect.insert(savedIndirect.end(),{0xf85f03a0,0xaa1d03ef,0xa8c179fd,0xd65f03c0});
+		Check(!Analyze(savedIndirect,indirectProfile,&inputs).normalReturnClass, "Indirect result grants no saved-local preservation");
+		auto otherResult = MakeProfile(); otherResult.nativeReturnClasses.emplace(0x3000,NativeReturnContract{8,"allocate_two_byte_string"});
+		Check(!Analyze(indirectWords,otherResult,&inputs).normalReturnClass, "Direct native contracts are not silently generalized to BLR");
 		returned.provedReturnClasses[0x4000] = 7;
 		Check(Analyze(dispatch,returned,&inputs).certificate.empty(), "Overlapping native and machine identities rejected");
 		// Authored call edges exercise selection and one-level grouping.

@@ -612,11 +612,13 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		// BLR may overwrite its own source (LR), so capture the proven dispatch
 		// target before applying architectural writes.
 		Fact indirect;
+		std::optional<uint64_t> indirectTarget;
 		std::optional<uint64_t> indirectCallee;
 		if (i.id == ARM64_INS_BLR && d.op_count == 1 && d.operands[0].type == ARM64_OP_REG) {
 			indirect = Read(state, d.operands[0].reg);
-			if (indirect.kind == Target && indirect.value < profile.dispatchEntries.size() && profile.dispatchEntries[indirect.value] &&
-				profile.frameSafeCallees.contains(*profile.dispatchEntries[indirect.value])) indirectCallee = *profile.dispatchEntries[indirect.value];
+			if (indirect.kind == Target && indirect.value < profile.dispatchEntries.size())
+				indirectTarget = profile.dispatchEntries[indirect.value];
+			if (indirectTarget && profile.frameSafeCallees.contains(*indirectTarget)) indirectCallee = indirectTarget;
 		}
 		const auto writes = Writes(i);
 		Fact produced;
@@ -832,6 +834,11 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				if (const auto bound = profile.callReturnClasses.find(i.address); bound != profile.callReturnClasses.end())
 					state.regs[0] = {Object, bound->second.classId, 0, 0, {i.address}};
 			}
+			// A resolved dispatch can consume a closed machine result summary
+			// without granting caller-frame or working-register preservation.
+			if (indirectTarget && profile.wordReturnRegister == ARM64_REG_X0)
+				if (const auto returned = profile.provedReturnClasses.find(*indirectTarget); returned != profile.provedReturnClasses.end())
+					state.regs[0] = Proven({Object, returned->second, 0, 0, indirect.proof}, i.address);
 			if (forwarded && preserves) state.regs[0] = forwarded->first;
 			if (indexed && preserves) state.regs[0] = indexed->first;
 			if (followIndexedResult) {

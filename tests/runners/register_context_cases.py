@@ -17,6 +17,24 @@ def exercise_register_contexts(run):
     assert len(bound(result)) == 1 and len(bound(result)[0]['resolutions']) == 1
     assert bound(result)[0]['resolutions'][0]['snapshot_target'] == 0x2004
 
+    result = run('indirect-machine-result-in-register-context', ['ldr x1, [x27, #40]', 'bl 0x5000'],
+                 {0x5000: frame + dispatch + restore, 0x2004: ['ldr x0, [x27, #40]', 'ret']})
+    assert dict(result['receiver_metadata']['machine_return_classes'])[0x2004] == 1
+    assert bound(result)[0]['normal_return_class'] == 1
+    assert 0x5018 in bound(result)[0]['certificate']['return_classes'][0]['proof']
+
+    result = run('indirect-target-without-machine-result', ['ldr x1, [x27, #40]', 'bl 0x5000'],
+                 {0x5000: frame + dispatch + restore, 0x2004: ['ret']})
+    assert bound(result)[0]['normal_return_class'] is None
+
+    result = run('indirect-machine-result-without-frame-effect', ['ldr x1, [x27, #40]', 'bl 0x5000'],
+                 {0x5000: frame + ['stur x1, [x29, #-8]'] + dispatch + ['ldur x0, [x29, #-8]'] + restore,
+                  0x2004: frame + ['bl 0x5200', 'ldr x0, [x27, #40]'] + restore,
+                  0x5200: ['svc #0', 'ret']})
+    assert dict(result['receiver_metadata']['machine_return_classes'])[0x2004] == 1
+    assert not any(c['payload'] == 0x2004 for c in result['call_effects'])
+    assert bound(result)[0]['normal_return_class'] is None
+
     result = run('register-input-unknown-call-kills-binding', ['ldr x1, [x27, #40]', 'bl 0x5000'],
                  {0x5000: ['bl 0x5100'] + dispatch, 0x5100: ['svc #0', 'ret']})
     assert not bound(result)

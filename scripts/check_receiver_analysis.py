@@ -473,11 +473,13 @@ def check_receivers(graph, read, decode, audit):
             spills = dict(spills)
             ops = ins.operands
             destination = reg(ins, ops[0].reg) if ops and ops[0].type == a.ARM64_OP_REG else -1
-            indirect_callee = None
+            indirect_target = indirect_callee = None
             if graph.get('format', 4) >= 10 and ins.id == a.ARM64_INS_BLR and len(ops) == 1 and ops[0].type == a.ARM64_OP_REG:
                 indirect = read_reg(old, ins, ops[0].reg)
-                if indirect[0] == TARGET and indirect[1] < len(dispatch['entries']) and dispatch['entries'][indirect[1]] in safe_callees:
-                    indirect_callee = dispatch['entries'][indirect[1]]
+                if indirect[0] == TARGET and indirect[1] < len(dispatch['entries']):
+                    indirect_target = dispatch['entries'][indirect[1]]
+                    if indirect_target in safe_callees:
+                        indirect_callee = indirect_target
             bits = width(ins, ops[0].reg) if destination >= 0 else 0
             produced = EMPTY
             if ins.id in (a.ARM64_INS_DC, a.ARM64_INS_SYS, a.ARM64_INS_SYSL):
@@ -644,6 +646,8 @@ def check_receivers(graph, read, decode, audit):
                     state[0] = fact(OBJECT, sdk_stub_returns[ops[0].imm])
                 if ins.id == a.ARM64_INS_BL and ops[0].imm in active_machine_returns:
                     state[0] = fact(OBJECT, active_machine_returns[ops[0].imm])
+                if graph.get('format', 4) >= 27 and metadata.get('word_return_register') == 'x0' and indirect_target in active_machine_returns:
+                    state[0] = fact(OBJECT, active_machine_returns[indirect_target])
                 if result_mode and ins.address in result_bindings:
                     binding = result_bindings[ins.address]
                     assert ins.id == a.ARM64_INS_BL and ops[0].imm == binding['callee']
