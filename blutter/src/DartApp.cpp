@@ -128,6 +128,8 @@ DartLibrary* DartApp::addLibraryClass(const dart::Library& library, const dart::
 		classes[dartCls->id] = dartCls;
 		for (const auto dartFn : dartCls->functions) {
 			functions[dartFn->Address()] = dartFn;
+			if (dartFn->Ptr() != dart::Function::null())
+				functionMetadata.Remember((uintptr_t)dartFn->Ptr(), dartFn);
 		}
 	}
 	return dartLib;
@@ -146,6 +148,8 @@ DartLibrary* DartApp::addLibrary(const dart::Library& library)
 			classes[dartCls->id] = dartCls;
 		for (const auto dartFn : dartCls->functions) {
 			functions[dartFn->Address()] = dartFn;
+			if (dartFn->Ptr() != dart::Function::null())
+				functionMetadata.Remember((uintptr_t)dartFn->Ptr(), dartFn);
 		}
 	}
 
@@ -347,6 +351,9 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 				auto dartFn = it->second; \
 				std::erase(dartFn->Class().functions, dartFn); \
 				functions.erase(it); \
+				if (dartFn->Ptr() != dart::Function::null()) \
+					functionMetadata.Forget((uintptr_t)dartFn->Ptr(), dartFn); \
+				delete dartFn; \
 			} \
 		} \
 	}
@@ -356,6 +363,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
 
 DartFunction* DartApp::addFunctionNoCheck(const dart::Function& func)
 {
+	if (auto* existing = FindFunctionMetadata(func.ptr())) return existing;
 	// find its class or library, then add it
 	const auto cls_ptr = func.Owner();
 	const auto cid = cls_ptr.untag()->id();
@@ -377,7 +385,9 @@ DartFunction* DartApp::addFunctionNoCheck(const dart::Function& func)
 			throw std::runtime_error(msg);
 		}
 	}
-	return cls->AddFunction(func.ptr());
+	auto* model = cls->AddFunction(func.ptr());
+	functionMetadata.Remember((uintptr_t)func.ptr(), model);
+	return model;
 }
 
 void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
@@ -387,10 +397,11 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 	// (UnknownDartCode or LazyCompile). Its null signature is not an app type.
 	if (stubs.contains(ep_addr)) return;
 #endif
-	if (!functions.contains(ep_addr)) {
-		auto dartFn = addFunctionNoCheck(func);
-		functions[dartFn->Address()] = dartFn;
-	}
+	if (FindFunctionMetadata(func.ptr())) return;
+	auto* model = addFunctionNoCheck(func);
+	// A code-only placeholder or earlier representative still describes the
+	// machine address. Preserve it while retaining every distinct metadata alias.
+	functions.try_emplace(model->Address(), model);
 }
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
@@ -567,74 +578,26 @@ static bool hasInstructionsEntry(uintptr_t entry)
 void DartApp::finalizeFunctionsInfo()
 {
 	auto& parentFn = dart::Function::Handle();
-	std::unordered_map<uint64_t, DartFunction*> pending_functions;
-	for (auto& [_, dartFn] : functions) {
-		// update parent pointer
-		if (dartFn->parent) {
-			parentFn = dart::FunctionPtr((intptr_t)dartFn->parent);
-			const auto ep_addr = parentFn.entry_point() - base();
-			if (stubs.contains(ep_addr)) {
-				dartFn->parent = nullptr;
-			}
-			else if (functions.contains(ep_addr)) {
-				dartFn->parent = functions[ep_addr];
-			}
-			else if (pending_functions.contains(ep_addr)) {
-				dartFn->parent = pending_functions[ep_addr];
-			}
-			else {
-				auto newDartFn = addFunctionNoCheck(parentFn);
-				pending_functions[ep_addr] = newDartFn;
-				dartFn->parent = newDartFn;
-			}
+	// Resolve lexical parents by metadata identity. Shared machine entries do
+	// not imply that two closures have the same parent or signature.
+	for (size_t i = 0; i < functionMetadata.Models().size(); ++i) {
+		auto* function = functionMetadata.Models()[i];
+		if (!function->parent) continue;
+		parentFn = dart::FunctionPtr((intptr_t)function->parent);
+		const auto entry = parentFn.entry_point() - base();
+		if (stubs.contains(entry)) {
+			function->parent = nullptr;
+			continue;
 		}
-
-		// TODO: handle function result type and paramters type
-	}
-
-	std::unordered_map<uint64_t, DartFunction*> new_functions;
-	while (!pending_functions.empty()) {
-		for (auto& [dartFn_ep, dartFn] : pending_functions) {
-			if (dartFn->parent) {
-				parentFn = dart::FunctionPtr((intptr_t)dartFn->parent);
-				const auto ep_addr = parentFn.entry_point() - base();
-				if (stubs.contains(ep_addr)) {
-					dartFn->parent = nullptr;
-				}
-				else if (functions.contains(ep_addr)) {
-					dartFn->parent = functions[ep_addr];
-				}
-				else if (pending_functions.contains(ep_addr)) {
-					dartFn->parent = pending_functions[ep_addr];
-				}
-				else if (new_functions.contains(ep_addr)) {
-					dartFn->parent = new_functions[ep_addr];
-				}
-				else {
-					auto newDartFn = addFunctionNoCheck(parentFn);
-					new_functions[ep_addr] = newDartFn;
-					dartFn->parent = newDartFn;
-				}
-			}
-			functions[dartFn_ep] = dartFn;
-		}
-		pending_functions.clear();
-		pending_functions = std::move(new_functions);
-		new_functions.clear();
-	}
-
-	// null self parent
-	for (auto& [_, dartFn] : functions) {
-		// update parent pointer
-		if (dartFn->parent == dartFn) {
-			dartFn->parent = nullptr;
-		}
+		auto* parent = addFunctionNoCheck(parentFn);
+		functions.try_emplace(parent->Address(), parent);
+		function->parent = parent == function ? nullptr : parent;
 	}
 
 	// extract function parameters
 	// Note: Signature is dropped in most function
 	auto& func = dart::Function::Handle();
-	for (auto& [_, dartFn] : functions) {
+	for (auto* dartFn : functionMetadata.Models()) {
 		func = dartFn->ptr;
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 		// Anonymous retained Code objects have no Function metadata.

@@ -2,6 +2,7 @@ set(SRCS
     AnalysisDiagnostics.h
     RawAssembly.h
     NativePayloadRouting.h
+    FunctionIdentityIndex.h
     ReadUnaligned.h
     Arm64GdtAnalysis.cpp
     Arm64GdtAnalysis.h

@@ -377,6 +377,10 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 						edge.targetPayload = payloads[*targetIndex].start;
 						edge.targetLabel = payloads[*targetIndex].label;
 						note(std::format("{} -> {} [payload {:#x}, entry +{:#x}]", edge.kind, Preview(edge.targetLabel), *edge.targetPayload, address - *edge.targetPayload));
+						const auto aliases = std::count_if(payloads[*targetIndex].names.begin(), payloads[*targetIndex].names.end(),
+							[&](const auto& name) { return name.address == address && name.kind == "function"; });
+						if (aliases > 1)
+							note(std::format("shared Function entry: {} metadata aliases; source identity unresolved", aliases));
 					} else note(std::format("{} -> {:#x} [outside snapshot payloads]", edge.kind, address));
 					edge.registerConstants = callConstants();
 					if (call && profile.wordReturnRegister == ARM64_REG_X0 && profile.nativeReturnClasses.contains(address))

@@ -149,6 +149,8 @@ DartClass::~DartClass()
 
 DartFunction* DartClass::AddFunction(const dart::ObjectPtr funcPtr)
 {
+	for (auto* existing : functions)
+		if (existing->Ptr() == funcPtr) return existing;
 	auto dartFn = new DartFunction(*this, dart::Function::RawCast(funcPtr));
 	functions.push_back(dartFn);
 	return dartFn;

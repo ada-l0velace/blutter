@@ -129,6 +129,23 @@ int main(int argc, char** argv)
 		std::optional<uint64_t> selectedCaller;
 		if (const auto* value = std::getenv("BLUTTER_TEST_ANALYSIS_CALLER"); value && *value)
 			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(value);
+		// Authored direct call: BL from 0x1000 to 0x2000, then RET.
+		const uint8_t aliasCall[] = {0x00, 0x04, 0x00, 0x94, 0xc0, 0x03, 0x5f, 0xd6};
+		cs_insn* aliasRaw = nullptr;
+		const auto aliasCount = cs_disasm(handle, aliasCall, sizeof(aliasCall), 0x1000, 0, &aliasRaw);
+		const std::shared_ptr<cs_insn> aliasInstructions(aliasRaw, [aliasCount](cs_insn* p) { cs_free(p, aliasCount); });
+		if (aliasCount != 2) throw std::runtime_error("Cannot decode authored alias call");
+		for (bool shared : {false, true}) {
+			std::vector<SnapshotAnalysis::Name> names{{0x2000, "first_alias", "function"}, {0x2000, "runtime_alias", "stub"}};
+			if (shared) names.push_back({0x2000, "second_alias", "function"});
+			SnapshotAnalysis::Analyzer aliases(profile, {{0x1000, 0x1008, {}, ""}, {0x2000, 0x2004, {}, ""}}, std::move(names));
+			aliases.RegisterEntries(aliasRaw, aliasCount);
+			const auto comments = aliases.Analyze(aliasRaw, aliasCount, 0x1000);
+			const auto note = comments.find(0x1000);
+			if (note == comments.end() ||
+				(note->second.find("shared Function entry: 2 metadata aliases; source identity unresolved") != std::string::npos) != shared)
+				throw std::runtime_error("Shared machine entry was presented as a unique Function identity");
+		}
 		SnapshotAnalysis::Analyzer analyzer(std::move(profile), std::move(payloads), {{0x2000, "known_function", "function"}}, selectedCaller);
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
 		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);

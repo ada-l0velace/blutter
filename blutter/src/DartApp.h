@@ -4,6 +4,7 @@
 #include "DartClass.h"
 #include "DartFunction.h"
 #include "DartStub.h"
+#include "FunctionIdentityIndex.h"
 #include <unordered_map>
 
 class DartApp
@@ -24,6 +25,9 @@ public:
 
 	DartClass* GetClass(intptr_t cid);
 	DartFnBase* GetFunction(uint64_t addr);
+	DartFunction* FindFunctionMetadata(dart::FunctionPtr ptr) const {
+		return functionMetadata.Find((uintptr_t)ptr);
+	}
 	// Exact registered entries only; this query never splits an existing stub range.
 	bool HasFunctionAt(uint64_t addr) const { return functions.contains(addr) || stubs.contains(addr); }
 	DartField* GetStaticField(intptr_t offset) { return staticFields.at(offset); }
@@ -64,6 +68,7 @@ private:
 	std::vector<DartClass*> classes;
 	std::vector<DartClass*> topClasses;
 	std::unordered_map<uint64_t, DartFunction*> functions;
+	FunctionIdentityIndex<DartFunction> functionMetadata;
 	std::unordered_map<uint64_t, DartStub*> stubs;
 	std::unordered_map<uint64_t, DartField*> staticFields;
 	std::unique_ptr<DartTypeDb> typeDb;

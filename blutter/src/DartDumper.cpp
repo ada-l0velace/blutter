@@ -224,6 +224,27 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		of << std::format("{{\"entry\":{},\"unknown_code\":{},\"has_code\":{}}}",
 			fn.entry_point() - app.base(), code.IsUnknownDartCode() ? "true" : "false", fn.HasCode() ? "true" : "false");
 	}
+	of << "],\"function_metadata\":[";
+	comma = false;
+	for (const auto ptr : visitor.functions) {
+		const auto& function = dart::Function::Handle(zone, ptr);
+		const auto& owner = dart::Class::Handle(zone, function.Owner());
+		const auto& code = dart::Code::Handle(zone, function.CurrentCode());
+		std::string libraryUri;
+		if (!owner.IsNull()) {
+			const auto& library = dart::Library::Handle(zone, owner.library());
+			if (!library.IsNull()) libraryUri = dart::String::Handle(zone, library.url()).ToCString();
+		}
+		if (comma) of << ','; comma = true;
+		of << "{\"entry\":" << function.entry_point() - app.base()
+			<< ",\"name\":" << JsonNativeText(function.UserVisibleNameCString())
+			<< ",\"class_name\":" << JsonNativeText(owner.IsNull() || owner.IsTopLevel() ? "" : owner.ScrubbedNameCString())
+			<< ",\"library_uri\":" << JsonNativeText(libraryUri)
+			<< ",\"kind\":" << static_cast<int>(function.kind())
+			<< ",\"registered_model\":" << (app.FindFunctionMetadata(ptr) ? "true" : "false")
+			<< ",\"has_code\":" << (function.HasCode() ? "true" : "false")
+			<< ",\"unknown_code\":" << (code.IsUnknownDartCode() ? "true" : "false") << '}';
+	}
 	of << "],\"native_return_sdk\":[[" << dart::MethodRecognizer::kAllocateOneByteString << ',' << dart::kOneByteStringCid
 		<< ",\"Internal_allocateOneByteString\",\"allocate_one_byte_string\"],[" << dart::MethodRecognizer::kAllocateTwoByteString << ',' << dart::kTwoByteStringCid
 		<< ",\"Internal_allocateTwoByteString\",\"allocate_two_byte_string\"]],\"native_return_identities\":[";
@@ -1483,11 +1504,14 @@ std::string DartDumper::ObjectToString(dart::Object& obj, bool simpleForm, bool 
 		return "SubtypeTestCache";
 	case dart::kFunctionCid: {
 		// stub never be in Object Pool
-		auto fnBase = app.GetFunction(dart::Function::Cast(obj).entry_point() - app.base());
-		if (fnBase == nullptr || fnBase->IsStub()) {
-			return std::format("Function: [unknown] ({:#x})", dart::Function::Cast(obj).entry_point() - app.base());
+		const auto& metadata = dart::Function::Cast(obj);
+		auto* dartFn = app.FindFunctionMetadata(metadata.ptr());
+		if (!dartFn) {
+			auto* fnBase = app.GetFunction(metadata.entry_point() - app.base());
+			if (fnBase == nullptr || fnBase->IsStub())
+				return std::format("Function: [unknown] ({:#x})", metadata.entry_point() - app.base());
+			dartFn = fnBase->AsFunction();
 		}
-		auto dartFn = fnBase->AsFunction();
 		if (dartFn->IsClosure()) {
 			auto parentFn = dartFn->GetOutermostFunction();
 			if (parentFn) {
