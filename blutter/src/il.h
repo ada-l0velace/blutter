@@ -42,6 +42,7 @@ public:
 		WriteBarrier,
 		TestType,
 		StoreObjectPool,
+		MemoryAccess,
 	};
 
 	ILInstr(const ILInstr&) = delete;
@@ -507,6 +508,45 @@ public:
 	A64::Register arrReg;
 	VarStorage idx;
 	ArrayOp arrayOp;
+};
+
+// Byte-addressed native memory; no Dart field type or heap identity is implied.
+class MemoryAccessInstr : public ILInstr {
+public:
+	enum Base { Frame, Stack, Thread, Pool, Dispatch, NativeStack, StaticFields };
+	MemoryAccessInstr(AddrRange range, A64::Register value, Base base, int64_t offset,
+		unsigned bytes, bool isLoad, A64::Register index = {}, bool signedIndex = false, unsigned shift = 0)
+		: ILInstr(MemoryAccess, range), value(value), base(base), offset(offset), bytes(bytes),
+		  isLoad(isLoad), index(index), signedIndex(signedIndex), shift(shift) {}
+
+	std::string ToString() override {
+		const char* name = "";
+		switch (base) {
+		case Frame: name = "frame"; break;
+		case Stack: name = "SP"; break;
+		case Thread: name = "THR"; break;
+		case Pool: name = "PP"; break;
+		case Dispatch: name = "GDT"; break;
+		case NativeStack: name = "native_sp"; break;
+		case StaticFields: name = "field_table_values"; break;
+		}
+		std::string address = std::format("{}[", name);
+		if (index.IsSet())
+			address += std::format("{}({}) * {} ", signedIndex ? "SignExtend32" : "ZeroExtend32", index.Name(), uint64_t{1} << shift);
+		const auto magnitude = offset < 0 ? uint64_t{0} - static_cast<uint64_t>(offset) : static_cast<uint64_t>(offset);
+		address += std::format("{}{:#x}]", offset < 0 ? '-' : '+', magnitude);
+		return std::format("{}Memory{}: {} = {}", isLoad ? "Load" : "Store", bytes * 8,
+			isLoad ? value.Name() : address, isLoad ? address : value.Name());
+	}
+
+	A64::Register value;
+	Base base;
+	int64_t offset;
+	unsigned bytes;
+	bool isLoad;
+	A64::Register index;
+	bool signedIndex;
+	unsigned shift;
 };
 
 class LoadFieldInstr : public ILInstr {

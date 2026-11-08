@@ -354,6 +354,24 @@ static void TaggedClassIdChecks()
 	}
 }
 
+static void NativeMemoryPresentation()
+{
+	const AddrRange range{Base, Base + 16};
+	MemoryAccessInstr stack(range, A64::Register{ARM64_REG_X3}, MemoryAccessInstr::Frame, -0x30, 8, false);
+	Check(stack.Kind() == ILInstr::MemoryAccess && stack.Start() == Base && stack.End() == Base + 16,
+		"native memory has its own IL kind and retains its complete instruction span");
+	Check(stack.ToString() == "StoreMemory64: frame[-0x30] = r3", "stack store is not an unsigned object field");
+	MemoryAccessInstr table(range, A64::Register{ARM64_REG_X5}, MemoryAccessInstr::StaticFields, 0x180, 8, true);
+	Check(table.ToString() == "LoadMemory64: r5 = field_table_values[+0x180]", "table offset remains byte-addressed");
+	MemoryAccessInstr indexed(range, A64::Register{ARM64_REG_W5}, MemoryAccessInstr::Frame, 0x10, 4, true,
+		A64::Register{ARM64_REG_W2}, true, 2);
+	Check(indexed.ToString() == "LoadMemory32: r5 = frame[SignExtend32(r2) * 4 +0x10]", "access width and index extension remain explicit");
+	MemoryAccessInstr negative(range, A64::Register{ARM64_REG_X3}, MemoryAccessInstr::Thread, INT64_MIN, 8, true);
+	Check(negative.ToString() == "LoadMemory64: r3 = THR[-0x8000000000000000]", "minimum signed displacement prints without overflow");
+	LoadFieldInstr heap(range, A64::Register{ARM64_REG_X3}, A64::Register{ARM64_REG_X1}, 7);
+	Check(heap.ToString() == "LoadField: r3 = r1->field_7", "ordinary field convention is unchanged");
+}
+
 int main(int argc, char** argv)
 {
 	try {
@@ -416,6 +434,7 @@ int main(int argc, char** argv)
 		MaskedDispatchConstant();
 		TaggedClassIdChecks();
 		TypeOwnershipChecks();
+		NativeMemoryPresentation();
 	}
 	catch (const AnalysisStopped& error) {
 		std::cerr << error.what() << '\n';

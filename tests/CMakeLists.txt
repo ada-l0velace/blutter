@@ -26,6 +26,11 @@ add_executable(arm64_patterns_test unit/arm64_patterns_test.cpp)
 target_include_directories(arm64_patterns_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 target_link_libraries(arm64_patterns_test PRIVATE capstone)
 
+add_executable(arm64_memory_test unit/arm64_memory_test.cpp)
+target_include_directories(arm64_memory_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(arm64_memory_test PRIVATE capstone)
+add_test(NAME arm64_memory COMMAND arm64_memory_test)
+
 foreach(profile IN ITEMS upstream shorebird_3c9c shorebird_8399 shorebird_7d8f)
     add_executable(thread_layout_${profile}_test unit/thread_layout_test.cpp)
     target_include_directories(thread_layout_${profile}_test PRIVATE "${BLUTTER_SOURCE_DIR}")
@@ -152,6 +157,6 @@ add_test(NAME invalid_input_prevents_export COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/runners/expect_input_failure.cmake")
 
 foreach(target arm64_analyzer_test arm64_decoder_test arm64_boxing_test
-        arm64_patterns_test analysis_diagnostics_test snapshot_code_ranges_test native_payload_routing_test function_identity_index_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test native_returns_test sdk_stub_returns_test register_inputs_test call_result_annotations_test)
+        arm64_patterns_test arm64_memory_test analysis_diagnostics_test snapshot_code_ranges_test native_payload_routing_test function_identity_index_test read_unaligned_test native_ir_test arm64_ir_test array_length_test stack_check_test entry_predicate_test native_returns_test sdk_stub_returns_test register_inputs_test call_result_annotations_test)
     blutter_instrument_test_target(${target})
 endforeach()

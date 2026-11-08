@@ -315,6 +315,7 @@ public:
 	std::unique_ptr<ILInstr> processLoadFieldTableInstr(AsmIterator& insn);
 	std::unique_ptr<AllocateObjectInstr> processTryAllocateObject(AsmIterator& insn);
 	std::unique_ptr<WriteBarrierInstr> processWriteBarrierInstr(AsmIterator& insn);
+	std::unique_ptr<ILInstr> processBasedMemoryAccess(AsmIterator& insn);
 	std::unique_ptr<ILInstr> processLoadStore(AsmIterator& insn);
 
 	struct ObjectPoolInstr {
@@ -384,6 +385,7 @@ static const AsmMatcherFn matcherFns[] = {
 	&FunctionAnalyzer::processLoadFieldTableInstr,
 	(AsmMatcherFn) &FunctionAnalyzer::processTryAllocateObject,
 	(AsmMatcherFn) &FunctionAnalyzer::processWriteBarrierInstr,
+	&FunctionAnalyzer::processBasedMemoryAccess,
 	&FunctionAnalyzer::processLoadStore,
 };
 
@@ -2474,6 +2476,48 @@ std::unique_ptr<LoadValueInstr> FunctionAnalyzer::processComputedMemoryLoad(AsmI
 	++insn;
 	return std::make_unique<LoadValueInstr>(insn.Wrap(first), A64::Register{match->destination},
 		VarItem{VarStorage::Immediate, new VarExpression(std::format("LoadMemory({})", address))});
+}
+
+std::unique_ptr<ILInstr> FunctionAnalyzer::processBasedMemoryAccess(AsmIterator& insn)
+{
+	auto* start = insn.Current();
+	const auto remaining = std::span<const cs_insn>(start, asm_insns.LastPtr() - start + 1);
+	const std::array<arm64_reg, 6> bases{CSREG_DART_FP, CSREG_DART_SP, CSREG_DART_THR,
+		CSREG_DART_PP, CSREG_DART_DISPATCH_TABLE, ARM64_REG_SP};
+	auto match = arm64_patterns::BasedMemoryAccess(remaining, bases);
+	if (!match) return nullptr;
+	const auto& targets = knownBranchTargets();
+	const auto noInteriorEntry = [&](size_t last) {
+		for (size_t i = 1; i <= last; ++i)
+			if (std::binary_search(targets.begin(), targets.end(), start[i].address) || app.HasFunctionAt(start[i].address))
+				return false;
+		return true;
+	};
+	if (!noInteriorEntry(match->lastIndex)) return nullptr;
+	const std::array<MemoryAccessInstr::Base, 6> names{MemoryAccessInstr::Frame, MemoryAccessInstr::Stack,
+		MemoryAccessInstr::Thread, MemoryAccessInstr::Pool, MemoryAccessInstr::Dispatch, MemoryAccessInstr::NativeStack};
+	auto base = names[std::find(bases.begin(), bases.end(), match->base) - bases.begin()];
+	const auto threadLoad = match->isLoad && match->base == CSREG_DART_THR && match->index == ARM64_REG_INVALID;
+	if (threadLoad && !GetThreadOffsetName(match->offset).empty()) {
+		auto& text = fnInfo->asmTexts.AtAddr(start[match->lastIndex].address);
+		text.dataType = AsmText::ThreadOffset;
+		text.threadOffset = match->offset;
+	}
+	// Only the exact runtime field-table load establishes this second base.
+	// Keep offsets in bytes; do not invent a Dart field owner or value type.
+	if (auto access = arm64_patterns::FollowFieldTableAccess(remaining, *match, CSREG_DART_THR,
+		AOT_Thread_field_table_values_offset, targets); access && noInteriorEntry(access->lastIndex)) {
+		match = access;
+		base = MemoryAccessInstr::StaticFields;
+	}
+	const auto end = start[match->lastIndex].address + 4;
+	auto result = std::make_unique<MemoryAccessInstr>(AddrRange{start->address, end},
+		A64::Register{match->value}, base, match->offset, match->bytes, match->isLoad,
+		match->index == ARM64_REG_INVALID ? A64::Register{} : A64::Register{match->index},
+		match->extension == ARM64_EXT_SXTW, match->shift);
+	insn.SetCurrent(start + match->lastIndex);
+	++insn;
+	return result;
 }
 
 std::unique_ptr<ILInstr> FunctionAnalyzer::processObjectPoolInstr(AsmIterator& insn)
