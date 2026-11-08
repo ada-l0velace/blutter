@@ -150,12 +150,17 @@ int main(int argc, char** argv)
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
 		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);
 		SnapshotAnalysis::AssemblyNotes notes;
-		analyzer.Write(argv[1], [&](const auto& result) {
-			for (const auto& [site, added] : SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()))
+		auto appendNotes = [&](const auto& addedNotes) {
+			for (const auto& [site, added] : addedNotes)
 				for (const auto& line : added) {
 					auto& retained = notes[site];
 					if (std::find(retained.begin(), retained.end(), line) == retained.end()) retained.push_back(line);
 				}
+		};
+		analyzer.Write(argv[1], [&](const auto& result) {
+			appendNotes(SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()));
+		}, {}, [&](const auto& result) {
+			appendNotes(SnapshotAnalysis::BuildRegisterResultNotes(result, analyzer.Edges()));
 		});
 		std::ofstream assembly(std::string(argv[1]) + ".asm");
 		for (const auto& block : blocks) for (size_t n = 0; n < block.count; ++n) {

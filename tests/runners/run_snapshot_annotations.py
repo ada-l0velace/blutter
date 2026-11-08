@@ -130,6 +130,23 @@ def main():
                     from check_snapshot_annotations import decode_payload
                     return check_receivers(value, read, lambda raw, address: decode_payload(decoder, raw, address), audit)
                 return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
+            if name == 'indirect-machine-result-in-register-context':
+                for defect in ('missing', 'callee', 'class', 'proof', 'basis', 'duplicate'):
+                    forged = copy.deepcopy(result)
+                    context = next(c for c in forged['register_contexts'] if c['payload'] == 0x5000)
+                    rows = context['certificate']['indirect_returns']
+                    if defect == 'missing': rows.clear()
+                    elif defect == 'callee': rows[0]['callee'] += 4
+                    elif defect == 'class': rows[0]['class_id'] += 1
+                    elif defect == 'proof': rows[0]['proof'].remove(rows[0]['site'])
+                    elif defect == 'basis': rows[0]['basis'] = 'guessed'
+                    else: rows *= 2
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('indirect-result-tamper-'+defect)
+                    else:
+                        raise AssertionError('Accepted forged indirect result: '+defect)
             if name == 'sdk-stub-return-wrapper':
                 for defect in ('summary-class', 'producer-basis', 'caller-basis', 'producer-site',
                                'phase-budget', 'missing-summary', 'ordinary-promotion', 'duplicate-producer'):

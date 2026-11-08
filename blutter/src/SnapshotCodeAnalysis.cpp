@@ -598,7 +598,8 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 
 void Analyzer::Write(const std::string& filename,
 	const std::function<void(const CallResultContextResult&)>& presentResults,
-	const std::function<void(uint64_t)>& reportSdkDecodeFailure) const
+	const std::function<void(uint64_t)>& reportSdkDecodeFailure,
+	const std::function<void(const RegisterContextResult&)>& presentRegisterResults) const
 {
 	using Bindings = std::vector<std::tuple<int64_t, std::string, uint64_t>>;
 	std::map<std::pair<uint64_t, Bindings>, std::vector<uint64_t>> groups;
@@ -866,9 +867,10 @@ void Analyzer::Write(const std::string& filename,
 		presentResults(sdkResults.producers);
 		presentResults(sdkResults.callers);
 	}
+	if (presentRegisterResults) presentRegisterResults(registerContexts);
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":27,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out << "{\"format\":28,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize

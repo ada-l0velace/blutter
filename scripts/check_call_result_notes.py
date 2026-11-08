@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 from native_assembly import native_assembly_streams
+from indirect_result_records import indirect_results, scope_key
 
 
 PREFIX = re.compile(r'^\s*// caller-result @(0x[0-9a-f]+) \[payload (0x[0-9a-f]+)\]: (.*)$')
@@ -43,7 +44,28 @@ def expected_facts(graph):
             facts.add((payload, d['site'], 'dispatch', d['snapshot_target']))
         for v in c['certificate'].get('return_classes', []):
             facts.add((payload, v['site'], 'ret', v['class_id']))
+    for row in indirect_results(graph):
+        facts.add((row['payload'], row['site'], 'indirect', row['class_id'], row['callee'],
+                   scope_key(row['entry_register_inputs'], row['entry_stack_inputs'], row['return_bindings'])))
     return facts
+
+
+def parse_scope(registers, stack, calls):
+    def values(text, pattern, convert, limit):
+        if text == 'none':
+            return ()
+        parts = text.split(',')
+        assert 0 < len(parts) <= limit, 'Invalid indirect-result scope size'
+        matches = [re.fullmatch(pattern, part) for part in parts]
+        assert all(matches), 'Malformed indirect-result condition'
+        result = tuple(convert(m) for m in matches)
+        assert len({v[0] for v in result}) == len(result), 'Duplicate indirect-result condition'
+        return tuple(sorted(result))
+    return (values(registers, r'x(\d+)=(0x[0-9a-f]+)', lambda m: (int(m[1]), int(m[2], 16)), 15),
+            values(stack, r'SP\+(\d+):(word|heap_class)=(0x[0-9a-f]+)',
+                   lambda m: (int(m[1]), m[2], int(m[3], 16)), 32),
+            values(calls, r'(0x[0-9a-f]+)@(0x[0-9a-f]+)=(0x[0-9a-f]+)',
+                   lambda m: tuple(int(m[k], 16) for k in (1, 2, 3)), 16384))
 
 
 def parse_note(line, class_names=None):
@@ -57,7 +79,10 @@ def parse_note(line, class_names=None):
         body = body[:name.start()] + body[name.end():]
     cid = None
     m = re.fullmatch(r'normal-return X0 -> class (0x[0-9a-f]+) \[(callee summary|caller-bound helper|matched SDK stub|SDK-derived helper)\]', body)
-    if m:
+    if (indirect := re.fullmatch(r'indirect normal-return X0 -> class (0x[0-9a-f]+) \[callee (0x[0-9a-f]+); entry regs ([^;]+); stack ([^;]+); after calls ([^;]+)\]', body)):
+        cid = int(indirect[1], 16)
+        fact = (payload, site, 'indirect', cid, int(indirect[2], 16), parse_scope(*indirect.groups()[2:]))
+    elif m:
         cid = int(m[1], 16); fact = (payload, site, 'normal', cid, m[2])
     elif (m := re.fullmatch(r'stack Dart SP([+-]\d+) -> (class|word) (0x[0-9a-f]+) \[partial\]', body)):
         value = int(m[3], 16); kind = 'heap_class' if m[2] == 'class' else 'word'

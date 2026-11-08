@@ -4,6 +4,11 @@
 
 namespace SnapshotAnalysis {
 struct InitialStackCheck;
+struct IndirectCallReturn {
+	uint64_t callee;
+	uint32_t classId;
+	std::vector<uint64_t> proof;
+};
 struct ReceiverAnalysisResult {
 	std::map<uint64_t, StaticDispatch> resolutions;
 	std::string certificate;
@@ -11,6 +16,7 @@ struct ReceiverAnalysisResult {
 	std::map<uint64_t, std::vector<StackInput>> stackInputs;
 	std::map<uint64_t, std::vector<RegisterInput>> registerInputs;
 	std::map<uint64_t, ReturnedClass> returnClasses;
+	std::map<uint64_t, IndirectCallReturn> indirectReturns;
 	std::optional<uint32_t> normalReturnClass;
 	std::vector<EntryStackLoad> entryStackLoads;
 	std::map<uint64_t, ForwardedReturn> forwardedReturns;

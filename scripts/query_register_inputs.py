@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+from indirect_result_records import indirect_results
 
 
 def query(graph, site):
@@ -37,6 +38,7 @@ def query(graph, site):
             'callee_normal_return_class': dict(graph['receiver_metadata'].get('machine_return_classes', [])).get(edge.get('target')),
             'contexts': contexts, 'call_result_contexts': result_contexts,
             'limits': 'Partial full-width physical register observations, not complete source arguments. Context results require their explicit caller bindings. Result classes grant no memory or register preservation; unknown remains unknown.'}
+    result['indirect_results'] = indirect_results(graph, site)
     targeted = graph.get('targeted_call_result_analysis')
     if targeted is not None and targeted['payload'] == edge['source']:
         result['targeted_analysis'] = targeted
@@ -44,7 +46,7 @@ def query(graph, site):
 
 
 def render(result):
-    target = 'unresolved' if result['target'] is None else hex(result['target'])
+    target = ('context-dependent' if result.get('indirect_results') else 'unresolved') if result['target'] is None else hex(result['target'])
     lines = [f"Call {result['site']:#x} -> {target} {result['target_label']}".rstrip(),
              'Physical heap-class observations (partial):']
     lines.extend(f"  {v['register']}: class {v['class_id']:#x}" for v in result['register_inputs'])
@@ -56,6 +58,18 @@ def render(result):
         lines.append(f"Matched SDK stub normal-return X0: class {result['sdk_stub_return']['class_id']:#x} [return only]")
     if result['callee_normal_return_class'] is not None:
         lines.append(f"Callee all-normal-return X0 summary: class {result['callee_normal_return_class']:#x}")
+    for value in result.get('indirect_results', []):
+        lines.append(f"Scoped indirect result: target {value['callee']:#x}; normal-return X0: class {value['class_id']:#x}")
+        lines.append('  Entry register conditions: ' + (', '.join(
+            f"{v['register']}=class {v['class_id']:#x}" for v in value['entry_register_inputs']) or 'none'))
+        lines.append('  Entry stack conditions: ' + (', '.join(
+            f"SP+{v['sp_offset']:#x} {v['kind']} {int(v['value'],16):#x}" for v in value['entry_stack_inputs']) or 'none'))
+        lines.append('  Prior-call result conditions: ' + (', '.join(
+            f"{v['site']:#x}->{v['callee']:#x}: class {v['class_id']:#x}" for v in value['return_bindings']) or 'none'))
+        if value['callers']:
+            lines.append('  Observed original callers: ' + ', '.join(hex(site) for site in value['callers']))
+    if not result.get('indirect_results') and result['target'] is None:
+        lines.append('Scoped indirect result: no explicit record')
     for context in result['contexts']:
         bindings = ', '.join(f"{v['register']}=class {v['class_id']:#x}" for v in context['register_inputs'])
         lines.append(f'Caller-qualified helper context: {bindings}')
@@ -66,7 +80,7 @@ def render(result):
         for observation in context['stack_observations']:
             values = ', '.join(f"SP+{v['sp_offset']:#x} {v['kind']} {int(v['value'], 16):#x}" for v in observation['values'])
             lines.append(f"  Call {observation['site']:#x}: {values}")
-    if not result['contexts']:
+    if not result['contexts'] and not result.get('indirect_results'):
         lines.append('Caller-qualified helper context: none recorded')
     if result.get('targeted_analysis') is not None:
         target = result['targeted_analysis']

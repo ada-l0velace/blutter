@@ -223,6 +223,7 @@ def check_receivers(graph, read, decode, audit):
     verified, incoming_checks, blocks_checked = {}, 0, 0
     verified_stacks, verified_loads, verified_returns = set(), set(), set()
     verified_registers, register_stack_count, return_class_count = set(), 0, 0
+    indirect_result_count = 0
     result_stack_count, result_array_count, result_element_count, result_dispatch_count = 0, 0, 0, 0
     register_context_callers = check_register_bindings(graph, stack_claims, register_observations)
     context_return_count = 0
@@ -300,6 +301,11 @@ def check_receivers(graph, read, decode, audit):
         physical_returns = {v['site']: v for v in certificate.get('return_classes', [])}
         assert graph.get('format', 4) >= 24 or not physical_returns and certificate.get('normal_return_class') is None
         verified_physical_returns, reached_returns = set(), set()
+        indirect_rows = certificate.get('indirect_returns', [])
+        assert graph.get('format', 4) >= 28 or not indirect_rows
+        assert len({v['site'] for v in indirect_rows}) == len(indirect_rows)
+        indirect_claims = {v['site']: v for v in indirect_rows}
+        expected_indirect, verified_indirect = set(), set()
         verified_context = set()
         active_returns = {r['site']: r for r in context.get('forwarded_returns', [])} if context else return_claims
         verified_context_returns = set()
@@ -965,7 +971,28 @@ def check_receivers(graph, read, decode, audit):
                         verified_context.add(address)
                     else:
                         verified[address] = claim
+                indirect_result = None
+                if graph.get('format', 4) >= 28 and metadata.get('word_return_register') == 'x0' and ins.id == a.ARM64_INS_BLR:
+                    value = read_reg(state, ins, ins.operands[0].reg)
+                    if value[0] == TARGET:
+                        target = dispatch['entries'][value[1]]
+                        resolution = active_claims.get(address) or claims.get(address)
+                        if target in active_machine_returns and resolution and len(set(resolution['proof']) | {address}) <= 128:
+                            indirect_result = target, active_machine_returns[target], value[3]
                 state, comparison, live, spills, fresh = step(state, comparison, live, spills, ins, contents)
+                if indirect_result and state[0] == fact(OBJECT, indirect_result[1]):
+                    expected_indirect.add(address)
+                if address in indirect_claims:
+                    claim = indirect_claims[address]
+                    assert set(claim) == {'site', 'callee', 'class_id', 'register', 'basis', 'proof'}
+                    assert all(type(claim[k]) is int for k in ('site', 'callee', 'class_id'))
+                    assert claim['register'] == 'x0' and claim['basis'] == 'machine_return_summary'
+                    assert indirect_result is not None and (claim['callee'], claim['class_id']) == indirect_result[:2]
+                    assert state[0] == fact(OBJECT, claim['class_id'])
+                    proof = claim['proof']
+                    assert 0 < len(proof) <= 128 and proof == sorted(set(proof))
+                    assert address in proof and indirect_result[2] in proof and all(type(p) is int and p in by_address for p in proof)
+                    verified_indirect.add(address)
                 if ins.group(cs.CS_GRP_CALL) or ins.group(cs.CS_GRP_INT) or sp[0] != state[15][0] or sp[2] != state[15][2]:
                     stores.clear()
             edges = outgoing(block, state, comparison, live, spills, fresh)
@@ -995,6 +1022,8 @@ def check_receivers(graph, read, decode, audit):
                 assert declared_live[address] <= incoming_live
                 assert all(incoming_spills.get(k) == v for k, v in declared_spills[address].items())
                 incoming_checks += 1
+        assert expected_indirect == verified_indirect == set(indirect_claims), 'Missing or unproved indirect-result record'
+        indirect_result_count += len(verified_indirect)
         check_return_summary(certificate, instructions, reached_returns, verified_physical_returns, nonreturning_calls, scoped=bool(path or trace))
         return_class_count += len(verified_physical_returns)
         if result_mode:
@@ -1062,6 +1091,7 @@ def check_receivers(graph, read, decode, audit):
             'register_context_stack_slots_checked': register_stack_count,
             'register_call_effects_checked': len(register_safe), 'register_effect_instructions_checked': register_effect_instructions,
             'machine_return_classes_checked': len(machine_return_classes), 'physical_return_classes_checked': return_class_count,
+            'indirect_machine_returns_checked': indirect_result_count,
             'call_result_contexts_checked': len(result_contexts), 'call_result_dispatches_checked': result_dispatch_count,
             'call_result_stack_slots_checked': result_stack_count, 'call_result_arrays_checked': result_array_count,
             'call_result_array_elements_checked': result_element_count,

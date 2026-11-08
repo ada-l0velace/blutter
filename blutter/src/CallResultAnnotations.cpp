@@ -17,6 +17,38 @@ std::string QuotedName(const std::string& name)
 	}
 	return text + '"';
 }
+std::string ClassText(uint32_t cid, const std::function<std::string(uint32_t)>& className)
+{
+	if (!cid) throw std::runtime_error("Invalid caller-result class annotation");
+	auto text = std::format("class {:#x}", cid);
+	if (className) { const auto name = className(cid); if (!name.empty()) text += " (" + QuotedName(name) + ")"; }
+	return text;
+}
+std::string Joined(const std::map<uint64_t, std::string>& values)
+{
+	std::string text;
+	for (const auto& [_, value] : values) { if (!text.empty()) text += ','; text += value; }
+	return text.empty() ? "none" : text;
+}
+void IndirectNotes(AssemblyNotes& notes, uint64_t payload, const ReceiverAnalysisResult& analysis,
+	const std::map<uint64_t, const Edge*>& calls, const std::string& scope,
+	const std::function<std::string(uint32_t)>& className)
+{
+	for (const auto& [site, value] : analysis.indirectReturns) {
+		const auto edge = calls.find(site);
+		if (edge == calls.end() || edge->second->source != payload || edge->second->kind != "indirect_call" ||
+			!value.callee || value.callee % 4 || value.proof.empty() || value.proof.size() > 128 ||
+			std::find(value.proof.begin(), value.proof.end(), site) == value.proof.end())
+			throw std::runtime_error("Indirect result annotation has no matching call or proof");
+		const auto resolution = analysis.resolutions.find(site);
+		const auto* target = resolution != analysis.resolutions.end() ? &resolution->second :
+			edge->second->staticDispatch ? &*edge->second->staticDispatch : nullptr;
+		if (!target || target->snapshotTarget != value.callee)
+			throw std::runtime_error("Indirect result annotation disagrees with its resolved target");
+		notes[site].push_back(std::format("caller-result @{:#x} [payload {:#x}]: indirect normal-return X0 -> {} [callee {:#x}; {}]",
+			site, payload, ClassText(value.classId, className), value.callee, scope));
+	}
+}
 }
 AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const std::vector<Edge>& edges,
 	const std::function<std::string(uint32_t)>& className)
@@ -26,12 +58,7 @@ AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const 
 	for (const auto& edge : edges) calls.emplace(edge.site, &edge);
 	std::map<uint32_t, std::string> names;
 	auto type = [&](uint32_t cid) -> const std::string& {
-		if (!cid) throw std::runtime_error("Invalid caller-result class annotation");
-		if (!names.contains(cid)) {
-			auto text = std::format("class {:#x}", cid);
-			if (className) { const auto name = className(cid); if (!name.empty()) text += " (" + QuotedName(name) + ")"; }
-			names.emplace(cid, std::move(text));
-		}
+		if (!names.contains(cid)) names.emplace(cid, ClassText(cid, className));
 		return names.at(cid);
 	};
 	for (const auto& context : result.contexts) {
@@ -89,6 +116,45 @@ AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const 
 		}
 		for (const auto& [site, value] : context.analysis.returnClasses)
 			add(site, "physical X0 at RET -> " + type(value.classId));
+		if (!context.analysis.indirectReturns.empty()) {
+			if (context.bindings.empty()) throw std::runtime_error("Indirect caller result has no binding scope");
+			std::map<uint64_t, std::string> bindings;
+			for (const auto& b : context.bindings)
+				if (!bindings.emplace(b.site, std::format("{:#x}@{:#x}={:#x}", b.site, b.callee, b.classId)).second)
+					throw std::runtime_error("Duplicate indirect-result binding scope");
+			IndirectNotes(notes, context.payload, context.analysis, calls,
+				"entry regs none; stack none; after calls " + Joined(bindings), className);
+		}
+	}
+	return notes;
+}
+AssemblyNotes BuildRegisterResultNotes(const RegisterContextResult& result, const std::vector<Edge>& edges,
+	const std::function<std::string(uint32_t)>& className)
+{
+	AssemblyNotes notes;
+	std::map<uint64_t, const Edge*> calls;
+	for (const auto& edge : edges) calls.emplace(edge.site, &edge);
+	for (const auto& context : result.contexts) {
+		if (context.analysis.indirectReturns.empty()) continue;
+		if (context.callers.empty() || context.registerInputs.empty()) throw std::runtime_error("Indirect result has no caller scope");
+		std::set<uint64_t> callers;
+		for (const auto site : context.callers) {
+			const auto edge = calls.find(site);
+			if (!callers.insert(site).second || edge == calls.end() || edge->second->kind != "call" || edge->second->target != context.payload)
+				throw std::runtime_error("Indirect result has a mismatched original caller");
+		}
+		std::map<uint64_t, std::string> registers, stack;
+		for (const auto& value : context.registerInputs)
+			if (value.reg >= 15 || !value.classId || !registers.emplace(value.reg, std::format("x{}={:#x}", value.reg, value.classId)).second)
+				throw std::runtime_error("Invalid indirect-result register scope");
+		for (const auto& value : context.stackInputs)
+			if (value.spOffset < 0 || value.spOffset > 248 || value.spOffset % 8 ||
+				(value.kind != "word" && value.kind != "heap_class") ||
+				(value.kind == "heap_class" && (!value.value || value.value > UINT32_MAX)) ||
+				!stack.emplace(value.spOffset, std::format("SP+{}:{}={:#x}", value.spOffset, value.kind, value.value)).second)
+				throw std::runtime_error("Invalid indirect-result stack scope");
+		IndirectNotes(notes, context.payload, context.analysis, calls,
+			"entry regs " + Joined(registers) + "; stack " + Joined(stack) + "; after calls none", className);
 	}
 	return notes;
 }

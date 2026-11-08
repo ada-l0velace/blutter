@@ -1342,18 +1342,23 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	manifest << std::format("],\"payload_count\":{},\"additional_exports\":{},\"undecoded_words\":{}}}\n",
 		total, recoveredCodeRanges.size(), undecoded);
 	callerResultNotes.clear();
-	annotations.Write((directory.parent_path() / "snapshot_calls.json").string(), [&](const auto& result) {
-		const auto added = SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), [&](uint32_t cid) {
-			return cid < app.classes.size() && app.classes[cid] ? app.classes[cid]->Name() : std::string{};
-		});
+	auto resultClassName = [&](uint32_t cid) {
+		return cid < app.classes.size() && app.classes[cid] ? app.classes[cid]->Name() : std::string{};
+	};
+	auto appendResultNotes = [&](const auto& added) {
 		for (const auto& [site, notes] : added) for (const auto& note : notes) {
 			auto& retained = callerResultNotes[site];
 			if (std::find(retained.begin(), retained.end(), note) == retained.end()) retained.push_back(note);
 		}
+	};
+	annotations.Write((directory.parent_path() / "snapshot_calls.json").string(), [&](const auto& result) {
+		appendResultNotes(SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), resultClassName));
 	}, [&](uint64_t entry) {
 		AnalysisIssue issue("sdk-result-decode", entry, "SDK result analysis cannot decode this retained payload");
 		if (diagnostics) diagnostics->Report(issue);
 		else throw issue;
+	}, [&](const auto& result) {
+		appendResultNotes(SnapshotAnalysis::BuildRegisterResultNotes(result, annotations.Edges(), resultClassName));
 	});
 	// Render original words after the checked result pass. Only disassembly is
 	// repeated here; no receiver/context analysis is rerun for presentation.

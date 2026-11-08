@@ -58,6 +58,32 @@ int main()
 			Check(rejected,"Malformed scope, producer or class information is rejected");
 		}
 		Check(BuildCallResultNotes({},edges).empty(),"Absent proofs create no annotations");
+		auto indirect = result;
+		indirect.contexts[0].analysis.indirectReturns[0x1014] = {0x4000,7,{0x100c,0x1014}};
+		Check(Has(BuildCallResultNotes(indirect,edges),0x1014,"after calls 0x1004@0x2000=0x7"),"Indirect result retains prior-call conditions");
+		Edge original{};original.site=0x8000;original.source=0x8000;original.kind="call";original.target=0x1000;
+		auto scopedEdges=edges;scopedEdges.push_back(original);
+		RegisterContext scoped{};scoped.payload=0x1000;scoped.callers={0x8000};scoped.registerInputs={{1,7,{}}};
+		scoped.stackInputs={{8,"word",42,{}}};scoped.analysis=indirect.contexts[0].analysis;
+		RegisterContextResult scopedResult;scopedResult.contexts.push_back(scoped);
+		const auto scopedNotes=BuildRegisterResultNotes(scopedResult,scopedEdges,[](uint32_t){return "Quoted\"\\\nName";});
+		Check(Has(scopedNotes,0x1014,"entry regs x1=0x7; stack SP+8:word=0x2a; after calls none"),"Register and stack conditions remain explicit");
+		Check(Has(scopedNotes,0x1014,"\\x0a"),"Indirect class metadata is safely quoted");
+		for(const auto& [_,lines]:scopedNotes)for(const auto& line:lines)
+			Check(line.find('\n')==std::string::npos&&line.find('\r')==std::string::npos,"Indirect note cannot inject an assembly line");
+		for(unsigned defect=0;defect<7;++defect){
+			auto bad=scopedResult;
+			if(defect==0)bad.contexts[0].analysis.indirectReturns.at(0x1014).callee=0x4010;
+			if(defect==1)bad.contexts[0].analysis.indirectReturns.at(0x1014).proof.clear();
+			if(defect==2)bad.contexts[0].callers={0x8004};
+			if(defect==3)bad.contexts[0].registerInputs.push_back({1,8,{}});
+			if(defect==4)bad.contexts[0].stackInputs[0].spOffset=-8;
+			if(defect==5)bad.contexts[0].analysis.indirectReturns.at(0x1014).classId=0;
+			if(defect==6)bad.contexts[0].analysis.indirectReturns.at(0x1014).proof={0x100c};
+			bool rejected=false;try{BuildRegisterResultNotes(bad,scopedEdges);}catch(const std::runtime_error&){rejected=true;}
+			Check(rejected,"Malformed indirect target, proof or caller conditions are rejected");
+		}
+		Check(BuildRegisterResultNotes({},scopedEdges).empty(),"No indirect proof produces no scoped note");
 		std::cout<<checks<<" caller-result annotation checks passed\n";
 	} catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 }

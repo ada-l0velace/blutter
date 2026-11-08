@@ -996,6 +996,7 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		for (size_t n = b.first; n < b.end; ++n) {
 			const auto& i = instructions[n];
 			const auto& d = i.detail->arm64;
+			std::optional<IndirectCallReturn> indirectReturn;
 			const auto sp = state.regs[15];
 			if (i.id == ARM64_INS_RET && (d.op_count == 0 || (d.op_count == 1 && d.operands[0].reg == ARM64_REG_X30))) {
 				normalReturns.insert(i.address);
@@ -1076,9 +1077,17 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 				const auto f = Read(state, d.operands[0].reg);
 				if (f.kind == Target) {
 					result.resolutions.emplace(i.address, StaticDispatch{f.origin, std::bit_cast<int64_t>(f.aux), f.value, *profile.dispatchEntries[f.value], f.proof});
+					const auto target = *profile.dispatchEntries[f.value];
+					if (profile.wordReturnRegister == ARM64_REG_X0)
+						if (const auto returned = profile.provedReturnClasses.find(target); returned != profile.provedReturnClasses.end()) {
+							const auto value = Proven({Object, returned->second, 0, 0, f.proof}, i.address);
+							if (value.kind == Object) indirectReturn = IndirectCallReturn{target, returned->second, value.proof};
+						}
 				}
 			}
 			state = execute(std::move(state), i, contents);
+			if (indirectReturn && state.regs[0].kind == Object && state.regs[0].value == indirectReturn->classId)
+				result.indirectReturns.emplace(i.address, std::move(*indirectReturn));
 			if (Group(i, CS_GRP_CALL) || Group(i, CS_GRP_INT) || sp.kind != state.regs[15].kind || sp.aux != state.regs[15].aux) recentStores.clear();
 		}
 	}
@@ -1135,7 +1144,20 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 		for (size_t n = 0; n < value.proof.size(); ++n) { if (n) certificate << ','; certificate << value.proof[n]; }
 		certificate << "]}";
 	}
-	certificate << "],\"normal_return_class\":" << (result.normalReturnClass ? std::to_string(*result.normalReturnClass) : "null") << '}';
+	certificate << ']';
+	if (!result.indirectReturns.empty()) {
+		certificate << ",\"indirect_returns\":[";
+		bool comma = false;
+		for (const auto& [site, value] : result.indirectReturns) {
+			if (comma) certificate << ','; comma = true;
+			certificate << "{\"site\":" << site << ",\"callee\":" << value.callee << ",\"class_id\":" << value.classId
+				<< ",\"register\":\"x0\",\"basis\":\"machine_return_summary\",\"proof\":[";
+			for (size_t n = 0; n < value.proof.size(); ++n) { if (n) certificate << ','; certificate << value.proof[n]; }
+			certificate << "]}";
+		}
+		certificate << ']';
+	}
+	certificate << ",\"normal_return_class\":" << (result.normalReturnClass ? std::to_string(*result.normalReturnClass) : "null") << '}';
 	result.certificate = certificate.str();
 	return result;
 }

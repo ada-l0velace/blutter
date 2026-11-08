@@ -240,6 +240,7 @@ struct Edge {
 };
 
 struct CallResultContextResult;
+struct RegisterContextResult;
 class Analyzer {
 public:
 	Analyzer(Profile profile, std::vector<Payload> payloads, std::vector<Name> names,
@@ -250,7 +251,8 @@ public:
 	std::map<uint64_t, std::string> Analyze(const cs_insn* instructions, size_t count, uint64_t payloadStart);
 	void Write(const std::string& filename,
 		const std::function<void(const CallResultContextResult&)>& presentResults = {},
-		const std::function<void(uint64_t)>& reportSdkDecodeFailure = {}) const;
+		const std::function<void(uint64_t)>& reportSdkDecodeFailure = {},
+		const std::function<void(const RegisterContextResult&)>& presentRegisterResults = {}) const;
 	const std::vector<Reference>& References() const { return references; }
 	const std::vector<Edge>& Edges() const { return edges; }
 private:

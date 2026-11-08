@@ -92,6 +92,8 @@ int main() {
 		auto indirectProfile = MakeProfile(); indirectProfile.provedReturnClasses[0x3000] = 8;
 		const auto indirectResult = Analyze(indirectWords, indirectProfile, &inputs);
 		Check(indirectResult.normalReturnClass == 8, "Resolved indirect call consumes its closed machine result");
+		Check(indirectResult.indirectReturns.size() == 1 && indirectResult.indirectReturns.at(0x1018).callee == 0x3000 &&
+			indirectResult.indirectReturns.at(0x1018).classId == 8, "Settled indirect result has an explicit call-site record");
 		const auto& indirectProof = indirectResult.returnClasses.at(0x1024).proof;
 		for (const uint64_t site : {0x100c,0x1010,0x1014,0x1018,0x1024})
 			Check(std::find(indirectProof.begin(), indirectProof.end(), site) != indirectProof.end(), "Indirect result retains target and call provenance");
@@ -103,6 +105,11 @@ int main() {
 		Check(!Analyze(indirectWords, absentTarget, &inputs).normalReturnClass, "Missing dispatch entry cannot supply a result");
 		auto clobberedTarget = indirectWords; clobberedTarget.insert(clobberedTarget.begin()+6,0xd280001e);
 		Check(!Analyze(clobberedTarget, indirectProfile, &inputs).normalReturnClass, "Overwritten BLR source cannot reuse an earlier target");
+		Check(Analyze(clobberedTarget, indirectProfile, &inputs).indirectReturns.empty(), "Clobbered target has no result record");
+		auto joinedTarget = frame; joinedTarget.insert(joinedTarget.end(), {0xb4000042,0xaa0303e1});
+		joinedTarget.insert(joinedTarget.end(),dispatch.begin(),dispatch.end());
+		joinedTarget.insert(joinedTarget.end(),{0xaa1d03ef,0xa8c179fd,0xd65f03c0});
+		Check(Analyze(joinedTarget,indirectProfile,&inputs).indirectReturns.empty(), "Transient worklist target is not published after a conflicting join");
 		auto savedIndirect = frame; savedIndirect.push_back(0xf81f03a1);
 		savedIndirect.insert(savedIndirect.end(),dispatch.begin(),dispatch.end());
 		savedIndirect.insert(savedIndirect.end(),{0xf85f03a0,0xaa1d03ef,0xa8c179fd,0xd65f03c0});
