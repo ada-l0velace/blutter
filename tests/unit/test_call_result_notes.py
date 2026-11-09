@@ -6,7 +6,7 @@ import subprocess
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from check_call_result_notes import expected_facts, parse_note, check_stream, metadata_class_names
+from check_call_result_notes import expected_facts, facts_by_site, parse_note, check_stream, metadata_class_names
 
 
 class CallResultNotes(unittest.TestCase):
@@ -33,6 +33,43 @@ class CallResultNotes(unittest.TestCase):
         observed, kinds = self.check([self.note, self.instruction])
         self.assertEqual(sum(observed.values()), 1)
         self.assertEqual(kinds, {0x1010: 'bl'})
+
+    def test_shared_site_index_preserves_coverage_without_mutation(self):
+        expected = expected_facts(self.graph)
+        index = facts_by_site(expected)
+        before = {site: set(values) for site, values in index.items()}
+        lines = [self.note, self.instruction]
+        self.assertEqual(check_stream(lines, expected), check_stream(lines, expected, by_site=index))
+        with self.assertRaises(AssertionError):
+            check_stream([self.instruction], expected, by_site=index)
+        self.assertEqual(index, before)
+
+    def test_physical_inputs_keep_partial_and_conditional_scope(self):
+        ordinary = ' // call-input @0x1010 [payload 0x1000]: physical x2 -> class 0x7 ("Example") [partial; normal flow]\n'
+        self.assertEqual(parse_note(ordinary, {7: 'Example'}), (0x1000, 0x1010, 'input', 'x2', 7, None))
+        scoped = ordinary.replace('normal flow', 'under result bindings 0x1000@0x2000=0x7')
+        self.assertEqual(parse_note(scoped)[-1], ((), (), ((0x1000, 0x2000, 7),)))
+        for bad in (ordinary.replace('physical x2', 'argument 2'), ordinary.replace('partial; ', ''),
+                    scoped.replace('0x1000@0x2000=0x7', 'none'), ordinary.replace('Example', 'Wrong')):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                parse_note(bad, {7: 'Example'})
+
+    def test_old_graph_does_not_require_new_input_comments(self):
+        self.graph['edges'][0]['source'] = 0x1000
+        self.graph['edges'][0]['register_inputs'] = [{'register': 'x2', 'class_id': 7, 'proof': [0x1000]}]
+        self.assertFalse(any(v[2] == 'input' for v in expected_facts(self.graph)))
+        self.graph['format'] = 32
+        self.assertTrue(any(v[2] == 'input' for v in expected_facts(self.graph)))
+
+    def test_missing_duplicate_or_unqualified_input_comment_fails(self):
+        self.graph.update(format=32)
+        self.graph['edges'][0].update(source=0x1000, register_inputs=[{'register': 'x2', 'class_id': 7, 'proof': [0x1000]}])
+        note = ' // call-input @0x1010 [payload 0x1000]: physical x2 -> class 0x7 ("Example") [partial; normal flow]\n'
+        self.check([self.note, note, self.instruction])
+        for lines in ([self.note, self.instruction], [self.note, note, note, self.instruction],
+                      [self.note, note.replace('normal flow', 'under result bindings 0x1000@0x2000=0x7'), self.instruction]):
+            with self.subTest(lines=lines), self.assertRaises(AssertionError):
+                self.check(lines)
 
     def test_missing_duplicate_invented_or_detached_note_is_rejected(self):
         for lines in ([self.instruction], [self.note, self.note, self.instruction], [self.note],

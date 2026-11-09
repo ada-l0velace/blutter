@@ -12,15 +12,29 @@ from pathlib import Path
 import re
 from native_assembly import native_assembly_streams
 from indirect_result_records import indirect_results, scope_key
+from stub_input_roles import input_records, ROLE_TEXT
+from call_input_shapes import input_records as supplied_input_records
 
 
 PREFIX = re.compile(r'^\s*// caller-result @(0x[0-9a-f]+) \[payload (0x[0-9a-f]+)\]: (.*)$')
+INPUT_PREFIX = re.compile(r'^\s*// call-input @(0x[0-9a-f]+) \[payload (0x[0-9a-f]+)\]: (.*)$')
 INSTRUCTION = re.compile(r'^\s*//\s*(0x[0-9a-f]+):\s+([a-z][a-z0-9.]*)\b')
 
 
 def expected_facts(graph):
     edges = {e['site']: e for e in graph['edges']}
     facts = set()
+    for value in input_records(graph):
+        scope = scope_key([], [], value['bindings']) if value['bindings'] is not None else None
+        if value['role']:
+            facts.add((value['payload'], value['site'], 'role_input', value['register'], value['role'],
+                       value['callee'], value['kind'], value['value'], scope))
+        else:
+            facts.add((value['payload'], value['site'], 'input', value['register'], value['value'], scope))
+    for value in supplied_input_records(graph):
+        scope = scope_key([], [], value['bindings']) if value['bindings'] is not None else None
+        facts.add((value['payload'], value['site'], 'supplied_input', value['index'], value['sp_offset'],
+                   value['kind'], value['value'], value['load'], scope))
     for c in (graph.get('call_result_contexts', []) + graph.get('sdk_stub_producer_contexts', []) +
               graph.get('sdk_stub_caller_contexts', [])):
         payload = c['payload']
@@ -69,7 +83,8 @@ def parse_scope(registers, stack, calls):
 
 
 def parse_note(line, class_names=None):
-    match = PREFIX.fullmatch(line.rstrip('\n'))
+    input_match = INPUT_PREFIX.fullmatch(line.rstrip('\n'))
+    match = input_match or PREFIX.fullmatch(line.rstrip('\n'))
     assert match, 'Malformed caller-result annotation'
     site, payload = int(match[1], 16), int(match[2], 16)
     body = match[3]
@@ -79,7 +94,51 @@ def parse_note(line, class_names=None):
         body = body[:name.start()] + body[name.end():]
     cid = None
     m = re.fullmatch(r'normal-return X0 -> class (0x[0-9a-f]+) \[(callee summary|caller-bound helper|matched SDK stub|SDK-derived helper)\]', body)
-    if (indirect := re.fullmatch(r'indirect normal-return X0 -> class (0x[0-9a-f]+) \[callee (0x[0-9a-f]+); entry regs ([^;]+); stack ([^;]+); after calls ([^;]+)\]', body)):
+    if input_match:
+        supplied = re.fullmatch(r'supplied input\[(\d+)\] \(Dart SP\+(\d+)\) -> (class|raw word) (0x[0-9a-f]+) \[descriptor load (0x[0-9a-f]+); fixed stack; partial; (.*)\]', body)
+        if supplied:
+            condition = supplied[6]
+            if condition == 'normal flow':
+                scope = None
+            else:
+                binding = re.fullmatch(r'under result bindings (.+)', condition)
+                assert binding, 'Supplied input lacks its conditions'
+                scope = parse_scope('none', 'none', binding[1])
+                assert scope[2], 'Supplied input has empty conditions'
+            kind = 'heap_class' if supplied[3] == 'class' else 'word'
+            amount = int(supplied[4], 16)
+            cid = amount if kind == 'heap_class' else None
+            fact = (payload, site, 'supplied_input', int(supplied[1]), int(supplied[2]), kind, amount, int(supplied[5], 16), scope)
+            if name:
+                assert cid is not None, 'Raw input word cannot carry a class name'
+                if class_names is not None and cid in class_names:
+                    assert displayed_name == class_names[cid], 'Supplied input class name differs from metadata'
+            elif class_names is not None and cid in class_names and class_names[cid]:
+                raise AssertionError('Available supplied input class name is missing')
+            return fact
+        role_value = re.fullmatch(r'(.+) \(X(\d+)\) -> (class (0x[0-9a-f]+)|raw word (0x[0-9a-f]+)|value unknown) \[stub (0x[0-9a-f]+); partial; (.*)\]', body)
+        value = re.fullmatch(r'physical (x\d+) -> class (0x[0-9a-f]+) \[partial; (.*)\]', body)
+        assert value or role_value, 'Malformed register input annotation'
+        condition_text = role_value[7] if role_value else value[3]
+        if condition_text == 'normal flow':
+            scope = None
+        else:
+            condition = re.fullmatch(r'under result bindings (.+)', condition_text)
+            assert condition, 'Register input annotation lacks its conditions'
+            scope = parse_scope('none', 'none', condition[1])
+            assert scope[2] and not scope[0] and not scope[1], 'Unexpected register input scope'
+        if role_value:
+            roles = {text: role for role, text in ROLE_TEXT.items()}
+            assert role_value[1] in roles, 'Unknown SDK input role'
+            kind = 'class' if role_value[4] else 'word' if role_value[5] else 'unknown'
+            amount = int(role_value[4] or role_value[5], 16) if kind != 'unknown' else None
+            cid = amount if kind == 'class' else None
+            fact = (payload, site, 'role_input', 'x' + role_value[2], roles[role_value[1]],
+                    int(role_value[6], 16), kind, amount, scope)
+        else:
+            cid = int(value[2], 16)
+            fact = (payload, site, 'input', value[1], cid, scope)
+    elif (indirect := re.fullmatch(r'indirect normal-return X0 -> class (0x[0-9a-f]+) \[callee (0x[0-9a-f]+); entry regs ([^;]+); stack ([^;]+); after calls ([^;]+)\]', body)):
         cid = int(indirect[1], 16)
         fact = (payload, site, 'indirect', cid, int(indirect[2], 16), parse_scope(*indirect.groups()[2:]))
     elif m:
@@ -106,16 +165,22 @@ def parse_note(line, class_names=None):
     return fact
 
 
-def check_stream(lines, expected, class_names=None, instruction_kinds=None):
-    by_site = defaultdict(set)
+def facts_by_site(expected):
+    index = defaultdict(set)
     for fact in expected:
-        by_site[fact[1]].add(fact)
+        index[fact[1]].add(fact)
+    return index
+
+
+def check_stream(lines, expected, class_names=None, instruction_kinds=None, *, by_site=None):
+    if by_site is None:
+        by_site = facts_by_site(expected)
     observed, required = Counter(), Counter()
     pending, kinds, previous = [], {}, None
     for line in lines:
         if instruction_kinds is not None and re.search(r'// \*\* addr:', line):
             previous = None
-        if re.match(r'^\s*// caller-result', line):
+        if re.match(r'^\s*// (?:caller-result|call-input)', line):
             fact = parse_note(line, class_names)
             assert fact in expected, 'Assembly annotation has no corresponding checked graph fact'
             observed[fact] += 1; pending.append(fact[1])
@@ -153,13 +218,14 @@ def metadata_class_names(script):
 
 def check_output(graph, output):
     expected = expected_facts(graph)
+    by_site = facts_by_site(expected)
     catalogue = output / 'blutter_frida.js'
     class_names = metadata_class_names(catalogue.read_text()) if catalogue.exists() else None
     manifest_path = output / 'snapshot_code.json'
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     native, kinds = Counter(), {}
     for _, stream in native_assembly_streams(output, manifest):
-        observed, found = check_stream(stream, expected, class_names)
+        observed, found = check_stream(stream, expected, class_names, by_site=by_site)
         native.update(observed)
         kinds.update(found)
     assert set(native) == expected, 'Native assembly omits a checked result fact'
@@ -167,7 +233,7 @@ def check_output(graph, output):
     for path in (output / 'asm').rglob('*.dart'):
         with path.open() as stream:
             try:
-                typed, _ = check_stream(stream, expected, class_names, kinds)
+                typed, _ = check_stream(stream, expected, class_names, kinds, by_site=by_site)
             except AssertionError as error:
                 raise AssertionError(f'{path}: {error}') from error
         typed_count += sum(typed.values()); files += bool(typed)
@@ -180,7 +246,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    graph = json.loads((args.output / 'snapshot_calls.json').read_text())
+    from graph_io import load_graph
+    graph = load_graph(args.output)
     print(json.dumps(check_output(graph, args.output), indent=2))
 
 

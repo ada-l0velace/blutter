@@ -6,6 +6,7 @@ import re
 import tempfile
 import platform
 
+from sdk_abi_features import valid_capability
 from runtime_sources import source_snapshot_hash
 from reader_profiles import SHOREBIRD_PROFILE, runtime_profile
 
@@ -73,6 +74,13 @@ def read_verified(path, info, kind, no_analysis=False):
             return None
         if info.reader_profile and result['source_revision'] != runtime_profile(info.reader_profile).source_base:
             return None
+        capability = result.get('call_input_capability')
+        if capability is not None and not valid_capability(capability):
+            # Optional compiler policy cannot invalidate a source-verified SDK
+            # library. A native reader built with an unknown policy must rebuild.
+            if kind == 'reader':
+                return None
+            result.pop('call_input_capability', None)
         if kind == 'runtime' and result.get('headers_sha256') != installed_headers_hash(path, info):
             return None
         return result
@@ -89,6 +97,11 @@ def write_verified(path, info, kind, source, no_analysis=False):
         result['headers_sha256'] = installed_headers_hash(path, info)
     elif 'headers_sha256' in source:
         result['headers_sha256'] = source['headers_sha256']
+    capability = source.get('call_input_capability')
+    if capability is not None:
+        if not valid_capability(capability):
+            raise ValueError('Invalid SDK call-input capability')
+        result['call_input_capability'] = capability
     with tempfile.NamedTemporaryFile(mode='w', dir=target.parent, delete=False, encoding='utf-8') as stream:
         temporary = Path(stream.name)
         json.dump(result, stream, indent=2)

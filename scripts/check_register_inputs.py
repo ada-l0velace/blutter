@@ -4,26 +4,50 @@ from check_snapshot_annotations import branch
 REGISTERS = {f'x{n}': n for n in range(15)}
 
 
+def register_values(graph, values):
+    bits = graph.get('receiver_metadata', {}).get('class_id_bits', 0)
+    assert graph.get('format', 4) >= 24 and 0 < len(values) <= 15
+    assert graph['receiver_metadata']['word_return_register'] == 'x0'
+    seen = set()
+    for value in values:
+        assert set(value) == {'register', 'class_id', 'proof'}
+        name, cid = value['register'], value['class_id']
+        assert name in REGISTERS and name not in seen
+        assert name not in {graph['profile'].get(k) for k in ('pool_register', 'thread_register', 'dispatch_register')} | {graph['receiver_metadata'].get('null_register')}
+        assert type(cid) is int and 0 < cid < 1 << bits
+        assert 0 < len(value['proof']) <= 128
+        seen.add(name)
+
+
 def register_claims(graph):
     claims = {}
-    bits = graph.get('receiver_metadata', {}).get('class_id_bits', 0)
     for edge in graph['edges']:
         values = edge.get('register_inputs', [])
         if not values:
             continue
-        assert graph.get('format', 4) >= 24 and 0 < len(values) <= 15
-        assert graph['receiver_metadata']['word_return_register'] == 'x0'
         assert edge['site'] not in claims
-        seen = set()
-        for value in values:
-            assert set(value) == {'register', 'class_id', 'proof'}
-            name, cid = value['register'], value['class_id']
-            assert name in REGISTERS and name not in seen
-            assert name not in {graph['profile'].get(k) for k in ('pool_register', 'thread_register', 'dispatch_register')} | {graph['receiver_metadata'].get('null_register')}
-            assert type(cid) is int and 0 < cid < 1 << bits
-            assert 0 < len(value['proof']) <= 128
-            seen.add(name)
+        register_values(graph, values)
         claims[edge['site']] = values
+    return claims
+
+
+def context_register_claims(graph, context, edges=None):
+    if graph.get('format', 4) < 32:
+        assert not context.get('register_observations')
+        return {}
+    if edges is None:
+        edges = {e['site']: e for e in graph['edges']}
+    claims = {}
+    for observation in context['register_observations']:
+        assert set(observation) == {'site', 'values'}
+        site, values = observation['site'], observation['values']
+        assert type(site) is int and site not in claims
+        assert site in edges and edges[site]['source'] == context['payload']
+        assert edges[site]['kind'] in ('call', 'indirect_call')
+        register_values(graph, values)
+        for value in values:
+            assert value['proof'] == sorted(set(value['proof']))
+        claims[site] = values
     return claims
 
 

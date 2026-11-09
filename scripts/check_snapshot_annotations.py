@@ -20,6 +20,7 @@ import capstone as cs
 from capstone import arm64 as a
 from elftools.elf.elffile import ELFFile
 from check_blutter_output import unprivileged_load_mnemonic
+from graph_io import load_graph
 
 
 @dataclass
@@ -183,6 +184,10 @@ def main():
                         help='Reader log with load address, used to check relocation normalization')
     parser.add_argument('--vm-audit', type=Path, help='Separate VM numerical audit for retained Code dispatch entries')
     args = parser.parse_args()
+    try:
+        graph = load_graph(args.output, require_full=True)
+    except (OSError, EOFError, ValueError) as error:
+        parser.error(str(error))
     raw = args.libapp.read_bytes()
     with args.libapp.open('rb') as stream:
         elf = ELFFile(stream)
@@ -194,8 +199,13 @@ def main():
                 return raw[pos + address - base:pos + address - base + length]
         raise AssertionError(f'Unmapped span {address:#x}')
 
-    graph = json.loads((args.output / 'snapshot_calls.json').read_text())
     audit_data = json.loads(args.vm_audit.read_text()) if args.vm_audit else None
+    from stub_input_roles import check_contracts
+    input_contracts_checked = check_contracts(graph, audit_data, read)
+    from call_input_shapes import check_shapes
+    input_shapes_checked = check_shapes(graph, audit_data, read)
+    from input_origins import check_origins
+    input_origins_checked = check_origins(graph, audit_data, read)
     load_base = int(re.search(r'^libapp is loaded at (0x[0-9a-f]+)$', args.log.read_text(), re.M)[1], 16)
     manifest = json.loads((args.output / 'snapshot_code.json').read_text())
     nodes, profile = graph['nodes'], graph['profile']
@@ -564,7 +574,7 @@ def main():
     from check_receiver_analysis import check_receivers
     receiver_checks = check_receivers(graph, read, lambda raw, start: decode_payload(md, raw, start), audit_data)
     print(json.dumps({'status': 'PASSED', 'sample_sha256': hashlib.sha256(raw).hexdigest(),
-                      'payloads': len(nodes), 'edges_checked_from_machine_words': len(graph['edges']),
+                      'stub_input_contracts_checked': input_contracts_checked, 'call_input_shapes_checked': input_shapes_checked, 'call_input_origins_checked': input_origins_checked, 'payloads': len(nodes), 'edges_checked_from_machine_words': len(graph['edges']),
                       'edge_kinds': dict(Counter(e['kind'] for e in graph['edges'])),
                       'references_checked_backwards': len(graph['references']),
                       'reference_kinds': dict(Counter(r['kind'] for r in graph['references'])),

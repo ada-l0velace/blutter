@@ -132,6 +132,18 @@ void WriteCallResultContexts(std::ostream& out, const CallResultContextResult& r
 			}
 			out << "]}";
 		}
+		out << "],\"register_observations\":["; first = true;
+		for (const auto& [site, values] : context.analysis.registerInputs) {
+			if (!first) out << ','; first = false;
+			out << "{\"site\":" << site << ",\"values\":[";
+			for (size_t k = 0; k < values.size(); ++k) {
+				if (k) out << ',';
+				const auto& value = values[k];
+				out << "{\"register\":\"x" << value.reg << "\",\"class_id\":" << value.classId << ",\"proof\":";
+				proof(value.proof); out << '}';
+			}
+			out << "]}";
+		}
 		out << "],\"array_observations\":["; first = true;
 		for (const auto& [site, values] : context.analysis.arrayArguments) {
 			if (!first) out << ','; first = false;

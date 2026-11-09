@@ -11,6 +11,7 @@
 #include <bit>
 #include <format>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <set>
@@ -308,7 +309,11 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		return comments;
 	if (payload.decoded) throw std::runtime_error("Duplicate annotation payload");
 	payload.decoded = true;
+	if (const auto contract = profile.asyncContracts.find(payload.start); contract != profile.asyncContracts.end() &&
+		contract->second.operation == AsyncOperation::Resume)
+		comments[payload.start] = "async resume entry: restores saved frame; successful delivery X0; exception path separate [matched SDK boundary]";
 	const auto firstEdge = edges.size();
+	const auto firstReference = references.size();
 	const int poolReg = RegNumber(profile.poolRegister);
 	const int threadReg = RegNumber(profile.threadRegister);
 	const int dispatchReg = RegNumber(profile.dispatchRegister);
@@ -383,6 +388,15 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 							note(std::format("shared Function entry: {} metadata aliases; source identity unresolved", aliases));
 					} else note(std::format("{} -> {:#x} [outside snapshot payloads]", edge.kind, address));
 					edge.registerConstants = callConstants();
+					if (const auto boundary = DescribeAsyncBoundary(edge.kind, edge.site, payload.start, payload.end, address, profile.asyncContracts)) {
+						note(AsyncBoundaryNote(*boundary));
+						if (boundary->operation != AsyncOperation::Init) {
+							auto input = TraceAsyncInput(instructions, count, n, *boundary, profile,
+								[&](uint64_t site) { return entries.contains(site) || receiverEntries.contains(site); });
+							note(AsyncInputNote(input));
+							asyncInputs.push_back(std::move(input));
+						}
+					}
 					if (call && profile.wordReturnRegister == ARM64_REG_X0 && profile.nativeReturnClasses.contains(address))
 						note(std::format("normal return x0: heap class {:#x} [matched SDK native contract; caller memory effects unproved]",
 							profile.nativeReturnClasses.at(address).classId));
@@ -541,6 +555,64 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		for (auto& [reg, origin] : loaded) state[reg] = std::move(origin);
 		afterTransfer = Transfer(instruction);
 	}
+	if (profile.callInputAbi.supported) {
+		std::map<uint64_t, const Reference*> loads;
+		for (size_t i = firstReference; i < references.size(); ++i) {
+			const auto& ref = references[i];
+			if (ref.kind == "pool" && ref.access == "load" && ref.width == 8 && ref.poolIndex)
+				loads.emplace(ref.site, &ref);
+		}
+		for (size_t i = firstEdge; i < edges.size(); ++i) {
+			const auto& edge = edges[i];
+			if (edge.kind != "call" || !edge.target) continue;
+			const auto model = profile.callInputModels.find(*edge.target);
+			if (model == profile.callInputModels.end()) {
+				if (const auto why = profile.callInputModelRejections.find(*edge.target); why != profile.callInputModelRejections.end())
+					callInputRejections.emplace(edge.site, why->second);
+			}
+			if (model == profile.callInputModels.end() && (!profile.descriptorPrologueAbi.supported || !loads.contains(edge.site-4) ||
+				!profile.callInputDescriptors.contains(*loads.at(edge.site-4)->poolIndex))) continue;
+			const auto load = loads.find(edge.site - 4);
+			if (load == loads.end()) { callInputRejections.emplace(edge.site, "no_immediate_descriptor_pool_load"); continue; }
+			const auto& ref = *load->second;
+			const auto descriptor = profile.callInputDescriptors.find(*ref.poolIndex);
+			if (descriptor == profile.callInputDescriptors.end()) { callInputRejections.emplace(edge.site, "unsupported_descriptor_object"); continue; }
+			const size_t n = (edge.site - payload.start) / 4;
+			if (!n || n >= count) throw std::runtime_error("Call-input edge outside its original payload");
+			const auto& detail = instructions[n-1].detail->arm64;
+			const int base = detail.op_count == 2 && detail.operands[1].type == ARM64_OP_MEM ? RegNumber(detail.operands[1].mem.base) : -1;
+			auto proof = ref.proof; proof.push_back(ref.site);
+			std::sort(proof.begin(), proof.end()); proof.erase(std::unique(proof.begin(), proof.end()), proof.end());
+			DescriptorLoad evidence{ref.site, *ref.poolIndex, ref.offset, ref.width, static_cast<unsigned>(base), std::move(proof)};
+			auto word = [](const cs_insn& insn) { uint32_t value = 0; for (unsigned k = 0; k < 4; ++k) value |= uint32_t{insn.bytes[k]} << (k * 8); return value; };
+			std::string reason;
+			std::optional<CallInputShape> shape;
+			if (model != profile.callInputModels.end()) shape = SelectCallInputShape(profile.callInputAbi, model->second, descriptor->second, evidence,
+				edge.site, payload.start, payload.end, word(instructions[n-1]), word(instructions[n]),
+				entries.contains(edge.site) || receiverEntries.contains(edge.site), reason);
+			if (!shape && profile.descriptorPrologueAbi.supported && profile.readInputCode) {
+				const auto targetPayload = FindPayload(*edge.target);
+				if (targetPayload && !descriptorPrologues.contains(*edge.target)) {
+					const auto size = static_cast<size_t>(std::min(uint64_t{512}, payloads[*targetPayload].end-*edge.target));
+					descriptorPrologues.emplace(*edge.target, ProveDescriptorPrologue(profile.readInputCode(*edge.target, size), *edge.target, profile.descriptorPrologueAbi));
+				}
+				if (descriptorPrologues.contains(*edge.target) && descriptorPrologues.at(*edge.target)) {
+					shape = SelectDescriptorInputShape(profile.callInputAbi, descriptor->second, *edge.target, evidence,
+						edge.site, payload.start, payload.end, word(instructions[n-1]), word(instructions[n]),
+						entries.contains(edge.site) || receiverEntries.contains(edge.site), reason);
+					if (shape) {
+						const auto& p = *descriptorPrologues.at(*edge.target);
+						const auto offset = int64_t{shape->count}*8+p.countBias*4+p.frameLoadOffset-16;
+						if (p.parameter && (offset < 0 || offset%8 || offset >= int64_t{shape->count}*8)) { shape.reset(); reason = "descriptor_parameter_outside_packet"; }
+						else shape->descriptorPrologue = true;
+					}
+				}
+			}
+			if (reason.empty() && !shape) reason = "no_checked_descriptor_prologue";
+			if (shape) { callInputShapes.emplace(edge.site, *shape); callInputRejections.erase(edge.site); }
+			else callInputRejections.emplace(edge.site, std::move(reason));
+		}
+	}
 	if (profile.classIdBits) {
 		auto receiver = AnalyzeReceivers(instructions, count, profile, receiverEntries);
 		for (size_t n = firstEdge; n < edges.size(); ++n)
@@ -592,6 +664,46 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		}
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
+	}
+	if (profile.callInputAbi.supported) {
+		std::map<uint64_t, int64_t> poolLoads;
+		for (size_t i = firstReference; i < references.size(); ++i) {
+			const auto& ref = references[i];
+			if (ref.kind == "pool" && ref.access == "load" && ref.width == 8 && ref.poolIndex) poolLoads.emplace(ref.site, *ref.poolIndex);
+		}
+		auto poolAt = [&](uint64_t site) -> std::optional<int64_t> {
+			if (const auto found = poolLoads.find(site); found != poolLoads.end()) return found->second;
+			return {};
+		};
+		auto observe = [&](const Edge& edge, WordLocation location, CallInputOrigin input) {
+			const auto n = (edge.site-payload.start)/4;
+			input = ObserveCallInput(instructions, count, n, location, std::move(input), profile, poolAt,
+				[&](uint64_t site) { return entries.contains(site) || receiverEntries.contains(site); }, inputOriginRemaining, inputOriginSteps);
+			for (const auto& step : input.chain) if (step.poolIndex && !inputObjects.contains(*step.poolIndex) && profile.describeInputObject) {
+				if (const auto object = profile.describeInputObject(*step.poolIndex)) inputObjects.emplace(*step.poolIndex, *object);
+			}
+			auto& comment = comments[edge.site]; if (!comment.empty()) comment += " | ";
+			comment += CallInputOriginNote(input, inputObjects);
+			callInputOrigins.push_back(std::move(input));
+		};
+		for (size_t i = firstEdge; i < edges.size(); ++i) {
+			const auto& edge = edges[i];
+			if (!edge.target) continue;
+			if (edge.kind == "call") {
+				if (const auto shape = callInputShapes.find(edge.site); shape != callInputShapes.end())
+					for (unsigned j = 0; j < shape->second.count; ++j) {
+						const int64_t offset = (shape->second.count-1-j)*8;
+						observe(edge, {0, NativeIr::Address{{15,64}, offset}}, {edge.site, edge.source, "supplied_input", j, {}, offset, {}});
+					}
+				if (const auto contract = profile.stubInputContracts.find(*edge.target); contract != profile.stubInputContracts.end())
+					for (const auto& input : contract->second.inputs) observe(edge, {static_cast<uint16_t>(input.reg), {}},
+						{edge.site, edge.source, StubInputRoleName(input.role), {}, input.reg, {}, {}});
+			}
+			if (const auto boundary = DescribeAsyncBoundary(edge.kind, edge.site, payload.start, payload.end, *edge.target, profile.asyncContracts);
+				boundary && boundary->operation != AsyncOperation::Init)
+				observe(edge, {0, {}}, {edge.site, edge.source,
+					boundary->operation == AsyncOperation::Await || boundary->operation == AsyncOperation::AwaitWithTypeCheck ? "await_input" : "completion_operand", {}, 0, {}, {}});
+		}
 	}
 	return comments;
 }
@@ -870,7 +982,10 @@ void Analyzer::Write(const std::string& filename,
 	if (presentRegisterResults) presentRegisterResults(registerContexts);
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
-	out << "{\"format\":28,\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
+	out.exceptions(std::ios::failbit | std::ios::badbit);
+	out << "{\"format\":36,\"export\":{\"detail\":" << Quoted(profile.includeGraphStates ? "full" : "compact")
+		<< ",\"omitted\":" << (profile.includeGraphStates ? "[]" : "[\"receiver_blocks\",\"call_effect_states\"]")
+		<< "},\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
 		<< ",\"dispatch_register\":" << (profile.dispatchRegister == ARM64_REG_INVALID ? "null" : Quoted(RegName(profile.dispatchRegister)))
 		<< ",\"pool_data_offset\":" << profile.poolDataOffset << ",\"pool_slot_size\":" << profile.poolSlotSize
@@ -884,6 +999,84 @@ void Analyzer::Write(const std::string& filename,
 			out << "{\"address\":" << node.names[n].address << ",\"kind\":" << Quoted(node.names[n].kind) << ",\"name\":" << Quoted(node.names[n].text) << '}';
 		}
 		out << "]}";
+	}
+	out << "],\"stub_input_contracts\":[";
+	bool firstContract = true;
+	for (const auto& [entry, contract] : profile.stubInputContracts) {
+		if (!ValidStubInputContract(entry, contract)) throw std::runtime_error("Invalid exported stub input contract");
+		if (!firstContract) out << ','; firstContract = false;
+		out << "{\"entry\":" << entry << ",\"end\":" << contract.end << ",\"kind\":" << Quoted(StubInputKindName(contract.kind))
+			<< ",\"basis\":\"matched_sdk_stub_identity\",\"inputs\":[";
+		for (size_t k = 0; k < contract.inputs.size(); ++k) {
+			if (k) out << ',';
+			const auto& input = contract.inputs[k];
+			out << "{\"register\":\"x" << input.reg << "\",\"role\":" << Quoted(StubInputRoleName(input.role)) << '}';
+		}
+		out << "]}";
+	}
+	out << "],\"call_input_abi\":{\"supported\":" << (profile.callInputAbi.supported ? "true" : "false")
+		<< ",\"reason\":" << Quoted(profile.callInputAbi.reason) << ",\"descriptor_register\":" << profile.callInputAbi.descriptorRegister
+		<< ",\"word_bytes\":" << profile.callInputAbi.wordBytes << "},\"call_input_descriptors\":[";
+	std::set<int64_t> usedDescriptors;
+	std::set<uint64_t> usedModels;
+	for (const auto& [site, shape] : callInputShapes) { usedDescriptors.insert(shape.poolIndex); if (!shape.descriptorPrologue) usedModels.insert(shape.target); }
+	bool firstInput = true;
+	for (const auto index : usedDescriptors) {
+		const auto& d = profile.callInputDescriptors.at(index);
+		if (!ValidCallInputDescriptor(d)) throw std::runtime_error("Invalid exported call-input descriptor");
+		if (!firstInput) out << ','; firstInput = false;
+		out << "{\"pool_index\":" << index << ",\"type_arguments\":" << d.typeArguments << ",\"count\":" << d.count
+			<< ",\"size\":" << d.size << ",\"positional\":" << d.positional;
+		if (!d.named.empty()) {
+			out << ",\"named\":["; bool comma = false;
+			for (const auto& [position, name] : d.named) { if (comma) out << ','; comma = true;
+				out << "{\"index\":" << position << ",\"name\":" << Quoted(name) << '}'; }
+			out << ']';
+		}
+		out << '}';
+	}
+	out << "],\"call_input_models\":[";
+	firstInput = true;
+	for (const auto target : usedModels) {
+		const auto& model = profile.callInputModels.at(target);
+		if (!ValidCallInputModel(model)) throw std::runtime_error("Invalid exported retained input model");
+		if (!firstInput) out << ','; firstInput = false;
+		out << "{\"entry\":" << target << ",\"fixed\":" << model.fixed << ",\"implicit\":" << model.implicit
+			<< ",\"type_parameters\":" << model.typeParameters << ",\"name\":" << Quoted(model.name)
+			<< ",\"basis\":\"compatible_retained_signature\",\"declared_types\":[";
+		for (size_t j = 0; j < model.declaredTypes.size(); ++j) { if (j) out << ','; out << Quoted(model.declaredTypes[j]); }
+		out << "]}";
+	}
+	out << "],\"call_input_shapes\":[";
+	firstInput = true;
+	for (const auto& [site, shape] : callInputShapes) {
+		if (!ValidCallInputShape(shape)) throw std::runtime_error("Invalid exported supplied-input shape");
+		if (!firstInput) out << ','; firstInput = false;
+		out << "{\"site\":" << site << ",\"payload\":" << shape.payload << ",\"target\":" << shape.target << ",\"load\":" << shape.load
+			<< ",\"pool_index\":" << shape.poolIndex << ",\"count\":" << shape.count << ",\"word_bytes\":" << shape.wordBytes
+			<< ",\"basis\":" << Quoted(shape.descriptorPrologue ? "callee_descriptor_prologue" : "immediate_descriptor_fixed_stack") << ",\"proof\":";
+		Proof(out, shape.proof); out << '}';
+	}
+	out << "],\"descriptor_prologue_abi\":{\"supported\":" << (profile.descriptorPrologueAbi.supported ? "true" : "false")
+		<< ",\"descriptor_register\":" << profile.descriptorPrologueAbi.descriptorRegister << ",\"field_bytes\":" << profile.descriptorPrologueAbi.fieldBytes
+		<< ",\"smi_shift\":" << profile.descriptorPrologueAbi.smiShift << ",\"type_arguments_offset\":" << profile.descriptorPrologueAbi.typeArgumentsOffset
+		<< ",\"size_offset\":" << profile.descriptorPrologueAbi.sizeOffset << ",\"frame_argument_base\":" << profile.descriptorPrologueAbi.frameArgumentBase << ",\"count_offset\":" << profile.descriptorPrologueAbi.countOffset << "},\"descriptor_prologues\":[";
+	std::set<uint64_t> usedPrologues;
+	for (const auto& [site, shape] : callInputShapes) if (shape.descriptorPrologue) usedPrologues.insert(shape.target);
+	firstInput = true;
+	for (const auto target : usedPrologues) {
+		const auto& p = *descriptorPrologues.at(target);
+		if (!firstInput) out << ','; firstInput = false;
+		out << "{\"target\":" << p.target << ",\"type_arguments_load\":" << p.typeArgumentsLoad << ",\"branch\":" << p.branch
+			<< ",\"size_load\":" << p.sizeLoad << ",\"address_add\":" << p.addressAdd << ",\"vector_load\":" << p.vectorLoad << ",\"parameter\":" << (p.parameter ? "true" : "false")
+			<< ",\"count_bias\":" << p.countBias << ",\"frame_load_offset\":" << p.frameLoadOffset << ",\"proof\":";
+		Proof(out, p.proof); out << '}';
+	}
+	out << "],\"call_input_rejections\":[";
+	firstInput = true;
+	for (const auto& [site, reason] : callInputRejections) {
+		if (!firstInput) out << ','; firstInput = false;
+		out << "{\"site\":" << site << ",\"reason\":" << Quoted(reason) << '}';
 	}
 	out << "],\"edges\":[";
 	for (size_t i = 0; i < edges.size(); ++i) {
@@ -980,7 +1173,74 @@ void Analyzer::Write(const std::string& filename,
 		out << ']';
 		out << '}';
 	}
-	out << "],\"entry_stack_loads\":[";
+	out << "],\"async_contracts\":[";
+	bool asyncComma = false;
+	for (const auto& [entry, contract] : profile.asyncContracts) {
+		if (asyncComma) out << ','; asyncComma = true;
+		out << "{\"entry\":" << entry << ",\"end\":" << contract.end << ",\"operation\":" << Quoted(AsyncOperationName(contract.operation))
+			<< ",\"basis\":\"matched_sdk_stub_identity\"}";
+	}
+	out << "],\"async_boundaries\":[";
+	asyncComma = false;
+	for (const auto& edge : edges) {
+		if (!edge.target) continue;
+		const auto payload = FindPayload(edge.source);
+		if (!payload) throw std::runtime_error("Async boundary has no source payload");
+		const auto boundary = DescribeAsyncBoundary(edge.kind, edge.site, edge.source, payloads[*payload].end, *edge.target, profile.asyncContracts);
+		if (!boundary) continue;
+		if (asyncComma) out << ','; asyncComma = true;
+		out << "{\"site\":" << boundary->site << ",\"payload\":" << boundary->payload << ",\"callee\":" << boundary->callee
+			<< ",\"operation\":" << Quoted(AsyncOperationName(boundary->operation)) << ",\"resume_site\":"
+			<< (boundary->resumeSite ? std::to_string(*boundary->resumeSite) : "null") << ",\"basis\":\"matched_sdk_stub_identity\"}";
+	}
+	out << "],\"async_inputs\":[";
+	asyncComma = false;
+	for (const auto& input : asyncInputs) {
+		if (asyncComma) out << ','; asyncComma = true;
+		out << "{\"site\":" << input.site << ",\"payload\":" << input.payload << ",\"role\":" << Quoted(input.role)
+			<< ",\"condition\":\"normal_fallthrough\",\"stop\":" << Quoted(input.stop) << ",\"steps\":" << input.steps << ",\"source\":";
+		if (input.source) {
+			const auto& value = *input.source;
+			out << "{\"kind\":" << Quoted(value.kind) << ",\"site\":" << value.site << ",\"callee\":"
+				<< (value.callee ? std::to_string(*value.callee) : "null") << ",\"bits\":" << (value.bits ? std::to_string(*value.bits) : "null") << ",\"load\":";
+			if (value.load) out << "{\"base\":" << value.load->base.id << ",\"displacement\":" << value.load->displacement << ",\"bytes\":8}";
+			else out << "null";
+			out << ",\"proof\":"; Proof(out, value.proof); out << '}';
+		} else out << "null";
+		out << '}';
+	}
+	out << "],\"call_input_origins\":[";
+	bool originComma = false;
+	for (const auto& input : callInputOrigins) {
+		if (originComma) out << ','; originComma = true;
+		out << "{\"site\":" << input.site << ",\"payload\":" << input.payload << ",\"role\":" << Quoted(input.role)
+			<< ",\"index\":" << (input.index ? std::to_string(*input.index) : "null") << ",\"register\":" << (input.reg ? std::to_string(*input.reg) : "null")
+			<< ",\"sp_offset\":" << (input.spOffset ? std::to_string(*input.spOffset) : "null") << ",\"condition\":\"normal_fallthrough\",\"chain\":[";
+		bool chainComma = false;
+		for (const auto& step : input.chain) {
+			if (chainComma) out << ','; chainComma = true;
+			out << "{\"relation\":" << Quoted(step.relation) << ",\"stop\":" << Quoted(step.origin.stop) << ",\"steps\":" << step.origin.steps
+				<< ",\"pool_index\":" << (step.poolIndex ? std::to_string(*step.poolIndex) : "null") << ",\"source\":";
+			if (step.origin.source) {
+				const auto& value = *step.origin.source;
+				out << "{\"kind\":" << Quoted(value.kind) << ",\"site\":" << value.site << ",\"callee\":"
+					<< (value.callee ? std::to_string(*value.callee) : "null") << ",\"bits\":" << (value.bits ? std::to_string(*value.bits) : "null") << ",\"load\":";
+				if (value.load) out << "{\"base\":" << value.load->base.id << ",\"displacement\":" << value.load->displacement << ",\"bytes\":" << (value.kind == "load_compressed" ? 4 : 8) << '}';
+				else out << "null";
+				out << ",\"proof\":"; Proof(out, value.proof); out << '}';
+			} else out << "null";
+			out << '}';
+		}
+		out << "]}";
+	}
+	out << "],\"input_object_catalog\":[";
+	originComma = false;
+	for (const auto& [index, object] : inputObjects) {
+		if (originComma) out << ','; originComma = true;
+		out << "{\"pool_index\":" << index << ",\"kind\":" << Quoted(object.kind) << ",\"text\":" << Quoted(object.text)
+			<< ",\"entry\":" << (object.entry ? std::to_string(*object.entry) : "null") << '}';
+	}
+	out << "],\"input_origin_work\":{\"limit\":2000000,\"steps\":" << inputOriginSteps << ",\"remaining\":" << inputOriginRemaining << "},\"entry_stack_loads\":[";
 	for (size_t n = 0; n < entryStackLoads.size(); ++n) {
 		if (n) out << ',';
 		const auto& value = entryStackLoads[n];
@@ -1257,5 +1517,8 @@ void Analyzer::Write(const std::string& filename,
 		<< ",\"candidate_payloads\":" << targeted.candidatePayloads << ",\"attempted_payloads\":" << targeted.attempted
 		<< ",\"transfer_steps\":" << targeted.steps << ",\"payload_limit\":1,\"step_limit\":" << TargetedResultStepLimit << '}';
 	out << ",\"limits\":\"Snapshot facts, not runtime target proof. static_dispatch remains the context-free normal-flow inference. call_contexts are one-level direct-caller analyses with explicit input bindings, not global receiver types. Only exact payload entries with recent stack observations are candidates. Unknown calls/stores and overlapping writes kill input bindings; they are never recreated. Reviewed SDK helpers and machine-code-proved callee effects preserve live inputs only with a separate negative caller frame and no other stack-address register aliases. Frame-only callee effects preserve caller-frame classes. Checked length leaves can additionally preserve unwritten working registers and selected array contents; no source return type is inferred. A separate return_input relation proves full-word X0 forwarding from one aligned entry stack slot on all normal returns of a call-free payload; its first consumer propagates only a known heap-object class. forwarded_returns in call_contexts remain conditional on their explicit caller bindings. Allocation body writes require separately audited fixed sizes or a known nonnegative Smi array length; headers and array metadata are excluded. native_return records are conditional matched-SDK result classes at direct calls, with no caller-frame, register or mutable-heap preservation implied. Unknown native calls, recursion and unsupported writes remain conservative. Bounds/unsupported paths may leave contexts unresolved. stack_inputs and entry_stack_loads remain partial physical observations, not complete source parameter lists. array_arguments are partial element-class observations in fresh arrays of at most 32 elements, confined to the allocation return block and checked unique length-call continuations. Other calls, branch boundaries and unproved stores discard their contents; known overlapping stores invalidate the affected elements. array_contexts separately bind one observed input array per direct-caller context, using an independent bounded budget. bound_only records establish supplied contents, not a callee read. read_proved records require an entry-block or checked entry-chain read certificate. length_proved records require a checked length-call result. Exact-target length leaves preserve contents only with a verified argument root and register-write mask at an untargeted immediate normal-return block. Packed values and saved index words are dropped there. Other calls and branch boundaries discard contents; entry backedges disable this consumer. array_path_contexts additionally require their explicit initial-stack-check fallthrough condition, checked against the matched SDK offset and slow stub. They exclude the initial slow edge only; the runtime stub has no asserted heap-preservation contract. They never replace unconditional array_contexts or global dispatch facts. array_entry_traces additionally describe one non-revisiting entry prefix ending at its first proved indexed result. Every chosen branch is concrete or an explicit checked stack condition; later iterations and post-getter execution are outside that scope. array_result_traces separately follow the getter result to the first later call, retaining scalar class/register data provenance and expiring array contents, prior input bindings and spills at the getter. Their stopped indirect target must derive from the result; unrelated or intervening calls produce no result-use claim. prefix_call_effects contain separately proved small callees requested by exact array-bound prefix calls. An interior helper must be an aligned dispatch-table entry within retained payload bytes; containing_payload identifies its unchanged native container and only the entry-to-end suffix is proved. They supplement entry/result traces only, with independent bounded work; original broad effects and ordinary contexts keep their original budgets and assumptions. These bindings do not claim global callee types or stable heap-pointer identities. A separate array_return certificate proves an element result for a nonnegative Smi index in [0,31] on all normal returns, with no heap writes or returning calls. indexed_return consumes this relation only for known in-bounds local fresh-array elements; array contents are still discarded at the call. Only separately audited SDK nonreturning_calls terminate call fallthrough. Unknown calls remain potentially returning. register_inputs additionally observe full-width heap classes in nonreserved X0 through X14; they are not source signatures. register_contexts have separate bounded work, explicit entry bindings, independent frame proofs and no promotion of conditional results to global helper types. Backward register liveness and observed callee stack loads select relevant bindings without proving types. return_classes describe individual normal RET sites; machine_return_classes additionally require a closed body and agreement at every reached normal return. These result-only summaries grant no preservation effects. call_result_contexts separately consume global or caller-qualified helper results at exact original direct BL sites; their derived caller facts never feed back into the producer proofs. Old scalar/array contexts retain their own inputs and budgets. Dropped register/result callers are counted explicitly. Exception-handler edges and unknown indirect entries are not recovered.\"}\n";
+	out.close();
+	// A successful plain export supersedes any earlier compressed graph.
+	std::filesystem::remove(filename + ".gz");
 }
 }

@@ -1,4 +1,18 @@
 set(SRCS 
+    CallInputOrigins.h
+    CallInputOrigins.cpp
+    WordOrigins.h
+    WordOrigins.cpp
+    DescriptorPrologue.h
+    DescriptorPrologue.cpp
+    CallInputShapes.h
+    CallInputShapes.cpp
+    CallInputRoles.h
+    CallInputRoles.cpp
+    CallInputAbi.h
+    AsyncContracts.h
+    AsyncOrigins.h
+    AsyncOrigins.cpp
     AnalysisDiagnostics.h
     RawAssembly.h
     NativePayloadRouting.h

@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 from indirect_result_records import indirect_results
+from graph_io import load_graph
+from stub_input_roles import input_records, ROLE_TEXT
 
 
 def query(graph, site):
@@ -30,6 +32,8 @@ def query(graph, site):
         bound = any(v['site'] == site for v in context['return_bindings'])
         selected = {key: [v for v in context[key] if bound or v['site'] == site]
                     for key in ('resolutions', 'stack_observations', 'array_observations')}
+        if 'register_observations' in context:
+            selected['register_observations'] = [v for v in context['register_observations'] if bound or v['site'] == site]
         if bound or any(selected.values()):
             result_contexts.append(dict(payload=context['payload'], return_bindings=context['return_bindings'], **selected))
     result = {'site': site, 'target': edge.get('target'), 'target_label': labels.get(edge.get('target'), ''),
@@ -38,6 +42,8 @@ def query(graph, site):
             'callee_normal_return_class': dict(graph['receiver_metadata'].get('machine_return_classes', [])).get(edge.get('target')),
             'contexts': contexts, 'call_result_contexts': result_contexts,
             'limits': 'Partial full-width physical register observations, not complete source arguments. Context results require their explicit caller bindings. Result classes grant no memory or register preservation; unknown remains unknown.'}
+    if graph.get('format', 0) >= 33:
+        result['stub_input_roles'] = [v for v in input_records(graph, site) if v['role']]
     result['indirect_results'] = indirect_results(graph, site)
     targeted = graph.get('targeted_call_result_analysis')
     if targeted is not None and targeted['payload'] == edge['source']:
@@ -52,6 +58,12 @@ def render(result):
     lines.extend(f"  {v['register']}: class {v['class_id']:#x}" for v in result['register_inputs'])
     if not result['register_inputs']:
         lines.append('  none recorded')
+    for value in result.get('stub_input_roles', []):
+        observed = (f"class {value['value']:#x}" if value['kind'] == 'class' else
+                    f"raw word {value['value']:#x}" if value['kind'] == 'word' else 'value unknown')
+        condition = 'normal flow' if value['bindings'] is None else 'under result bindings ' + ','.join(
+            f"{b['site']:#x}@{b['callee']:#x}={b['class_id']:#x}" for b in value['bindings'])
+        lines.append(f"SDK input: {ROLE_TEXT[value['role']]} ({value['register']}) -> {observed} [stub {value['callee']:#x}; {condition}]")
     if result['native_return']:
         lines.append(f"Matched SDK normal-return X0: class {result['native_return']['class_id']:#x}")
     if result.get('sdk_stub_return'):
@@ -89,6 +101,9 @@ def render(result):
         lines.append('Separate caller result propagation:')
         for binding in context['return_bindings']:
             lines.append(f"  Call {binding['site']:#x} normal-return X0: class {binding['class_id']:#x} [{binding['basis']}]")
+        for observation in context.get('register_observations', []):
+            values = ', '.join(f"{v['register']}=class {v['class_id']:#x}" for v in observation['values'])
+            lines.append(f"  Call {observation['site']:#x}: physical registers (partial): {values}")
         for observation in context['array_observations']:
             for value in observation['values']:
                 elements = ', '.join(f'[{index}]=class {cid:#x}' for index, cid in value['elements'])
@@ -109,8 +124,8 @@ def main():
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args()
     try:
-        result = query(json.loads(args.graph.read_text()), args.site)
-    except (ValueError, KeyError, TypeError) as error:
+        result = query(load_graph(args.graph), args.site)
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     print(json.dumps(result, indent=2) if args.json else render(result))
 

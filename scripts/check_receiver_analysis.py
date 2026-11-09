@@ -96,11 +96,13 @@ def heap_field(base, operand, writeback, header, enabled):
 
 
 def check_receivers(graph, read, decode, audit):
+    from graph_io import require_full_evidence
+    require_full_evidence(graph)
     from check_native_returns import check_native_returns
     native_returns, native_return_calls = check_native_returns(graph, read, audit or {})
     from check_sdk_stub_returns import check_sdk_stub_returns
     sdk_stub_returns, sdk_stub_return_calls = check_sdk_stub_returns(graph, read, audit or {})
-    from check_register_inputs import register_claims, check_register_bindings, machine_returns, check_return_summary, REGISTERS
+    from check_register_inputs import register_claims, context_register_claims, check_register_bindings, machine_returns, check_return_summary, REGISTERS
     register_observations = register_claims(graph)
     machine_return_classes = machine_returns(graph)
     from check_call_results import check_result_bindings
@@ -224,6 +226,7 @@ def check_receivers(graph, read, decode, audit):
     verified_stacks, verified_loads, verified_returns = set(), set(), set()
     verified_registers, register_stack_count, return_class_count = set(), 0, 0
     indirect_result_count = 0
+    result_register_count = 0
     result_stack_count, result_array_count, result_element_count, result_dispatch_count = 0, 0, 0, 0
     register_context_callers = check_register_bindings(graph, stack_claims, register_observations)
     context_return_count = 0
@@ -266,6 +269,7 @@ def check_receivers(graph, read, decode, audit):
     checks.extend((c['certificate'], c) for c in result_contexts)
     checks.extend((c['certificate'], c) for c in array_contexts + path_contexts + entry_traces + result_traces if c['certificate'] is not None)
 
+    input_edges = {e['site']: e for e in graph['edges']}
     for certificate, context in checks:
         register_mode = context is not None and 'register_inputs' in context
         result_mode = context is not None and 'return_bindings' in context
@@ -294,7 +298,8 @@ def check_receivers(graph, read, decode, audit):
         verified_array_reads = set()
         active_claims = {r['site']: r for r in context['resolutions']} if context else claims
         active_stacks, active_loads = ({v['site']: v['values'] for v in context['stack_observations']}, {}) if register_mode or result_mode else ({}, {}) if context else (stack_claims, load_claims)
-        active_registers = register_observations if not context else {}
+        active_registers = context_register_claims(graph, context, input_edges) if result_mode else register_observations if not context else {}
+        verified_context_registers = set()
         active_arrays = {v['site']: v['values'] for v in context['array_observations']} if result_mode else array_claims if not context else {}
         verified_context_arrays = set()
         verified_context_stacks = set()
@@ -833,7 +838,10 @@ def check_receivers(graph, read, decode, audit):
                     for claim in active_registers[address]:
                         assert state[REGISTERS[claim['register']]] == fact(OBJECT, claim['class_id'])
                         assert all(type(pc) is int and pc in by_address for pc in claim['proof'])
-                    verified_registers.add(address)
+                    if result_mode:
+                        verified_context_registers.add(address)
+                    else:
+                        verified_registers.add(address)
                 if address in active_array_reads:
                     claim = active_array_reads[address]
                     assert all(type(claim[k]) is int for k in ('site', 'input_sp_offset', 'index', 'class_id'))
@@ -1027,6 +1035,8 @@ def check_receivers(graph, read, decode, audit):
         check_return_summary(certificate, instructions, reached_returns, verified_physical_returns, nonreturning_calls, scoped=bool(path or trace))
         return_class_count += len(verified_physical_returns)
         if result_mode:
+            assert verified_context_registers == set(active_registers), 'Unchecked result-context register observation'
+            result_register_count += sum(map(len, active_registers.values()))
             assert verified_context_stacks == set(active_stacks) and verified_context_arrays == set(active_arrays)
             result_stack_count += sum(map(len, active_stacks.values()))
             result_array_count += sum(map(len, active_arrays.values()))
@@ -1083,6 +1093,7 @@ def check_receivers(graph, read, decode, audit):
     return {'receiver_claims_checked': len(verified), 'receiver_blocks_checked': blocks_checked,
             'native_return_contracts_checked': len(native_returns), 'native_return_calls_checked': native_return_calls,
             'sdk_stub_return_contracts_checked': len(sdk_stub_returns), 'sdk_stub_return_calls_checked': sdk_stub_return_calls,
+            'result_register_observations_checked': result_register_count,
             'register_observation_calls_checked': len(verified_registers),
             'register_observation_classes_checked': sum(map(len, register_observations.values())),
             'register_contexts_checked': len(register_contexts), 'register_context_callers_checked': len(register_context_callers),

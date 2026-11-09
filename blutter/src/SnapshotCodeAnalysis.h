@@ -9,6 +9,12 @@
 #include <vector>
 #include "NativeReturnContracts.h"
 #include "SdkStubReturnContracts.h"
+#include "AsyncContracts.h"
+#include "AsyncOrigins.h"
+#include "CallInputRoles.h"
+#include "CallInputShapes.h"
+#include "DescriptorPrologue.h"
+#include "CallInputOrigins.h"
 
 // ARM64 instruction facts. This module has no Dart VM or vendor dependencies.
 namespace SnapshotAnalysis {
@@ -84,6 +90,8 @@ struct Profile {
 	// Optional matched ABI for full-word physical results. This does not imply
 	// a source return type or describe floating/pair results.
 	arm64_reg wordReturnRegister = ARM64_REG_INVALID;
+	// Matched async boundaries; separate from ordinary result/effect summaries.
+	std::map<uint64_t, AsyncContract> asyncContracts;
 	// Matched SDK normal-result classes only. No frame, register, allocation
 	// body or heap-preservation effect is implied by membership in this map.
 	std::map<uint64_t, NativeReturnContract> nativeReturnClasses;
@@ -111,6 +119,16 @@ struct Profile {
 	std::optional<int64_t> stackLimitOffset;
 	// Matched compressed-pointer reconstruction register; optional.
 	arm64_reg heapBitsRegister = ARM64_REG_INVALID;
+	// Serialization only: inference and its budgets are identical in both modes.
+	bool includeGraphStates = true;
+	StubInputContracts stubInputContracts;
+	CallInputAbi callInputAbi;
+	DescriptorPrologueAbi descriptorPrologueAbi;
+	std::function<std::vector<uint8_t>(uint64_t, size_t)> readInputCode;
+	std::function<std::optional<InputObject>(int64_t)> describeInputObject;
+	std::map<int64_t, CallInputDescriptor> callInputDescriptors;
+	std::map<uint64_t, CallInputModel> callInputModels;
+	std::map<uint64_t, std::string> callInputModelRejections;
 };
 struct Reference {
 	uint64_t site;
@@ -255,6 +273,8 @@ public:
 		const std::function<void(const RegisterContextResult&)>& presentRegisterResults = {}) const;
 	const std::vector<Reference>& References() const { return references; }
 	const std::vector<Edge>& Edges() const { return edges; }
+	const StubInputContracts& InputContracts() const { return profile.stubInputContracts; }
+	const CallInputShapes& InputShapes() const { return callInputShapes; }
 private:
 	std::optional<size_t> FindPayload(uint64_t address) const;
 	Profile profile;
@@ -263,6 +283,13 @@ private:
 	std::map<int64_t, PoolSlot> poolSlots;
 	std::vector<Reference> references;
 	std::vector<Edge> edges;
+	std::vector<AsyncInput> asyncInputs;
+	std::vector<CallInputOrigin> callInputOrigins;
+	std::map<int64_t, InputObject> inputObjects;
+	size_t inputOriginRemaining = 2000000, inputOriginSteps = 0;
+	CallInputShapes callInputShapes;
+	std::map<uint64_t, std::optional<DescriptorPrologue>> descriptorPrologues;
+	std::map<uint64_t, std::string> callInputRejections;
 	std::set<uint64_t> entries;
 	std::set<uint64_t> receiverEntries;
 	std::vector<std::string> receiverCertificates;

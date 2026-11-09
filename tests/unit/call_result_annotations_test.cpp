@@ -84,6 +84,44 @@ int main()
 			Check(rejected,"Malformed indirect target, proof or caller conditions are rejected");
 		}
 		Check(BuildRegisterResultNotes({},scopedEdges).empty(),"No indirect proof produces no scoped note");
+		Edge input{};input.site=0x1010;input.source=0x1000;input.kind="indirect_call";
+		for(unsigned reg=0;reg<15;++reg)input.registerInputs.push_back({reg,32+reg,{0x1000}});
+		const auto inputNotes=BuildCallInputNotes({input});
+		for(unsigned reg=0;reg<15;++reg)
+			Check(Has(inputNotes,input.site,"physical x"+std::to_string(reg)+" -> class "),"Every supported physical register can be displayed");
+		Check(inputNotes.at(input.site).size()==15,"One note per known register, with no invented unknown arguments");
+		Check(Has(inputNotes,input.site,"[partial; normal flow]"),"Ordinary inputs retain their normal-flow scope");
+		Check(!Has(inputNotes,input.site,"argument"),"Physical observations do not become source argument positions");
+		Check(Has(BuildCallInputNotes({input},[](uint32_t){return "Type\"\\\nName";}),input.site,"\\x0a"),"Input metadata cannot inject assembly lines");
+		for(unsigned defect=0;defect<7;++defect){
+			auto bad=input;
+			if(defect==0)bad.kind="indirect_jump";
+			if(defect==1)bad.registerInputs[0].reg=15;
+			if(defect==2)bad.registerInputs[0].classId=0;
+			if(defect==3)bad.registerInputs[0].proof.clear();
+			if(defect==4)bad.registerInputs[0].proof={0x1004,0x1000};
+			if(defect==5)bad.registerInputs[0].proof={0x1001};
+			if(defect==6)bad.registerInputs.push_back(bad.registerInputs[0]);
+			bool rejected=false;try{BuildCallInputNotes({bad});}catch(const std::runtime_error&){rejected=true;}
+			Check(rejected,"Malformed input observations fail rather than producing misleading comments");
+		}
+		input.registerInputs.clear();
+		Check(BuildCallInputNotes({input}).empty(),"Unknown inputs produce no invented class comments");
+		auto inputEdges=edges;inputEdges[1].registerInputs={{1,7,{0x1000}}};
+		auto inputResult=result;
+		inputResult.contexts[0].analysis.registerInputs[0x1010]={{1,7,{0x1000}},{2,8,{0x1004,0x1008}}};
+		const auto qualified=BuildCallResultNotes(inputResult,inputEdges);
+		Check(Has(qualified,0x1010,"physical x2 -> class 0x8 [partial; under result bindings 0x1004@0x2000=0x7]"),"Derived input retains its exact result-binding condition");
+		Check(!Has(qualified,0x1010,"physical x1"),"An unchanged ordinary class is not repeated conditionally");
+		Check(!Has(qualified,0x1010,"partial; normal flow"),"A derived class is never published as unconditional");
+		for(unsigned defect=0;defect<3;++defect){
+			auto bad=inputResult;
+			if(defect==0)bad.contexts[0].bindings.clear();
+			if(defect==1)bad.contexts[0].bindings.push_back(bad.contexts[0].bindings[0]);
+			if(defect==2)bad.contexts[0].analysis.registerInputs[0x101c]={{2,8,{0x1004}}};
+			bool rejected=false;try{BuildCallResultNotes(bad,inputEdges);}catch(const std::runtime_error&){rejected=true;}
+			Check(rejected,"Missing conditions, duplicate bindings and detached input sites fail");
+		}
 		std::cout<<checks<<" caller-result annotation checks passed\n";
 	} catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 }

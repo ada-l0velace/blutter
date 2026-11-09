@@ -1114,29 +1114,33 @@ ReceiverAnalysisResult AnalyzeReceivers(const cs_insn* instructions, size_t coun
 	}
 	if (result.resolutions.empty() && result.forwardedReturns.empty() && result.indexedReturns.empty() && result.arrayReads.empty() && result.lengthReturns.empty() && result.returnClasses.empty() && result.registerInputs.empty() && ((inputs || registerInputs) || (result.stackInputs.empty() && result.entryStackLoads.empty()))) { result.poolClasses.clear(); return result; }
 	std::ostringstream certificate;
-	certificate << "{\"payload\":" << start << ",\"blocks\":[";
-	for (size_t n = 0; n < blocks.size(); ++n) {
-		if (n) certificate << ',';
-		const auto& b = blocks[n];
-		certificate << "{\"start\":" << start + b.first * 4 << ",\"end\":" << start + b.end * 4 << ",\"entry\":" << (b.entry ? "true" : "false")
-			<< ",\"reachable\":" << (b.in ? "true" : "false") << ",\"facts\":[";
-		bool comma = false;
-		if (b.in) for (unsigned r = 0; r < 31; ++r) if (b.in->regs[r].kind != Unknown) { if (comma) certificate << ','; comma = true; JsonFact(certificate, r, b.in->regs[r]); }
-		certificate << "],\"compare\":[";
-		if (b.in && b.in->compare.reg >= 0) certificate << b.in->compare.reg << ',' << b.in->compare.width << ',' << b.in->compare.value << ',' << b.in->compare.site;
-		certificate << "],\"live_inputs\":[";
-		bool first = true;
-		if (b.in) for (const auto offset : b.in->liveInputs) { if (!first) certificate << ','; first = false; certificate << offset; }
-		certificate << "],\"spills\":["; first = true;
-		if (b.in) for (const auto& [offset, value] : b.in->spills) { if (!first) certificate << ','; first = false; certificate << '[' << offset << ',' << value.value << ']'; }
-		certificate << "],\"fresh_array\":";
-		if (b.in && b.in->freshArray.kind == Word) certificate << "{\"allocation\":" << b.in->freshArray.origin << ",\"length\":" << b.in->freshArray.value << '}';
-		else certificate << "null";
-		certificate << ",\"array_continuation\":";
-		if (b.in && b.in->arrayContinuation) certificate << b.in->arrayContinuation->site; else certificate << "null";
-		certificate << '}';
+	certificate << "{\"payload\":" << start;
+	if (profile.includeGraphStates) {
+		certificate << ",\"blocks\":[";
+		for (size_t n = 0; n < blocks.size(); ++n) {
+			if (n) certificate << ',';
+			const auto& b = blocks[n];
+			certificate << "{\"start\":" << start + b.first * 4 << ",\"end\":" << start + b.end * 4 << ",\"entry\":" << (b.entry ? "true" : "false")
+				<< ",\"reachable\":" << (b.in ? "true" : "false") << ",\"facts\":[";
+			bool comma = false;
+			if (b.in) for (unsigned r = 0; r < 31; ++r) if (b.in->regs[r].kind != Unknown) { if (comma) certificate << ','; comma = true; JsonFact(certificate, r, b.in->regs[r]); }
+			certificate << "],\"compare\":[";
+			if (b.in && b.in->compare.reg >= 0) certificate << b.in->compare.reg << ',' << b.in->compare.width << ',' << b.in->compare.value << ',' << b.in->compare.site;
+			certificate << "],\"live_inputs\":[";
+			bool first = true;
+			if (b.in) for (const auto offset : b.in->liveInputs) { if (!first) certificate << ','; first = false; certificate << offset; }
+			certificate << "],\"spills\":["; first = true;
+			if (b.in) for (const auto& [offset, value] : b.in->spills) { if (!first) certificate << ','; first = false; certificate << '[' << offset << ',' << value.value << ']'; }
+			certificate << "],\"fresh_array\":";
+			if (b.in && b.in->freshArray.kind == Word) certificate << "{\"allocation\":" << b.in->freshArray.origin << ",\"length\":" << b.in->freshArray.value << '}';
+			else certificate << "null";
+			certificate << ",\"array_continuation\":";
+			if (b.in && b.in->arrayContinuation) certificate << b.in->arrayContinuation->site; else certificate << "null";
+			certificate << '}';
+		}
+		certificate << ']';
 	}
-	certificate << "],\"return_classes\":[";
+	certificate << ",\"return_classes\":[";
 	bool firstReturn = true;
 	for (const auto& [site, value] : result.returnClasses) {
 		if (!firstReturn) certificate << ','; firstReturn = false;

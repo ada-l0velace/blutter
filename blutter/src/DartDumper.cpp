@@ -15,6 +15,11 @@
 #include "SnapshotCodeAnalysis.h"
 #include "SnapshotCodeRanges.h"
 #include "CallResultAnnotations.h"
+#include "CallInputAbi.h"
+#ifdef BLUTTER_FIXED_STACK_INPUTS
+#include <vm/dart_entry.h>
+#include <vm/stack_frame.h>
+#endif
 #endif
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
@@ -65,6 +70,91 @@ static std::string pythonString(const std::string& value)
 
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 namespace {
+template <typename Stubs>
+static std::vector<std::pair<SnapshotAnalysis::StubInputKind, const dart::Code*>> InputRoleSdkReferences()
+{
+	using K = SnapshotAnalysis::StubInputKind;
+	std::vector<std::pair<K, const dart::Code*>> result;
+	if constexpr (requires { Stubs::AllocateArray(); }) result.emplace_back(K::Array, &Stubs::AllocateArray());
+	if constexpr (requires { Stubs::AllocateClosure(); }) result.emplace_back(K::Closure, &Stubs::AllocateClosure());
+	if constexpr (requires { Stubs::AllocateClosure1(); }) result.emplace_back(K::Closure1, &Stubs::AllocateClosure1());
+	if constexpr (requires { Stubs::AllocateClosure2(); }) result.emplace_back(K::Closure2, &Stubs::AllocateClosure2());
+	if constexpr (requires { Stubs::AllocateClosure3(); }) result.emplace_back(K::Closure3, &Stubs::AllocateClosure3());
+	if constexpr (requires { Stubs::AllocateClosure4(); }) result.emplace_back(K::Closure4, &Stubs::AllocateClosure4());
+	return result;
+}
+static std::vector<SnapshotAnalysis::StubInputIdentity> ReadInputRoleIdentities(
+	const std::vector<dart::CodePtr>& codes, uintptr_t base, uintptr_t begin, uintptr_t end)
+{
+	std::vector<SnapshotAnalysis::StubInputIdentity> result;
+	auto* zone = dart::Thread::Current()->zone();
+	auto& candidate = dart::Code::Handle(zone);
+	auto& owner = dart::Object::Handle(zone);
+	for (const auto& [kind, reference] : InputRoleSdkReferences<dart::StubCode>()) {
+		if (reference->IsNull() || reference->Size() <= 0 || reference->Size() > (1 << 20)) continue;
+		auto append = [&](const dart::Code& code) {
+			const auto entry = code.EntryPoint(), payload = code.PayloadStart();
+			if (code.Size() != reference->Size() || entry < begin || entry >= end || payload < begin || payload >= end ||
+				static_cast<uint64_t>(code.Size()) > end-entry || static_cast<uint64_t>(code.Size()) > end-payload) return;
+			if (std::memcmp(reinterpret_cast<const void*>(entry), reinterpret_cast<const void*>(reference->EntryPoint()), code.Size()) == 0)
+				result.push_back({entry-base, payload-base, payload-base+code.Size(), kind, true});
+		};
+		append(*reference);
+		for (const auto ptr : codes) {
+			candidate = ptr;
+			owner = candidate.owner();
+			if (owner.IsNull()) append(candidate);
+		}
+	}
+	return result;
+}
+static constexpr bool SupportedAsyncAbi()
+{
+	return dart::CallingConventions::kReturnReg == dart::R0 &&
+		dart::SuspendStubABI::kArgumentReg == dart::R0 && dart::SuspendStubABI::kTypeArgsReg == dart::R1 &&
+		dart::SuspendStubABI::kResumePcDistance == 0 && dart::InitSuspendableFunctionStubABI::kTypeArgsReg == dart::R0 &&
+		dart::ReturnStubABI::kSuspendStateReg == dart::R2 && dart::ResumeStubABI::kSuspendStateReg == dart::R2 &&
+		dart::ResumeStubABI::kResumePcReg == dart::R1 && dart::ResumeStubABI::kExceptionReg == dart::R3 &&
+		dart::ResumeStubABI::kStackTraceReg == dart::R4;
+}
+template <typename Stubs>
+static std::vector<std::pair<SnapshotAnalysis::AsyncOperation, const dart::Code*>> AsyncSdkReferences()
+{
+	using Op = SnapshotAnalysis::AsyncOperation;
+	std::vector<std::pair<Op, const dart::Code*>> result;
+	if constexpr (requires { Stubs::InitAsync(); }) result.emplace_back(Op::Init, &Stubs::InitAsync());
+	if constexpr (requires { Stubs::Await(); }) result.emplace_back(Op::Await, &Stubs::Await());
+	if constexpr (requires { Stubs::AwaitWithTypeCheck(); }) result.emplace_back(Op::AwaitWithTypeCheck, &Stubs::AwaitWithTypeCheck());
+	if constexpr (requires { Stubs::ReturnAsyncNotFuture(); }) result.emplace_back(Op::CompleteValue, &Stubs::ReturnAsyncNotFuture());
+	if constexpr (requires { Stubs::ReturnAsync(); }) result.emplace_back(Op::CompleteValueOrFuture, &Stubs::ReturnAsync());
+	if constexpr (requires { Stubs::Resume(); }) result.emplace_back(Op::Resume, &Stubs::Resume());
+	return result;
+}
+static std::vector<SnapshotAnalysis::AsyncStubIdentity> ReadAsyncStubIdentities(
+	const std::vector<dart::CodePtr>& codes, uintptr_t base, uintptr_t begin, uintptr_t end)
+{
+	std::vector<SnapshotAnalysis::AsyncStubIdentity> result;
+	auto* zone = dart::Thread::Current()->zone();
+	auto& candidate = dart::Code::Handle(zone);
+	auto& owner = dart::Object::Handle(zone);
+	for (const auto& [operation, reference] : AsyncSdkReferences<dart::StubCode>()) {
+		if (reference->IsNull() || reference->Size() <= 0 || reference->Size() > (1 << 20)) continue;
+		auto append = [&](const dart::Code& code) {
+			const auto entry = code.EntryPoint(), payload = code.PayloadStart();
+			if (code.Size() != reference->Size() || entry < begin || entry >= end || payload < begin || payload >= end ||
+				static_cast<uint64_t>(code.Size()) > end-entry || static_cast<uint64_t>(code.Size()) > end-payload) return;
+			if (std::memcmp(reinterpret_cast<const void*>(entry), reinterpret_cast<const void*>(reference->EntryPoint()), code.Size()) == 0)
+				result.push_back({entry-base, payload-base, payload-base+code.Size(), operation, true});
+		};
+		append(*reference);
+		for (const auto ptr : codes) {
+			candidate = ptr;
+			owner = candidate.owner();
+			if (owner.IsNull()) append(candidate);
+		}
+	}
+	return result;
+}
 struct VmNativeReturnRecord {
 	SnapshotAnalysis::NativeReturnIdentity identity;
 	uint32_t recognizedValue;
@@ -157,6 +247,147 @@ static std::string JsonNativeText(const std::string& value)
 	return result + '"';
 }
 }
+static SnapshotAnalysis::CallInputAbi ReadCallInputAbi()
+{
+#ifdef BLUTTER_FIXED_STACK_INPUTS
+	if constexpr (dart::kWordSize == 8 && dart::SP == dart::R15 &&
+		dart::compiler::target::kIntSpillFactor == 1 && dart::compiler::target::kDoubleSpillFactor == 1)
+		return {true, static_cast<unsigned>(dart::ARGS_DESC_REG), dart::kWordSize, "verified_compiler_policy"};
+#endif
+	return {};
+}
+static SnapshotAnalysis::DescriptorPrologueAbi ReadDescriptorPrologueAbi()
+{
+#ifdef BLUTTER_DESCRIPTOR_PROLOGUE
+	if (ReadCallInputAbi().supported && dart::kCompressedWordSize == 4 && dart::kSmiTagShift == 1) {
+		SnapshotAnalysis::DescriptorPrologueAbi abi{true, static_cast<unsigned>(dart::ARGS_DESC_REG), dart::kCompressedWordSize, dart::kSmiTagShift,
+			dart::ArgumentsDescriptor::type_args_len_offset()-dart::kHeapObjectTag,
+			dart::ArgumentsDescriptor::size_offset()-dart::kHeapObjectTag,
+			(dart::kParamEndSlotFromFp+1)*dart::kWordSize};
+#ifdef BLUTTER_DESCRIPTOR_PARAMETERS
+		abi.countOffset = dart::ArgumentsDescriptor::count_offset()-dart::kHeapObjectTag;
+#endif
+		return abi;
+	}
+#endif
+	return {};
+}
+static std::map<int64_t, SnapshotAnalysis::CallInputDescriptor> ReadCallInputDescriptors(const dart::ObjectPool& pool)
+{
+	std::map<int64_t, SnapshotAnalysis::CallInputDescriptor> result;
+#ifdef BLUTTER_FIXED_STACK_INPUTS
+	// Validate storage before constructing the SDK wrapper; arbitrary Arrays
+	// are not descriptors merely because their first elements are integers.
+	if (!ReadCallInputAbi().supported) return result;
+	if (dart::ArgumentsDescriptor::type_args_len_offset() != dart::Array::element_offset(0) ||
+		dart::ArgumentsDescriptor::count_offset() != dart::Array::element_offset(1) ||
+		dart::ArgumentsDescriptor::size_offset() != dart::Array::element_offset(2) ||
+		dart::ArgumentsDescriptor::positional_count_offset() != dart::Array::element_offset(3) ||
+		dart::ArgumentsDescriptor::first_named_entry_offset() != dart::Array::element_offset(4)) return result;
+	auto& object = dart::Object::Handle();
+	auto& item = dart::Object::Handle();
+	for (intptr_t i = 0; i < pool.Length(); ++i) {
+		if (pool.TypeAt(i) != dart::ObjectPool::EntryType::kTaggedObject) continue;
+		object = pool.ObjectAt(i);
+		if (!object.IsArray()) continue;
+		const auto& array = dart::Array::Cast(object);
+		if (array.Length() < 5 || array.Length() > 69 || array.Length()%2 != 1 || array.At(array.Length()-1) != dart::Object::null()) continue;
+		bool valid = true;
+		for (intptr_t n = 0; n < 4; ++n) {
+			item = array.At(n);
+			if (!item.IsSmi() || dart::Smi::Cast(item).Value() < 0) { valid = false; break; }
+		}
+		if (!valid) continue;
+		const dart::ArgumentsDescriptor descriptor(array);
+		SnapshotAnalysis::CallInputDescriptor value{i, descriptor.TypeArgsLen(), descriptor.Count(), descriptor.Size(), descriptor.PositionalCount()};
+		const auto names = (array.Length()-5)/2;
+		if (value.count < 1 || value.count > 32 || value.positional < 0 || value.positional > value.count || value.count-value.positional != names) continue;
+		std::set<std::string> seen;
+		for (intptr_t n = 0; n < names; ++n) {
+			item = array.At(4+2*n);
+			if (!item.IsString() || dart::String::Cast(item).Length() < 1 || dart::String::Cast(item).Length() > 1024) { valid = false; break; }
+			bool embeddedNull = false;
+			for (intptr_t k = 0; k < dart::String::Cast(item).Length(); ++k) if (dart::String::Cast(item).CharAt(k) == 0) { embeddedNull = true; break; }
+			if (embeddedNull) { valid = false; break; }
+			const std::string name = dart::String::Cast(item).ToCString();
+			item = array.At(5+2*n);
+			if (!item.IsSmi()) { valid = false; break; }
+			const auto position = dart::Smi::Cast(item).Value();
+			if (position < value.positional || position >= value.count || name.size() > 4096 || !seen.insert(name).second ||
+				!value.named.emplace(static_cast<unsigned>(position), name).second) { valid = false; break; }
+		}
+		if (valid && SnapshotAnalysis::ValidCallInputDescriptor(value)) result.emplace(i, value);
+	}
+#endif
+	return result;
+}
+static std::map<uint64_t, SnapshotAnalysis::CallInputModel> ReadCallInputModels(
+	const std::vector<dart::FunctionPtr>& functions, uint64_t base,
+	const std::map<uint64_t, uint64_t>& bounds, std::map<uint64_t, std::string>& rejections)
+{
+	std::map<uint64_t, SnapshotAnalysis::CallInputModel> result;
+#ifdef BLUTTER_FIXED_STACK_INPUTS
+	if (!ReadCallInputAbi().supported) return result;
+	auto* zone = dart::Thread::Current()->zone();
+	std::map<uint64_t, size_t> owners;
+	for (auto ptr : functions) ++owners[dart::Function::Handle(zone, ptr).entry_point() - base];
+	for (auto ptr : functions) {
+		const auto& f = dart::Function::Handle(zone, ptr);
+		const auto entry = f.entry_point() - base;
+		if (f.kind() != dart::UntaggedFunction::kRegularFunction || !f.signature().IsHeapObject()) continue;
+		const auto& signature = dart::FunctionType::Handle(zone, f.signature());
+		if (signature.IsNull() || f.NumTypeParameters() <= 0) continue;
+		auto reject = [&](const char* why) { rejections[entry] = why; };
+		if (owners.at(entry) != 1) { reject("shared_retained_entry"); continue; }
+		if (f.is_native() || f.is_abstract()) { reject("native_or_abstract_model"); continue; }
+		if (signature.NumOptionalParameters() || f.NumParentTypeArguments()) { reject("unsupported_signature_model"); continue; }
+		const auto implicit = signature.num_implicit_parameters();
+		if (implicit != f.NumImplicitParameters() || implicit != (f.is_static() ? 0 : 1)) { reject("inconsistent_implicit_count"); continue; }
+		auto range = bounds.upper_bound(entry);
+		if (range == bounds.begin() || entry % 4 || entry >= std::prev(range)->second) { reject("unbounded_model_entry"); continue; }
+		SnapshotAnalysis::CallInputModel model{entry, signature.num_fixed_parameters(), implicit,
+			f.NumTypeParameters(), f.UserVisibleNameCString(), {}};
+		if (model.fixed < 1 || model.fixed > 32 || signature.NumParameters() != model.fixed) { reject("unsupported_model_arity"); continue; }
+		for (intptr_t i = 0; i < model.fixed; ++i) {
+			const auto& type = dart::AbstractType::Handle(zone, signature.ParameterTypeAt(i));
+			dart::ZoneTextBuffer text(zone); type.PrintName(dart::Object::kScrubbedName, &text);
+			model.declaredTypes.emplace_back(text.buffer());
+		}
+		if (!SnapshotAnalysis::ValidCallInputModel(model)) throw std::runtime_error("Invalid SDK call-input model");
+		result.emplace(entry, std::move(model));
+	}
+#endif
+	return result;
+}
+
+static std::optional<SnapshotAnalysis::InputObject> ReadInputObject(const dart::ObjectPool& pool,
+	int64_t index, uintptr_t base, uintptr_t codeStart, uintptr_t imageEnd)
+{
+		if (index < 0 || index >= pool.Length() || pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject) return {};
+		const auto& object = dart::Object::Handle(pool.ObjectAt(index));
+		if (object.IsNull()) return SnapshotAnalysis::InputObject{"null", "null", {}};
+		if (object.IsSmi()) return SnapshotAnalysis::InputObject{"smi", std::to_string(dart::Smi::Cast(object).Value()), {}};
+		if (object.IsBool()) return SnapshotAnalysis::InputObject{"bool", object.ptr() == dart::Bool::True().ptr() ? "true" : "false", {}};
+		if (object.IsString()) {
+			const auto& text = dart::String::Cast(object);
+			if (text.Length() > 1024) return {};
+			// A bounded display preview, not an embedded-NUL-sensitive identity.
+			return SnapshotAnalysis::InputObject{"string_preview", text.ToCString(), {}};
+		}
+		dart::FunctionPtr pointer;
+		std::string kind;
+		if (object.IsFunction()) { pointer = dart::Function::Cast(object).ptr(); kind = "function"; }
+		else if (object.IsClosure()) { pointer = dart::Closure::Cast(object).function(); kind = "closure"; }
+		else return {};
+		const auto& function = dart::Function::Handle(pointer);
+		if (function.IsNull()) return {};
+		const auto entry = function.entry_point();
+		if (entry < codeStart || entry >= imageEnd || (entry-base)%4) return {};
+		std::string name = function.UserVisibleNameCString();
+		if (name.size() > 4096) return {};
+		return SnapshotAnalysis::InputObject{kind, std::move(name), entry-base};
+}
+
 // Optional numerical VM metadata audit, independent of IDA/asm exports.
 void DartDumper::DumpCoverageAudit(const char* filename)
 {
@@ -243,9 +474,47 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 			<< ",\"kind\":" << static_cast<int>(function.kind())
 			<< ",\"registered_model\":" << (app.FindFunctionMetadata(ptr) ? "true" : "false")
 			<< ",\"has_code\":" << (function.HasCode() ? "true" : "false")
-			<< ",\"unknown_code\":" << (code.IsUnknownDartCode() ? "true" : "false") << '}';
+			<< ",\"unknown_code\":" << (code.IsUnknownDartCode() ? "true" : "false");
+#ifdef BLUTTER_FIXED_STACK_INPUTS
+		const auto& sig = dart::FunctionType::Handle(zone, function.signature());
+		of << ",\"call_input_model\":";
+		if (sig.IsNull()) of << "null";
+		else {
+			of << "{\"fixed\":" << sig.num_fixed_parameters() << ",\"implicit\":" << sig.num_implicit_parameters()
+			<< ",\"implicit_from_kind\":" << function.NumImplicitParameters() << ",\"optional\":" << sig.NumOptionalParameters()
+			<< ",\"type_parameters\":" << function.NumTypeParameters() << ",\"parent_type_arguments\":" << function.NumParentTypeArguments()
+			<< ",\"static\":" << (function.is_static() ? "true" : "false") << ",\"native\":" << (function.is_native() ? "true" : "false")
+			<< ",\"abstract\":" << (function.is_abstract() ? "true" : "false") << ",\"declared_types\":[";
+			for (intptr_t i = 0; i < sig.NumParameters(); ++i) {
+				if (i) of << ',';
+				const auto& type = dart::AbstractType::Handle(zone, sig.ParameterTypeAt(i));
+				dart::ZoneTextBuffer text(zone); type.PrintName(dart::Object::kScrubbedName, &text);
+				of << JsonNativeText(text.buffer());
+			}
+			of << "]}";
+		}
+#endif
+		of << '}';
 	}
-	of << "],\"native_return_sdk\":[[" << dart::MethodRecognizer::kAllocateOneByteString << ',' << dart::kOneByteStringCid
+	of << "],\"call_input_abi\":{\"supported\":" << (ReadCallInputAbi().supported ? "true" : "false")
+		<< ",\"descriptor_register\":" << ReadCallInputAbi().descriptorRegister << ",\"word_bytes\":" << ReadCallInputAbi().wordBytes << "},\"call_input_descriptors\":[";
+	comma = false;
+	for (const auto& [index, d] : ReadCallInputDescriptors(app.GetObjectPool())) {
+		if (comma) of << ','; comma = true;
+		of << "{\"pool_index\":" << index << ",\"type_arguments\":" << d.typeArguments << ",\"count\":" << d.count
+			<< ",\"size\":" << d.size << ",\"positional\":" << d.positional;
+		if (!d.named.empty()) {
+			of << ",\"named\":["; bool comma = false;
+			for (const auto& [position, name] : d.named) { if (comma) of << ','; comma = true;
+				of << "{\"index\":" << position << ",\"name\":" << JsonNativeText(name) << '}'; }
+			of << ']';
+		}
+		of << '}';
+	}
+	of << "],\"descriptor_prologue_abi\":{\"supported\":" << (ReadDescriptorPrologueAbi().supported ? "true" : "false")
+		<< ",\"descriptor_register\":" << ReadDescriptorPrologueAbi().descriptorRegister << ",\"field_bytes\":" << ReadDescriptorPrologueAbi().fieldBytes
+		<< ",\"smi_shift\":" << ReadDescriptorPrologueAbi().smiShift << ",\"type_arguments_offset\":" << ReadDescriptorPrologueAbi().typeArgumentsOffset
+		<< ",\"size_offset\":" << ReadDescriptorPrologueAbi().sizeOffset << ",\"frame_argument_base\":" << ReadDescriptorPrologueAbi().frameArgumentBase << ",\"count_offset\":" << ReadDescriptorPrologueAbi().countOffset << "},\"native_return_sdk\":[[" << dart::MethodRecognizer::kAllocateOneByteString << ',' << dart::kOneByteStringCid
 		<< ",\"Internal_allocateOneByteString\",\"allocate_one_byte_string\"],[" << dart::MethodRecognizer::kAllocateTwoByteString << ',' << dart::kTwoByteStringCid
 		<< ",\"Internal_allocateTwoByteString\",\"allocate_two_byte_string\"]],\"native_return_identities\":[";
 	comma = false;
@@ -273,6 +542,62 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	for (const auto& id : ReadSdkStubIdentities(visitor.codes, app.base(), image, image+imageSize)) {
 		if (comma) of << ','; comma = true;
 		of << "{\"entry\":" << id.entry << ",\"payload\":" << id.payload << ",\"end\":" << id.end << ",\"kind\":\"allocate_growable_array\"}";
+	}
+	of << "],\"async_abi_supported\":" << (SupportedAsyncAbi() ? "true" : "false") << ",\"async_stub_references\":[";
+	comma = false;
+	for (const auto& [operation, reference] : AsyncSdkReferences<dart::StubCode>()) {
+		if (reference->IsNull() || reference->Size() <= 0 || reference->Size() > (1 << 20)) continue;
+		if (comma) of << ','; comma = true;
+		std::string bytes;
+		const auto* raw = reinterpret_cast<const uint8_t*>(reference->EntryPoint());
+		for (intptr_t n = 0; n < reference->Size(); ++n) bytes += std::format("{:02x}", raw[n]);
+		of << "{\"operation\":" << JsonNativeText(SnapshotAnalysis::AsyncOperationName(operation)) << ",\"bytes\":" << JsonNativeText(bytes) << '}';
+	}
+	of << "],\"async_stub_identities\":[";
+	comma = false;
+	for (const auto& id : ReadAsyncStubIdentities(visitor.codes, app.base(), image, image+imageSize)) {
+		if (comma) of << ','; comma = true;
+		of << "{\"entry\":" << id.entry << ",\"payload\":" << id.payload << ",\"end\":" << id.end
+			<< ",\"operation\":" << JsonNativeText(SnapshotAnalysis::AsyncOperationName(id.operation)) << '}';
+	}
+	of << "],\"stub_input_abis\":[";
+	comma = false;
+	for (const auto& [kind, inputs] : SnapshotAnalysis::ReadStubInputAbis<dart::AllocateArrayABI, dart::AllocateClosureABI>()) {
+		if (comma) of << ','; comma = true;
+		of << "{\"kind\":" << JsonNativeText(SnapshotAnalysis::StubInputKindName(kind)) << ",\"inputs\":[";
+		for (size_t n = 0; n < inputs.size(); ++n) {
+			if (n) of << ',';
+			of << "{\"register\":\"x" << inputs[n].reg << "\",\"role\":"
+				<< JsonNativeText(SnapshotAnalysis::StubInputRoleName(inputs[n].role)) << '}';
+		}
+		of << "]}";
+	}
+	of << "],\"stub_input_references\":[";
+	comma = false;
+	for (const auto& [kind, reference] : InputRoleSdkReferences<dart::StubCode>()) {
+		if (reference->IsNull() || reference->Size() <= 0 || reference->Size() > (1 << 20)) continue;
+		if (comma) of << ','; comma = true;
+		std::string bytes;
+		const auto* raw = reinterpret_cast<const uint8_t*>(reference->EntryPoint());
+		for (intptr_t n = 0; n < reference->Size(); ++n) bytes += std::format("{:02x}", raw[n]);
+		of << "{\"kind\":" << JsonNativeText(SnapshotAnalysis::StubInputKindName(kind)) << ",\"bytes\":" << JsonNativeText(bytes) << '}';
+	}
+	of << "],\"stub_input_identities\":[";
+	comma = false;
+	for (const auto& id : ReadInputRoleIdentities(visitor.codes, app.base(), image, image+imageSize)) {
+		if (comma) of << ','; comma = true;
+		of << "{\"entry\":" << id.entry << ",\"payload\":" << id.payload << ",\"end\":" << id.end
+			<< ",\"kind\":" << JsonNativeText(SnapshotAnalysis::StubInputKindName(id.kind)) << '}';
+	}
+	of << "],\"input_object_catalog\":[";
+	comma = false;
+	const auto& inputPool = app.GetObjectPool();
+	for (intptr_t index = 0; index < inputPool.Length(); ++index) {
+		const auto object = ReadInputObject(inputPool, index, app.base(), image, image+imageSize);
+		if (!object) continue;
+		if (comma) of << ','; comma = true;
+		of << "{\"pool_index\":" << index << ",\"kind\":" << JsonNativeText(object->kind) << ",\"text\":" << JsonNativeText(object->text)
+			<< ",\"entry\":" << (object->entry ? std::to_string(*object->entry) : "null") << '}';
 	}
 	of << "],\"pool_heap_classes\":[";
 	comma = false;
@@ -1065,6 +1390,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 #endif
 	SnapshotAnalysis::Profile profile{profileName, ARM64_REG_X27, ARM64_REG_X26,
 		dart::ObjectPool::element_offset(0), 8, pool.Length(), {}, {}};
+	profile.includeGraphStates = includeGraphStates;
 	profile.dispatchRegister = ARM64_REG_X21;
 	profile.stackLimitOffset = TargetThreadOffset(dart::Thread::stack_limit_offset());
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
@@ -1084,6 +1410,22 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		iteration.IterateOldObjects(&visitor);
 		std::map<uint64_t, uint64_t> bounds;
 		for (const auto& payload : payloads) bounds.emplace(payload.start, payload.end);
+		profile.callInputAbi = ReadCallInputAbi();
+		profile.descriptorPrologueAbi = ReadDescriptorPrologueAbi();
+		profile.readInputCode = [&](uint64_t address, size_t bytes) {
+			if (!address || bytes > 512 || address > UINTPTR_MAX-app.base()) return std::vector<uint8_t>{};
+			const auto absolute = app.base()+address;
+			if (absolute < codeStart || absolute >= imageEnd || bytes > imageEnd-absolute) return std::vector<uint8_t>{};
+			const auto* first = reinterpret_cast<const uint8_t*>(absolute);
+			return std::vector<uint8_t>(first, first+bytes);
+		};
+		profile.callInputDescriptors = ReadCallInputDescriptors(pool);
+		profile.callInputModels = ReadCallInputModels(visitor.functions, app.base(), bounds, profile.callInputModelRejections);
+		profile.stubInputContracts = SnapshotAnalysis::SelectStubInputContracts(
+			ReadInputRoleIdentities(visitor.codes, app.base(), codeStart, imageEnd),
+			SnapshotAnalysis::ReadStubInputAbis<dart::AllocateArrayABI, dart::AllocateClosureABI>(), bounds, true);
+		profile.asyncContracts = SnapshotAnalysis::SelectAsyncContracts(
+			ReadAsyncStubIdentities(visitor.codes, app.base(), codeStart, imageEnd), bounds, SupportedAsyncAbi());
 		profile.sdkStubReturnClasses = SnapshotAnalysis::SdkStubReturnContracts(
 			ReadSdkStubIdentities(visitor.codes, app.base(), codeStart, imageEnd),
 			dart::kGrowableObjectArrayCid, bounds, true);
@@ -1108,6 +1450,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	profile.nullClassId = dart::kNullCid;
 	profile.threadHeapClasses.emplace(TargetThreadOffset(dart::Thread::empty_array_offset()),
 		static_cast<uint32_t>(dart::Object::empty_array().GetClassId()));
+	profile.describeInputObject = [&](int64_t index) { return ReadInputObject(pool, index, app.base(), codeStart, imageEnd); };
 	profile.poolHeapClass = [&](int64_t index) -> std::optional<uint32_t> {
 		if (pool.TypeAt(index) != dart::ObjectPool::EntryType::kTaggedObject) return {};
 		const auto& object = dart::Object::Handle(pool.ObjectAt(index));
@@ -1351,8 +1694,9 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 			if (std::find(retained.begin(), retained.end(), note) == retained.end()) retained.push_back(note);
 		}
 	};
+	appendResultNotes(SnapshotAnalysis::BuildCallInputNotes(annotations.Edges(), resultClassName, annotations.InputContracts(), annotations.InputShapes()));
 	annotations.Write((directory.parent_path() / "snapshot_calls.json").string(), [&](const auto& result) {
-		appendResultNotes(SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), resultClassName));
+		appendResultNotes(SnapshotAnalysis::BuildCallResultNotes(result, annotations.Edges(), resultClassName, annotations.InputContracts(), annotations.InputShapes()));
 	}, [&](uint64_t entry) {
 		AnalysisIssue issue("sdk-result-decode", entry, "SDK result analysis cannot decode this retained payload");
 		if (diagnostics) diagnostics->Report(issue);

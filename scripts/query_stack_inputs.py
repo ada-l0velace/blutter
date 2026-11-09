@@ -9,6 +9,7 @@ import bisect
 import copy
 import json
 from pathlib import Path
+from graph_io import load_graph
 
 
 TRACE_COLLECTIONS = ('array_path_contexts', 'array_entry_traces', 'array_result_traces')
@@ -237,16 +238,16 @@ def render_text(result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('graph', type=Path, help='snapshot_calls.json')
+    parser.add_argument('graph', type=Path, help='snapshot_calls.json, snapshot_calls.json.gz or output directory')
     parser.add_argument('--target', type=lambda s: int(s, 0), required=True, help='ELF VA of the direct call destination')
     parser.add_argument('--limit', type=int, default=20, help='Maximum callers displayed (1..1000)')
     parser.add_argument('--caller', type=lambda s: int(s, 0), help='ELF address of one direct call instruction to the target')
     parser.add_argument('--format', choices=('json', 'text'), default='json', help='Output format (default: json)')
     args = parser.parse_args()
     try:
-        result = query(json.loads(args.graph.read_text()), args.target, args.limit, caller=args.caller)
+        result = query(load_graph(args.graph), args.target, args.limit, caller=args.caller)
         output = json.dumps(result, indent=2) if args.format == 'json' else render_text(result)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     print(output)
 

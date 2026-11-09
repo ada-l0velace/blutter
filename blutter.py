@@ -11,6 +11,8 @@ import zipfile
 import tempfile
 from dartvm_fetch_build import DartLibInfo
 from reader_cache import read_verified, write_verified, library_path
+from graph_output import run_blutter
+from sdk_abi_features import cmake_options
 
 CMAKE_CMD = "cmake"
 NINJA_CMD = "ninja"
@@ -38,9 +40,12 @@ def analysis_caller_address(value):
 
 
 class BlutterInput:
-    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
+    def __init__(self, libapp_path: str, dart_info: DartLibInfo, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None, graph_detail='compact', compress_graph=False):
         self.libapp_path = libapp_path
+        self.graph_detail = graph_detail
+        self.compress_graph = compress_graph
         self.dart_info = dart_info
+        self.call_input_capability = None
         self.outdir = outdir
         self.rebuild_blutter = rebuild_blutter
         self.create_vs_sln = create_vs_sln
@@ -185,7 +190,7 @@ def cmake_blutter(input: BlutterInput):
     blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
     builddir = os.path.join(BUILD_DIR, input.blutter_name)
     
-    macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key)
+    macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key) + cmake_options(input.call_input_capability)
     my_env = None
     if platform.system() == 'Darwin':
         mac_ver = int(platform.mac_ver()[0].split('.', 1)[0])
@@ -224,8 +229,16 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     return info
 
 def build_and_run(input: BlutterInput):
-    runtime_metadata = None
-    if not read_verified(input.blutter_file, input.dart_info, 'reader', input.no_analysis) or input.rebuild_blutter or input.create_vs_sln:
+    dartlib_file = library_path(input.dart_info, os.path.dirname(PKG_LIB_DIR), os.name == 'nt')
+    runtime_metadata = read_verified(dartlib_file, input.dart_info, 'runtime')
+    if runtime_metadata:
+        from dartvm_fetch_build import refresh_call_input_capability
+        runtime_metadata = refresh_call_input_capability(input.dart_info, dartlib_file, runtime_metadata)
+    reader_metadata = read_verified(input.blutter_file, input.dart_info, 'reader', input.no_analysis)
+    input.call_input_capability = (runtime_metadata or reader_metadata or {}).get('call_input_capability')
+    capability_changed = (reader_metadata is not None and runtime_metadata is not None and
+                          reader_metadata.get('call_input_capability') != input.call_input_capability)
+    if not reader_metadata or capability_changed or input.rebuild_blutter or input.create_vs_sln:
         # before fetch and build, check the existence of compiled library first
         #   so the src and build directories can be deleted
         dartlib_file = library_path(input.dart_info, os.path.dirname(PKG_LIB_DIR), os.name == 'nt')
@@ -238,14 +251,16 @@ def build_and_run(input: BlutterInput):
             if not runtime_metadata:
                 raise RuntimeError('Runtime build did not produce a verified reader artifact')
         
+        input.call_input_capability = runtime_metadata.get('call_input_capability')
         input.rebuild_blutter = True
 
     # creating Visual Studio solution overrides building
     if input.create_vs_sln:
-        macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key)
+        macros = find_compat_macro(input.dart_info.version, input.no_analysis, input.dart_info.sdk_key) + cmake_options(input.call_input_capability)
         blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
         dbg_output_path = os.path.abspath(os.path.join(input.outdir, 'out'))
         dbg_cmd_args = f'-i {input.libapp_path} -o {dbg_output_path}'
+        dbg_cmd_args += f' --graph-detail {input.graph_detail}'
         if input.analysis_caller is not None:
             dbg_cmd_args += f' --analysis-caller {input.analysis_caller:#x}'
 
@@ -272,30 +287,30 @@ def build_and_run(input: BlutterInput):
             write_verified(input.blutter_file, input.dart_info, 'reader', runtime_metadata, input.no_analysis)
 
         # execute blutter    
-        command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir]
+        command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir, '--graph-detail', input.graph_detail]
         if input.analysis_caller is not None:
             command += ['--analysis-caller', hex(input.analysis_caller)]
-        subprocess.run(command, check=True)
+        run_blutter(command, input.outdir, input.compress_graph)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None, graph_detail='compact', compress_graph=False):
     version, os_name, arch = dart_version.split('_')
     dart_info = DartLibInfo(version, os_name, arch)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller, graph_detail, compress_graph)
     build_and_run(input)
     
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None, graph_detail='compact', compress_graph=False):
     dart_info = get_dart_lib_info(libapp_path, libflutter_path)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller, graph_detail, compress_graph)
     build_and_run(input)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None):
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, analysis_caller=None, graph_detail='compact', compress_graph=False):
     if indir.endswith(".apk"):
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller, graph_detail, compress_graph)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, analysis_caller, graph_detail, compress_graph)
 
 
 if __name__ == "__main__":
@@ -308,13 +323,19 @@ if __name__ == "__main__":
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
+    parser.add_argument('--graph-detail', choices=('compact', 'full'), default='compact',
+                        help='Graph detail: compact facts (default), or full verification states')
+    parser.add_argument('--compress-graph', action='store_true',
+                        help='Store snapshot_calls.json.gz using standard-library gzip')
     parser.add_argument('--analysis-caller', type=analysis_caller_address,
                         help='Supplement call-result analysis for one native payload start (ELF address, e.g. 0x1000)')
     # rare usage scenario
     parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
     args = parser.parse_args()
+    if args.vs_sln and args.compress_graph:
+        parser.error('--compress-graph applies to Python launches, not Visual Studio solution generation')
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller, args.graph_detail, args.compress_graph)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.analysis_caller, args.graph_detail, args.compress_graph)

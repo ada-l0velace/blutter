@@ -267,22 +267,26 @@ std::optional<ArraySummary> ProveArrayReturn(const cs_insn* raw, size_t count,
 	}
 	return {};
 }
-void JsonArraySummary(std::ostream& out, uint64_t entry, const ArraySummary& summary) {
+void JsonArraySummary(std::ostream& out, uint64_t entry, const ArraySummary& summary, bool includeStates) {
 	out << ",\"array_return\":{\"array_sp_offset\":" << summary.inputs.arraySpOffset << ",\"index_sp_offset\":" << summary.inputs.indexSpOffset
-		<< ",\"index_representation\":\"smi\",\"index_min\":0,\"index_max\":31,\"states\":[";
-	bool first = true;
-	for (size_t n = 0; n < summary.states.size(); ++n) if (summary.states[n]) {
-		if (!first) out << ',';
-		first = false; out << '[' << entry+n*4 << ",[";
-		bool firstReg = true;
-		for (unsigned r = 0; r < 31; ++r) if ((*summary.states[n])[r][0]) {
-			if (!firstReg) out << ',';
-			firstReg = false; const auto v = (*summary.states[n])[r];
-			out << '[' << r << ',' << v[0] << ',' << v[1] << ',' << v[2] << ']';
+		<< ",\"index_representation\":\"smi\",\"index_min\":0,\"index_max\":31";
+	if (includeStates) {
+		out << ",\"states\":[";
+		bool first = true;
+		for (size_t n = 0; n < summary.states.size(); ++n) if (summary.states[n]) {
+			if (!first) out << ',';
+			first = false; out << '[' << entry+n*4 << ",[";
+			bool firstReg = true;
+			for (unsigned r = 0; r < 31; ++r) if ((*summary.states[n])[r][0]) {
+				if (!firstReg) out << ',';
+				firstReg = false; const auto v = (*summary.states[n])[r];
+				out << '[' << r << ',' << v[0] << ',' << v[1] << ',' << v[2] << ']';
+			}
+			out << "]]";
 		}
-		out << "]]";
+		out << ']';
 	}
-	out << "]}";
+	out << '}';
 }
 }
 
@@ -527,17 +531,20 @@ CallEffectResult AnalyzeCallEffects(const std::map<uint64_t, std::vector<uint8_t
 			if (value.kind != Input || (forwarded && *forwarded != value.offset)) forwards = false;
 			else forwarded = value.offset;
 		}
-		std::ostringstream out; out << "{\"payload\":" << entry << ",\"depth\":" << depth << ",\"states\":[";
-		bool first = true;
-		for (size_t n = 0; n < count; ++n) if (incoming[n]) { if (!first) out << ','; first = false; JsonState(out, entry + n * 4, *incoming[n]); }
-		out << ']';
+		std::ostringstream out; out << "{\"payload\":" << entry << ",\"depth\":" << depth;
+		if (profile.includeGraphStates) {
+			out << ",\"states\":[";
+			bool first = true;
+			for (size_t n = 0; n < count; ++n) if (incoming[n]) { if (!first) out << ','; first = false; JsonState(out, entry + n * 4, *incoming[n]); }
+			out << ']';
+		}
 		if (forwards && forwarded) {
 			result.forwardedInputs.emplace(entry, *forwarded);
 			out << ",\"return_input\":" << *forwarded;
 		}
 		if (const auto summary = ProveArrayReturn(raw, count, incoming, profile, arrayBudget)) {
 			result.arrayReturns.emplace(entry, summary->inputs);
-			JsonArraySummary(out, entry, *summary);
+			JsonArraySummary(out, entry, *summary, profile.includeGraphStates);
 		}
 		if (const auto summary = ProveArrayLength(raw, count, profile)) {
 			result.arrayLengths.emplace(entry, ArrayLengthEffect{summary->arraySpOffset, summary->writtenRegisters});

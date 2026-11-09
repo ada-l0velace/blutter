@@ -30,6 +30,82 @@ std::string Joined(const std::map<uint64_t, std::string>& values)
 	for (const auto& [_, value] : values) { if (!text.empty()) text += ','; text += value; }
 	return text.empty() ? "none" : text;
 }
+void InputNotes(AssemblyNotes& notes, const Edge& edge, const std::vector<RegisterInput>& values,
+	const std::string& scope, const std::function<std::string(uint32_t)>& className, bool conditional,
+	const StubInputContracts& contracts, const StaticDispatch* contextTarget = nullptr)
+{
+	auto target = edge.kind == "call" ? edge.target : std::optional<uint64_t>{};
+	const auto* resolution = contextTarget ? contextTarget : edge.staticDispatch ? &*edge.staticDispatch : nullptr;
+	if (edge.kind == "indirect_call" && resolution && !resolution->proof.empty()) target = resolution->snapshotTarget;
+	const auto found = target ? contracts.find(*target) : contracts.end();
+	const auto* contract = found != contracts.end() ? &found->second : nullptr;
+	if (contract && !ValidStubInputContract(*target, *contract))
+		throw std::runtime_error("Invalid stub input role contract");
+	if (contract && edge.kind == "indirect_call" &&
+		(resolution->proof.size() > 128 || !std::is_sorted(resolution->proof.begin(), resolution->proof.end()) ||
+		 std::adjacent_find(resolution->proof.begin(), resolution->proof.end()) != resolution->proof.end() ||
+		 std::ranges::any_of(resolution->proof, [](uint64_t address) { return address % 4 != 0; }) ||
+		 std::find(resolution->proof.begin(), resolution->proof.end(), resolution->load) == resolution->proof.end()))
+		throw std::runtime_error("Invalid stub input target proof");
+	if (values.empty() && (!contract || conditional)) return;
+	if (edge.kind != "call" && edge.kind != "indirect_call")
+		throw std::runtime_error("Register input annotation has no matching original call");
+	auto ordinaryTarget = edge.kind == "call" ? edge.target :
+		edge.staticDispatch && !edge.staticDispatch->proof.empty() ? std::optional<uint64_t>{edge.staticDispatch->snapshotTarget} : std::nullopt;
+	auto emit = [&](unsigned reg, std::optional<StubInputRole> role, const std::string& value) {
+		if (role) notes[edge.site].push_back(std::format("call-input @{:#x} [payload {:#x}]: {} (X{}) -> {} [stub {:#x}; partial; {}]",
+			edge.site, edge.source, StubInputRoleText(*role), reg, value, *target, scope));
+		else notes[edge.site].push_back(std::format("call-input @{:#x} [payload {:#x}]: physical x{} -> {} [partial; {}]",
+			edge.site, edge.source, reg, value, scope));
+	};
+	std::set<unsigned> seen;
+	for (const auto& value : values) {
+		if (value.reg >= 15 || !value.classId || !seen.insert(value.reg).second ||
+			value.proof.empty() || value.proof.size() > 128 ||
+			!std::is_sorted(value.proof.begin(), value.proof.end()) ||
+			std::adjacent_find(value.proof.begin(), value.proof.end()) != value.proof.end() ||
+			std::ranges::any_of(value.proof, [](uint64_t address) { return address % 4 != 0; }))
+			throw std::runtime_error("Invalid register input annotation");
+		const auto role = contract ? FindStubInputRole(*contract, value.reg) : std::nullopt;
+		if (conditional && (!role || target == ordinaryTarget) && std::ranges::any_of(edge.registerInputs, [&](const auto& old) {
+			return old.reg == value.reg && old.classId == value.classId;
+		})) continue;
+		emit(value.reg, role, ClassText(value.classId, className));
+	}
+	if (contract && !conditional) for (const auto& input : contract->inputs) if (!seen.contains(input.reg)) {
+		const auto reg = std::format("x{}", input.reg);
+		const auto constant = std::ranges::find_if(edge.registerConstants, [&](const auto& value) { return value.reg == reg; });
+		emit(input.reg, input.role, constant == edge.registerConstants.end() ? "value unknown" : std::format("raw word {:#x}", constant->bits));
+	}
+}
+void StackInputNotes(AssemblyNotes& notes, const Edge& edge, const std::vector<StackInput>& values,
+	const CallInputShapes& shapes, const std::string& scope,
+	const std::function<std::string(uint32_t)>& className, bool conditional)
+{
+	const auto found = shapes.find(edge.site);
+	if (found == shapes.end()) return;
+	const auto& shape = found->second;
+	if (!ValidCallInputShape(shape) || edge.source != shape.payload || edge.kind != "call" || edge.target != shape.target)
+		throw std::runtime_error("Supplied-input annotation has no matching original call");
+	std::set<int64_t> seen;
+	for (const auto& value : values) {
+		const auto index = SuppliedInputIndex(shape, value.spOffset);
+		if (!index) continue;
+		if (!seen.insert(value.spOffset).second || (value.kind != "word" && value.kind != "heap_class") ||
+			(value.kind == "heap_class" && (!value.value || value.value > UINT32_MAX)) || value.proof.empty() ||
+			value.proof.size() > 128 || !std::is_sorted(value.proof.begin(), value.proof.end()) ||
+			std::adjacent_find(value.proof.begin(), value.proof.end()) != value.proof.end() ||
+			std::ranges::any_of(value.proof, [](uint64_t site) { return site % 4; }))
+			throw std::runtime_error("Invalid supplied-input value annotation");
+		if (conditional && std::ranges::any_of(edge.stackInputs, [&](const auto& old) {
+			return old.spOffset == value.spOffset && old.kind == value.kind && old.value == value.value;
+		})) continue;
+		const auto text = value.kind == "heap_class" ? ClassText(static_cast<uint32_t>(value.value), className) :
+			std::format("raw word {:#x}", value.value);
+		notes[edge.site].push_back(std::format("call-input @{:#x} [payload {:#x}]: supplied input[{}] (Dart SP+{}) -> {} [descriptor load {:#x}; fixed stack; partial; {}]",
+			edge.site, edge.source, *index, value.spOffset, text, shape.load, scope));
+	}
+}
 void IndirectNotes(AssemblyNotes& notes, uint64_t payload, const ReceiverAnalysisResult& analysis,
 	const std::map<uint64_t, const Edge*>& calls, const std::string& scope,
 	const std::function<std::string(uint32_t)>& className)
@@ -50,8 +126,18 @@ void IndirectNotes(AssemblyNotes& notes, uint64_t payload, const ReceiverAnalysi
 	}
 }
 }
+AssemblyNotes BuildCallInputNotes(const std::vector<Edge>& edges,
+	const std::function<std::string(uint32_t)>& className, const StubInputContracts& contracts, const CallInputShapes& shapes)
+{
+	AssemblyNotes notes;
+	for (const auto& edge : edges) {
+		InputNotes(notes, edge, edge.registerInputs, "normal flow", className, false, contracts);
+		StackInputNotes(notes, edge, edge.stackInputs, shapes, "normal flow", className, false);
+	}
+	return notes;
+}
 AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const std::vector<Edge>& edges,
-	const std::function<std::string(uint32_t)>& className)
+	const std::function<std::string(uint32_t)>& className, const StubInputContracts& contracts, const CallInputShapes& shapes)
 {
 	AssemblyNotes notes;
 	std::map<uint64_t, const Edge*> calls;
@@ -116,14 +202,29 @@ AssemblyNotes BuildCallResultNotes(const CallResultContextResult& result, const 
 		}
 		for (const auto& [site, value] : context.analysis.returnClasses)
 			add(site, "physical X0 at RET -> " + type(value.classId));
-		if (!context.analysis.indirectReturns.empty()) {
+		if (!context.analysis.stackInputs.empty()) {
+			if (context.bindings.empty()) throw std::runtime_error("Supplied input has no result-binding scope");
+			std::map<uint64_t, std::string> bindings;
+			for (const auto& b : context.bindings)
+				if (!bindings.emplace(b.site, std::format("{:#x}@{:#x}={:#x}", b.site, b.callee, b.classId)).second)
+					throw std::runtime_error("Duplicate supplied-input binding scope");
+			for (const auto& [site, values] : context.analysis.stackInputs)
+				StackInputNotes(notes, call(site), values, shapes, "under result bindings " + Joined(bindings), className, true);
+		}
+		if (!context.analysis.indirectReturns.empty() || !context.analysis.registerInputs.empty()) {
 			if (context.bindings.empty()) throw std::runtime_error("Indirect caller result has no binding scope");
 			std::map<uint64_t, std::string> bindings;
 			for (const auto& b : context.bindings)
 				if (!bindings.emplace(b.site, std::format("{:#x}@{:#x}={:#x}", b.site, b.callee, b.classId)).second)
 					throw std::runtime_error("Duplicate indirect-result binding scope");
-			IndirectNotes(notes, context.payload, context.analysis, calls,
-				"entry regs none; stack none; after calls " + Joined(bindings), className);
+			const auto scope = "entry regs none; stack none; after calls " + Joined(bindings);
+			IndirectNotes(notes, context.payload, context.analysis, calls, scope, className);
+			const auto inputScope = "under result bindings " + Joined(bindings);
+			for (const auto& [site, values] : context.analysis.registerInputs) {
+				const auto resolution = context.analysis.resolutions.find(site);
+				InputNotes(notes, call(site), values, inputScope, className, true, contracts,
+					resolution == context.analysis.resolutions.end() ? nullptr : &resolution->second);
+			}
 		}
 	}
 	return notes;

@@ -8,8 +8,8 @@
 class DartDumper
 {
 public:
-	DartDumper(DartApp& app, AnalysisDiagnostics* diagnostics = nullptr, std::optional<uint64_t> selectedCaller = {})
-		: app(app), diagnostics(diagnostics), selectedCaller(selectedCaller) {};
+	DartDumper(DartApp& app, AnalysisDiagnostics* diagnostics = nullptr, std::optional<uint64_t> selectedCaller = {}, bool includeGraphStates = false)
+		: app(app), diagnostics(diagnostics), selectedCaller(selectedCaller), includeGraphStates(includeGraphStates) {};
 
 	void Dump4Ida(std::filesystem::path outDir);
 
@@ -60,6 +60,7 @@ private:
 	DartApp& app;
 	AnalysisDiagnostics* diagnostics;
 	std::optional<uint64_t> selectedCaller;
+	bool includeGraphStates;
 	// map for object ptr to unescape string with quote
 	std::unordered_map<intptr_t, std::string> quoteStringCache;
 };

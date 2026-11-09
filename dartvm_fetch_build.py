@@ -6,6 +6,7 @@ import subprocess
 import sys
 import re
 import uuid
+from sdk_abi_features import inspect_source
 from reader_profiles import reader_profile, runtime_profile, RUNTIME_PROFILES
 from reader_cache import source_snapshot_hash, write_verified, library_path
 
@@ -192,7 +193,29 @@ def verify_dart_sources(info: DartLibInfo, directory):
             f'input {info.snapshot_hash}, source {actual}. '
             'Inspect candidate sources with scripts/probe_runtime_sources.py; '
             'the reader hash will not be replaced.')
-    return {'source_revision': revision, 'source_hash': actual}
+    return {'source_revision': revision, 'source_hash': actual,
+            'call_input_capability': inspect_source(directory) if info.os_name == 'android' and info.arch == 'arm64' else None}
+
+def refresh_call_input_capability(info, artifact, metadata):
+    """Refresh optional policy evidence only from already cached, verified sources."""
+    directory = os.path.join(SDK_DIR, 'v' + info.sdk_key)
+    if not os.path.isdir(directory):
+        return metadata
+    try:
+        source = verify_dart_sources(info, directory)
+    except (OSError, RuntimeError, subprocess.CalledProcessError):
+        source = None
+    capability = None
+    if (source and source['source_revision'] == metadata['source_revision'] and
+            source['source_hash'] == metadata['source_hash']):
+        capability = source.get('call_input_capability')
+    if capability == metadata.get('call_input_capability'):
+        return metadata
+    updated = dict(metadata, call_input_capability=capability)
+    write_verified(artifact, info, 'runtime', updated)
+    from reader_cache import read_verified
+    return read_verified(artifact, info, 'runtime')
+
 
 def cmake_dart(info: DartLibInfo, target_dir: str):
     source = verify_dart_sources(info, target_dir)

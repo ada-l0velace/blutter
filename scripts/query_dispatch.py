@@ -4,6 +4,7 @@ import argparse
 import bisect
 import json
 from pathlib import Path
+from graph_io import load_graph
 
 
 def query(graph, site, *, index=None, extracted_value=None):
@@ -58,16 +59,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('graph', type=Path)
     parser.add_argument('--site', required=True, type=lambda text: int(text, 0))
+    parser.add_argument('--max-graph-mib', type=int, default=128,
+                        help='Maximum uncompressed graph size in MiB (default: 128)')
     values = parser.add_mutually_exclusive_group()
     values.add_argument('--index', type=lambda text: int(text, 0))
     values.add_argument('--extracted-value', type=lambda text: int(text, 0),
                         help='Observed extracted bitfield value (class ID for a class-ID expression)')
     args = parser.parse_args()
-    if args.graph.stat().st_size > 128 << 20:
-        parser.error('Graph exceeds 128 MiB')
+    if args.max_graph_mib < 1:
+        parser.error('--max-graph-mib must be positive')
     try:
-        result = query(json.loads(args.graph.read_text()), args.site, index=args.index, extracted_value=args.extracted_value)
-    except (ValueError, KeyError, TypeError) as error:
+        result = query(load_graph(args.graph, max_bytes=args.max_graph_mib << 20), args.site, index=args.index, extracted_value=args.extracted_value)
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
     print(json.dumps(result, indent=2))
 

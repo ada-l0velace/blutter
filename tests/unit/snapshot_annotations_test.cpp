@@ -69,6 +69,7 @@ int main(int argc, char** argv)
 				{{0xf000, 0xf000, 0xf008, SnapshotAnalysis::SdkStubReturnKind::GrowableArray, true}}, 5, bounds, true);
 		}
 		profile.heapBitsRegister = ARM64_REG_X28;
+		profile.includeGraphStates = !(std::getenv("BLUTTER_TEST_GRAPH_COMPACT") && std::string(std::getenv("BLUTTER_TEST_GRAPH_COMPACT")) == "1");
 		profile.dispatchOrigin = 4;
 		profile.dispatchEntries = {0x2000, 0x2004, {}, 0x3000, 0x2000, 0x2004, 0x2000, 0x2004, 0xb000};
 		if (lateHelper) {
@@ -146,10 +147,63 @@ int main(int argc, char** argv)
 				(note->second.find("shared Function entry: 2 metadata aliases; source identity unresolved") != std::string::npos) != shared)
 				throw std::runtime_error("Shared machine entry was presented as a unique Function identity");
 		}
+		const bool async = std::getenv("BLUTTER_TEST_ASYNC_CONTRACTS") && std::string(std::getenv("BLUTTER_TEST_ASYNC_CONTRACTS")) == "1";
+		if (async) {
+			// Authored identities supplied by a synthetic runtime adapter.
+			std::map<uint64_t, uint64_t> bounds;
+			for (const auto& payload : payloads) bounds.emplace(payload.start, payload.end);
+			using Op = SnapshotAnalysis::AsyncOperation;
+			std::vector<SnapshotAnalysis::AsyncStubIdentity> ids;
+			for (const auto& [entry, operation] : std::map<uint64_t, Op>{{0x11000, Op::Init}, {0x12000, Op::Await},
+				{0x13000, Op::AwaitWithTypeCheck}, {0x14000, Op::CompleteValue}, {0x15000, Op::CompleteValueOrFuture}, {0x16000, Op::Resume}})
+				if (bounds.contains(entry)) ids.push_back({entry, entry, bounds.at(entry), operation, true});
+			profile.asyncContracts = SnapshotAnalysis::SelectAsyncContracts(ids, bounds, true);
+		}
+        if (const char* layout = std::getenv("BLUTTER_TEST_STUB_INPUTS"); layout && *layout) {
+            const bool modern = std::string(layout) == "new";
+            using K = SnapshotAnalysis::StubInputKind; using R = SnapshotAnalysis::StubInputRole;
+            const K closure = modern ? K::Closure2 : K::Closure;
+            SnapshotAnalysis::StubInputAbis abis{{K::Array, {{2,R::ArrayLength},{1,R::ArrayTypeArguments}}},
+                {closure, {{1,R::ClosureFunction},{modern ? 3U : 2U,R::ClosureContext}}}};
+            if (modern) abis[closure].push_back({2,R::ClosureLengthFlags});
+            std::map<uint64_t,uint64_t> bounds;
+            for (const auto& payload : payloads) bounds.emplace(payload.start,payload.end);
+            std::vector<SnapshotAnalysis::StubInputIdentity> ids;
+            for (const auto& [entry,kind] : std::map<uint64_t,K>{{0x11000,K::Array},{0x12000,closure}})
+                if (bounds.contains(entry)) ids.push_back({entry,entry,bounds.at(entry),kind,true});
+            profile.stubInputContracts = SnapshotAnalysis::SelectStubInputContracts(ids,abis,bounds,true);
+        }
+		if (const char* mode = std::getenv("BLUTTER_TEST_CALL_INPUTS"); mode && *mode) {
+			profile.describeInputObject = [](int64_t index) -> std::optional<SnapshotAnalysis::InputObject> {
+				if (index == 3) return SnapshotAnalysis::InputObject{"function", "authored_callback", 0x19000};
+				return {};
+			};
+			profile.callInputAbi = {std::string(mode) != "unsupported", 4, 8, "verified_compiler_policy"};
+			profile.callInputDescriptors.emplace(10, SnapshotAnalysis::CallInputDescriptor{10, 2, 3, 3, 3});
+			profile.callInputModels.emplace(0x18000, SnapshotAnalysis::CallInputModel{0x18000, 3, 0, 2, "authored", {"Object", "Object", "Object"}});
+			if (std::string(mode) == "mismatch") profile.callInputDescriptors.at(10).typeArguments = 1;
+		}
+		if (const char* mode = std::getenv("BLUTTER_TEST_CALL_INPUTS"); mode && (std::string(mode) == "prologue" || std::string(mode) == "named")) {
+			profile.callInputModels.clear();
+			if (std::string(mode) == "named") { auto& d = profile.callInputDescriptors.at(10); d.positional = 1; d.named = {{1,"first"},{2,"last"}}; }
+			profile.descriptorPrologueAbi = {true, 4, 4, 1, 15, 23, 16, 19};
+			profile.readInputCode = [&](uint64_t address, size_t size) {
+				std::vector<uint8_t> bytes;
+				for (const auto& block : blocks) if (address == block.start && size <= block.count*4) {
+					for (size_t n = 0; n < size/4; ++n) bytes.insert(bytes.end(), block.instructions.get()[n].bytes, block.instructions.get()[n].bytes+4);
+					break;
+				}
+				return bytes;
+			};
+		}
 		SnapshotAnalysis::Analyzer analyzer(std::move(profile), std::move(payloads), {{0x2000, "known_function", "function"}}, selectedCaller);
 		for (const auto& block : blocks) analyzer.RegisterEntries(block.instructions.get(), block.count);
-		for (const auto& block : blocks) analyzer.Analyze(block.instructions.get(), block.count, block.start);
 		SnapshotAnalysis::AssemblyNotes notes;
+		for (const auto& block : blocks) {
+			const auto comments = analyzer.Analyze(block.instructions.get(), block.count, block.start);
+			if (async) for (const auto& [site, text] : comments)
+				if (text.find("async ") != std::string::npos) notes[site].push_back(text);
+		}
 		auto appendNotes = [&](const auto& addedNotes) {
 			for (const auto& [site, added] : addedNotes)
 				for (const auto& line : added) {
@@ -157,8 +211,9 @@ int main(int argc, char** argv)
 					if (std::find(retained.begin(), retained.end(), line) == retained.end()) retained.push_back(line);
 				}
 		};
+		appendNotes(SnapshotAnalysis::BuildCallInputNotes(analyzer.Edges(), {}, analyzer.InputContracts(), analyzer.InputShapes()));
 		analyzer.Write(argv[1], [&](const auto& result) {
-			appendNotes(SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges()));
+			appendNotes(SnapshotAnalysis::BuildCallResultNotes(result, analyzer.Edges(), {}, analyzer.InputContracts(), analyzer.InputShapes()));
 		}, {}, [&](const auto& result) {
 			appendNotes(SnapshotAnalysis::BuildRegisterResultNotes(result, analyzer.Edges()));
 		});

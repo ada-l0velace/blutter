@@ -26,11 +26,15 @@ int main(int argc, char** argv)
 	args::ValueFlag<std::string> infile(reqGrp, "infile", "libapp file", { 'i', "in" });
 	args::ValueFlag<std::string> outdir(reqGrp, "outdir", "out path", { 'o', "out"});
 	args::ValueFlag<std::string> analysisCaller(parser, "ELF address", "Supplement call-result analysis for one native payload start", { "analysis-caller" });
+	args::ValueFlag<std::string> graphDetail(parser, "compact|full", "Graph detail: compact (default) or full verification states", { "graph-detail" });
 	AnalysisDiagnostics diagnostics(std::cerr);
 	std::filesystem::path outDir;
 
 	try {
 		parser.ParseCLI(argc, argv);
+		const auto detail = graphDetail ? args::get(graphDetail) : "compact";
+		if (detail != "compact" && detail != "full")
+			throw args::ValidationError("Graph detail must be compact or full");
 		std::optional<uint64_t> selectedCaller;
 		if (analysisCaller) {
 			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(args::get(analysisCaller));
@@ -65,7 +69,7 @@ int main(int argc, char** argv)
 		analyzer.AnalyzeAll();
 #endif
 
-		DartDumper dumper{ app, &diagnostics, selectedCaller };
+		DartDumper dumper{ app, &diagnostics, selectedCaller, detail == "full" };
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 		if (const auto* audit = std::getenv("BLUTTER_COVERAGE_AUDIT"))
 			dumper.DumpCoverageAudit(audit);

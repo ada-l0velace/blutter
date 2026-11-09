@@ -21,16 +21,17 @@ class AnalysisSelection(unittest.TestCase):
                 blutter.analysis_caller_address(text)
 
     def test_native_command_preserves_selection_and_default(self):
-        for selected in (None, 0x1000):
+        for selected, detail, compressed in ((None, 'compact', False), (0x1000, 'full', True)):
             item = SimpleNamespace(blutter_file='reader', rebuild_blutter=False, create_vs_sln=False,
                                    libapp_path='input library', outdir='output directory', analysis_caller=selected,
-                                   dart_info=DartLibInfo('3.11.0', 'android', 'arm64', True, '0' * 32), no_analysis=False)
-            with patch.object(blutter, 'read_verified', return_value={'synthetic': True}), patch.object(blutter.subprocess, 'run') as run:
+                                   dart_info=DartLibInfo('3.11.0', 'android', 'arm64', True, '0' * 32), no_analysis=False,
+                                   graph_detail=detail, compress_graph=compressed)
+            with patch.object(blutter, 'read_verified', return_value={'synthetic': True}), patch.object(blutter, 'run_blutter') as run:
                 blutter.build_and_run(item)
-            expected = ['reader', '-i', 'input library', '-o', 'output directory']
+            expected = ['reader', '-i', 'input library', '-o', 'output directory', '--graph-detail', detail]
             if selected is not None:
                 expected += ['--analysis-caller', '0x1000']
-            run.assert_called_once_with(expected, check=True)
+            run.assert_called_once_with(expected, 'output directory', compressed)
 
 
 if __name__ == '__main__':

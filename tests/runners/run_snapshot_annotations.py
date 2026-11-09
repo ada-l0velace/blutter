@@ -20,6 +20,8 @@ from check_call_result_notes import expected_facts, check_stream
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--memcheck', action='store_true', help='Use ordinary binaries under Valgrind instead of sanitizers')
+    parser.add_argument('--compare-compact', action='store_true', help='Compare compact/full facts and assembly for every fixture')
+    parser.add_argument('--inputs-only', action='store_true', help='Run supplied-input and provenance cases only')
     args = parser.parse_args()
     if args.memcheck and not shutil.which('valgrind'):
         parser.error('Valgrind is required')
@@ -38,11 +40,17 @@ def main():
                         '-I' + str(root / 'blutter/src'),
                         str(root / 'tests/unit/snapshot_annotations_test.cpp'),
                         str(root / 'blutter/src/SnapshotCodeAnalysis.cpp'),
+                        str(root / 'blutter/src/AsyncOrigins.cpp'),
+                        str(root / 'blutter/src/WordOrigins.cpp'),
+                        str(root / 'blutter/src/CallInputOrigins.cpp'),
                         str(root / 'blutter/src/ReceiverAnalysis.cpp'),
                         str(root / 'blutter/src/RegisterContexts.cpp'),
                         str(root / 'blutter/src/CallResultContexts.cpp'),
                         str(root / 'blutter/src/SdkStubResultAnalysis.cpp'),
                         str(root / 'blutter/src/CallResultAnnotations.cpp'),
+                        str(root / 'blutter/src/CallInputRoles.cpp'),
+                        str(root / 'blutter/src/CallInputShapes.cpp'),
+                        str(root / 'blutter/src/DescriptorPrologue.cpp'),
                         str(root / 'blutter/src/CallEffects.cpp'),
                         str(root / 'blutter/src/NativeIr.cpp'),
                         str(root / 'blutter/src/Arm64Ir.cpp'),
@@ -50,7 +58,7 @@ def main():
                         str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None, sdk_stub_returns=False):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None, sdk_stub_returns=False, async_contracts=False, stub_inputs="", call_inputs=""):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -77,13 +85,19 @@ def main():
             if args.memcheck:
                 command = ['valgrind', '--quiet', '--error-exitcode=97', '--leak-check=full',
                            '--errors-for-leak-kinds=definite,indirect,possible'] + command
-            subprocess.run(command, check=True, env=dict(os.environ, BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
+            environment = dict(os.environ, BLUTTER_TEST_GRAPH_COMPACT='0', BLUTTER_TEST_ARRAY_BYTES=str(element_bytes), BLUTTER_TEST_LATE_HELPER='1' if late_helper else '0',
                 BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
                 BLUTTER_TEST_NATIVE_RETURNS='1' if native_returns else '0',
                 BLUTTER_TEST_SDK_STUB_RETURNS='1' if sdk_stub_returns else '0',
+                BLUTTER_TEST_STUB_INPUTS=stub_inputs, BLUTTER_TEST_CALL_INPUTS=call_inputs,
+                BLUTTER_TEST_ASYNC_CONTRACTS='1' if async_contracts else '0',
                 BLUTTER_TEST_ANALYSIS_CALLER='' if selected_caller is None else hex(selected_caller),
-                ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
+                ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
+            subprocess.run(command, check=True, env=environment)
             result = json.loads((temp / 'out.json').read_text())
+            if args.compare_compact:
+                from compact_graph_cases import check_compact
+                check_compact(command, environment, temp / 'out.json', result)
             with (temp / 'out.json.asm').open() as assembly:
                 rendered, _ = check_stream(assembly, expected_facts(result))
             assert set(rendered) == expected_facts(result), 'Missing authored assembly result annotations'
@@ -125,11 +139,59 @@ def main():
                              sdk_stub_return_identities=[{'entry': 0xf000, 'payload': 0xf000, 'end': 0xf008,
                                                           'kind': 'allocate_growable_array'}],
                              known_stubs=[{'entry': 0xf000, 'size': 8}])
+            audit.update(stub_input_abis=[], stub_input_references=[], stub_input_identities=[])
+            if stub_inputs:
+                closure_kind = 'allocate_closure_2' if stub_inputs == 'new' else 'allocate_closure'
+                closure_inputs = [{'register':'x1','role':'closure_function'},
+                                  {'register':'x3' if stub_inputs == 'new' else 'x2','role':'closure_context'}]
+                if stub_inputs == 'new': closure_inputs.append({'register':'x2','role':'closure_length_flags'})
+                for entry, kind, inputs in [(0x11000,'allocate_array',[{'register':'x2','role':'array_length'}, {'register':'x1','role':'array_type_arguments'}]),
+                                            (0x12000,closure_kind,closure_inputs)]:
+                    raw = fixture_bytes[entry]
+                    audit['stub_input_abis'].append(dict(kind=kind, inputs=inputs))
+                    audit['stub_input_references'].append(dict(kind=kind, bytes=raw.hex()))
+                    audit['stub_input_identities'].append(dict(entry=entry,payload=entry,end=entry+len(raw),kind=kind))
+            from stub_input_roles import check_contracts
+            check_contracts(result, audit, read)
+            if call_inputs and call_inputs != 'unsupported':
+                from call_input_shapes import check_shapes
+                audit['call_input_abi'] = dict(supported=True, descriptor_register=4, word_bytes=8)
+                audit['call_input_descriptors'] = [dict(pool_index=10, type_arguments=1 if call_inputs == 'mismatch' else 2, count=3, size=3, positional=3)]
+                audit['function_metadata'] = [dict(entry=0x18000, name='authored', kind=0, call_input_model=dict(fixed=3, implicit=0, implicit_from_kind=0,
+                    optional=0, type_parameters=2, parent_type_arguments=0, static=True, native=False, abstract=False, declared_types=['Object']*3))]
+                prologue = call_inputs in ('prologue', 'named')
+                audit['descriptor_prologue_abi'] = dict(supported=prologue, descriptor_register=4 if prologue else 0,
+                    field_bytes=4 if prologue else 0, smi_shift=1 if prologue else 0,
+                    type_arguments_offset=15 if prologue else 0, size_offset=23 if prologue else 0, frame_argument_base=16 if prologue else 0, count_offset=19 if prologue else 0)
+                if prologue: audit['function_metadata'] = []
+                if call_inputs == 'named':
+                    audit['call_input_descriptors'][0].update(positional=1, named=[dict(index=1,name='first'),dict(index=2,name='last')])
+                check_shapes(result, audit, read)
+            if result.get('call_input_origins'):
+                audit['input_object_catalog']=[dict(pool_index=3,kind='function',text='authored_callback',entry=0x19000)]
+                from input_origins import check_origins
+                check_origins(result,audit,read)
             def verify(value):
                 if sdk_stub_returns:
                     from check_snapshot_annotations import decode_payload
                     return check_receivers(value, read, lambda raw, address: decode_payload(decoder, raw, address), audit)
                 return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
+            if name == 'call-input-result-scope':
+                for defect in ('class', 'site', 'proof', 'duplicate', 'binding'):
+                    forged = copy.deepcopy(result)
+                    c = next(v for v in forged['call_result_contexts'] if v['register_observations'])
+                    row = next(v for v in c['register_observations'] if any(x['register'] == 'x1' for x in v['values']))
+                    if defect == 'class': row['values'][0]['class_id'] += 1
+                    elif defect == 'site': row['site'] += 4
+                    elif defect == 'proof': row['values'][0]['proof'] = [0x900000]
+                    elif defect == 'duplicate': c['register_observations'].append(copy.deepcopy(row))
+                    else: c['return_bindings'][0]['callee'] += 4
+                    try:
+                        verify(forged)
+                    except (AssertionError, KeyError):
+                        passed.append('call-input-forged-'+defect)
+                    else:
+                        raise AssertionError('Forged register input was accepted: '+defect)
             if name == 'indirect-machine-result-in-register-context':
                 for defect in ('missing', 'callee', 'class', 'proof', 'basis', 'duplicate'):
                     forged = copy.deepcopy(result)
@@ -374,6 +436,13 @@ def main():
                         raise AssertionError('Forged array context accepted: ' + defect)
             passed.append(name)
             return result
+
+        if args.inputs_only:
+            from input_origin_cases import run_cases as origin_cases
+            from call_input_shape_cases import run_cases as shape_cases
+            origin_cases(run);shape_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
 
         d = run('direct-and-interior-targets', ['bl 0x2000', 'bl 0x2004', 'b 0x3000'])
         assert [e['target'] for e in d['edges']] == [0x2000, 0x2004, 0x3000]
@@ -1532,6 +1601,88 @@ def main():
         exercise_register_contexts(run)
         from targeted_caller_cases import exercise_targeted_callers
         exercise_targeted_callers(run)
+        async_stubs = {address: ['ret'] for address in (0x11000, 0x12000, 0x13000, 0x14000, 0x15000, 0x16000)}
+        for name, body, expected in [
+            ('await', ['bl 0x12000', 'ret'], [('await', 0x1004)]),
+            ('await-with-unrelated-x1', ['mov x1, #7', 'bl 0x12000', 'ret'], [('await', 0x1008)]),
+            ('typed-await', ['bl 0x13000', 'ret'], [('await_with_type_check', 0x1004)]),
+            ('last-word-await', ['bl 0x12000'], [('await', None)]),
+            ('complete-value', ['b 0x14000'], [('complete_value', None)]),
+            ('complete-value-or-future', ['b 0x15000'], [('complete_value_or_future', None)]),
+            ('init', ['bl 0x11000', 'ret'], [('init_async', None)]),
+            ('interior-target', ['bl 0x12004', 'ret'], []),
+            ('conditional-completion', ['cbz x0, 0x14000', 'ret'], []),
+            ('jump-to-await', ['b 0x12000'], []),
+            ('call-to-completion', ['bl 0x14000', 'ret'], []),
+            ('multiple-awaits', ['bl 0x12000', 'bl 0x13000', 'ret'], [('await', 0x1004), ('await_with_type_check', 0x1008)]),
+        ]:
+            ordinary = run('async-baseline-'+name, body, async_stubs)
+            described = run('async-boundary-'+name, body, async_stubs, async_contracts=True)
+            assert [(v['operation'], v['resume_site']) for v in described['async_boundaries']] == expected
+            assert len(described['async_contracts']) == 6
+            assert {k:v for k,v in described.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs')} == {
+                k:v for k,v in ordinary.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs')}, 'Async contracts changed ordinary analysis facts'
+            text = (temp / 'out.json.asm').read_text()
+            assert 'async resume entry:' in text
+            if any(k.startswith('await') for k, _ in expected):
+                assert 'input X0' in text and 'value origin unknown' in text and 'exception path separate' in text
+        for name, body, kind, site, stop in [
+            ('direct-producer', ['bl 0x4000', 'bl 0x12000', 'ret'], 'post_call_x0', 0x1000, 'matched'),
+            ('register-copy', ['bl 0x4000', 'mov x8,x0', 'mov x0,x8', 'bl 0x12000', 'ret'], 'post_call_x0', 0x1000, 'matched'),
+            ('local-spill', ['bl 0x4000', 'stur x0,[x29,#-8]', 'mov x0,#7', 'ldur x0,[x29,#-8]', 'bl 0x12000', 'ret'], 'post_call_x0', 0x1000, 'matched'),
+            ('partial-spill', ['bl 0x4000', 'stur x0,[x29,#-8]', 'stur w1,[x29,#-8]', 'ldur x0,[x29,#-8]', 'bl 0x12000', 'ret'], 'load', 0x100c, 'partial_spill_write'),
+            ('memory-call-barrier', ['bl 0x4000', 'stur x0,[x29,#-8]', 'bl 0x5000', 'ldur x0,[x29,#-8]', 'bl 0x12000', 'ret'], 'load', 0x100c, 'call_barrier'),
+            ('alias-write', ['bl 0x4000', 'stur x0,[x29,#-8]', 'stur x1,[x8]', 'ldur x0,[x29,#-8]', 'bl 0x12000', 'ret'], 'load', 0x100c, 'possible_alias_write'),
+            ('copied-register-clobber', ['bl 0x4000', 'mov x8,x0', 'bl 0x5000', 'mov x0,x8', 'bl 0x12000', 'ret'], None, None, 'call_barrier'),
+            ('narrow-copy', ['bl 0x4000', 'mov w0,w1', 'bl 0x12000', 'ret'], None, None, 'narrow_definition'),
+            ('computed-value', ['bl 0x4000', 'add x0,x0,#1', 'bl 0x12000', 'ret'], None, None, 'computed_definition'),
+            ('earlier-delivery', ['bl 0x12000', 'bl 0x13000', 'ret'], 'await_delivery', 0x1000, 'matched'),
+            ('completion-operand', ['bl 0x4000', 'b 0x15000'], 'post_call_x0', 0x1000, 'matched'),
+            ('constructed-reference', ['bl 0x4000', 'mov x1,x0', 'add x0,x22,#0x30', 'stur w0,[x1,#7]', 'mov x0,x1', 'b 0x14000'], 'post_call_x0', 0x1000, 'matched'),
+        ]:
+            helpers = async_stubs | {0x4000: ['ret'], 0x5000: ['ret']}
+            ordinary = run('async-origin-baseline-'+name, body, helpers)
+            observed = run('async-origin-'+name, body, helpers, async_contracts=True)
+            row = observed['async_inputs'][-1]
+            assert row['stop'] == stop and row['condition'] == 'normal_fallthrough'
+            assert row['steps'] <= 64
+            if kind is None:
+                assert row['source'] is None
+            else:
+                assert row['source']['kind'] == kind and row['source']['site'] == site
+                assert row['source']['proof'][0] == site and row['source']['proof'][-1] == row['site']
+            assert {k:v for k,v in observed.items() if k not in ('async_boundaries','async_contracts','async_inputs')} == {
+                k:v for k,v in ordinary.items() if k not in ('async_boundaries','async_contracts','async_inputs')}
+        input_helpers = {0x4000: ['ldr x0, [x27, #40]', 'ret'], 0x3000: ['ret']}
+        observed = run('call-input-result-scope', prologue + [
+            'bl 0x4000', 'mov x1,x0', 'str x1,[x15]', 'bl 0x3000'] + epilogue, input_helpers)
+        context = next(c for c in observed['call_result_contexts'] if c['register_observations'])
+        observation = next(v for v in context['register_observations'] if any(x['register'] == 'x1' for x in v['values']))
+        assert any(v['class_id'] == 1 for v in observation['values'])
+        barrier = run('call-input-unknown-call-kills', prologue + [
+            'bl 0x4000', 'mov x1,x0', 'str x1,[x15]', 'bl 0x3000', 'bl 0x3000'] + epilogue, input_helpers)
+        context = next(c for c in barrier['call_result_contexts'] if c['register_observations'])
+        sites = [v['site'] for v in context['register_observations'] if any(x['register'] == 'x1' for x in v['values'])]
+        assert len(sites) == 1, 'An unknown call must not preserve the input class'
+        for layout in ('old', 'new'):
+            observed = run('stub-input-roles-' + layout, [
+                'ldr x1,[x27,#40]', 'mov x2,#6', 'bl 0x11000',
+                'ldr x1,[x27,#40]', 'ldr x2,[x27,#48]', 'ldr x3,[x27,#48]', 'bl 0x12000', 'ret'],
+                {0x11000:['ret'], 0x12000:['ret']}, stub_inputs=layout)
+            assert len(observed['stub_input_contracts']) == 2
+            from stub_input_roles import input_records
+            roles = [v for v in input_records(observed) if v['role']]
+            assert any(v['role'] == 'array_length' and v['kind'] == 'word' and v['value'] == 6 for v in roles)
+            assert any(v['role'] == 'closure_context' and v['register'] == ('x3' if layout == 'new' else 'x2') for v in roles)
+            assert any(v['role'] == 'closure_length_flags' for v in roles) == (layout == 'new')
+        unknown = run('stub-input-unknown-values', ['bl 0x11000', 'bl 0x12000', 'ret'],
+                      {0x11000:['ret'], 0x12000:['ret']}, stub_inputs='new')
+        from stub_input_roles import input_records
+        assert all(v['kind'] == 'unknown' for v in input_records(unknown))
+        from input_origin_cases import run_cases as run_origin_cases
+        run_origin_cases(run)
+        from call_input_shape_cases import run_cases
+        run_cases(run)
         invalid = [str(executable), str(temp / 'invalid.json'), '0x1000', str(temp / '4096.bin'), '0x1000', str(temp / '4096.bin')]
         if args.memcheck:
             invalid = ['valgrind', '--quiet', '--error-exitcode=97', '--leak-check=full',
