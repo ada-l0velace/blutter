@@ -44,6 +44,9 @@ list(TRANSFORM SRCS PREPEND "${SRCDIR}/")
 add_executable(${BINNAME} ${SRCS})
 
 target_link_libraries(${BINNAME} PRIVATE ${DARTLIB} capstone)
+if (APPLE)
+	target_link_libraries(${BINNAME} PRIVATE "-framework Foundation")
+endif()
 
 target_precompile_headers(${BINNAME} PRIVATE "${SRCDIR}/pch.h")
 
