@@ -1,4 +1,9 @@
 #include "pch.h"
+#include "FieldInputOrigins.h"
+#include "CapturedFieldValues.h"
+#include "FreshFieldInitializations.h"
+#include "FreshContentUses.h"
+#include "CalleeEntryReads.h"
 #include "DartDumper.h"
 #include "ReadUnaligned.h"
 #include <bit>
@@ -12,6 +17,7 @@
 #include <numeric>
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
 #include <vm/heap/safepoint.h>
+#include <vm/stack_frame.h>
 #include "SnapshotCodeAnalysis.h"
 #include "SnapshotCodeRanges.h"
 #include "CallResultAnnotations.h"
@@ -83,6 +89,27 @@ static std::vector<std::pair<SnapshotAnalysis::StubInputKind, const dart::Code*>
 	if constexpr (requires { Stubs::AllocateClosure4(); }) result.emplace_back(K::Closure4, &Stubs::AllocateClosure4());
 	return result;
 }
+template <typename Closure, typename Abi>
+static std::map<SnapshotAnalysis::StubInputKind,int64_t> ReadCaptureOffsets()
+{
+    using K = SnapshotAnalysis::StubInputKind;
+    if constexpr (requires { Abi::kLengthAndFlagsReg; Closure::element_offset(0); })
+        return {{K::Closure1, Closure::element_offset(0)-dart::kHeapObjectTag},
+                {K::Closure2, Closure::element_offset(1)-dart::kHeapObjectTag},
+                {K::Closure3, Closure::element_offset(2)-dart::kHeapObjectTag},
+                {K::Closure4, Closure::element_offset(3)-dart::kHeapObjectTag}};
+    else if constexpr (requires { Abi::kInstantiatorTypeArgsReg; Closure::context_offset(); })
+        return {{K::Closure, Closure::context_offset()-dart::kHeapObjectTag}};
+    return {};
+}
+static SnapshotAnalysis::ClosureCaptureLayout ReadClosureCaptureLayout()
+{
+    if constexpr (dart::kWordSize == 8 && dart::kCompressedWordSize == 4 &&
+                  dart::kHeapObjectTag == 1 && dart::SP == dart::R15 && dart::FPREG == dart::R29)
+        return {4,1,ReadCaptureOffsets<dart::Closure,dart::AllocateClosureABI>(),
+            dart::runtime_frame_layout.first_local_from_fp*dart::kWordSize};
+    return {};
+}
 static std::vector<SnapshotAnalysis::StubInputIdentity> ReadInputRoleIdentities(
 	const std::vector<dart::CodePtr>& codes, uintptr_t base, uintptr_t begin, uintptr_t end)
 {
@@ -116,6 +143,47 @@ static constexpr bool SupportedAsyncAbi()
 		dart::ReturnStubABI::kSuspendStateReg == dart::R2 && dart::ResumeStubABI::kSuspendStateReg == dart::R2 &&
 		dart::ResumeStubABI::kResumePcReg == dart::R1 && dart::ResumeStubABI::kExceptionReg == dart::R3 &&
 		dart::ResumeStubABI::kStackTraceReg == dart::R4;
+}
+static SnapshotAnalysis::FutureBindingAbi ReadFutureBindingAbi()
+{
+	if constexpr (dart::kWordSize == 8 && dart::FPREG == dart::R29 && dart::SP == dart::R15 && dart::NULL_REG == dart::R22) {
+		if (!SupportedAsyncAbi()) return {};
+		// The precompiled reader deliberately invalidates compiler::target's
+		// frame layout. Its initialized runtime layout describes these AOT frames.
+		const auto& layout=dart::runtime_frame_layout;
+		if (layout.saved_caller_fp_from_fp!=0 || layout.saved_caller_pc_from_fp!=1 || layout.param_end_from_fp!=1) return {};
+		const auto slot=layout.FrameSlotForVariableIndex(dart::SuspendState::kSuspendStateVarIndex);
+		if (slot < -512 || slot >= 0) return {};
+		return {true,slot*dart::kWordSize};
+	}
+	return {};
+}
+static SnapshotAnalysis::SavedFrameAbi ReadSavedFrameAbi()
+{
+	if (!ReadFutureBindingAbi().supported) return {};
+	const auto& layout=dart::runtime_frame_layout;
+	if (layout.last_param_from_entry_sp!=0 || layout.first_local_from_fp>=0 || layout.first_local_from_fp < -512) return {};
+	return {true,layout.first_local_from_fp*dart::kWordSize};
+}
+static SnapshotAnalysis::SavedStackMap ReadSavedStackMap(const dart::InstructionsTable& table,
+	uintptr_t base,uint64_t payload,uint64_t site)
+{
+	SnapshotAnalysis::SavedStackMap result{payload,site};
+	const auto abi=ReadSavedFrameAbi();if(!abi.supported || site>UINTPTR_MAX-base-4)return result;
+	dart::uword start=0;
+	const auto* raw=dart::InstructionsTable::FindStackMap(table.ptr(),base+site+4,&start);
+	if (!raw || start!=base+payload)return result;
+	using Maps=dart::CompressedStackMaps;
+	Maps::RawPayloadHandle maps,global;maps=raw;global=dart::InstructionsTable::GetCanonicalStackMap(table.ptr());
+	if(maps.UsesGlobalTable() && global.IsNull())return result;
+	Maps::Iterator<Maps::RawPayloadHandle> it(maps,global);
+	if(!it.Find(base+site+4-start))return result;
+	const auto spill=it.SpillSlotBitCount(),length=it.Length();
+	if(spill<0 || spill>8192 || length<spill || length>16384)return result;
+	result.available=true;result.spillSlots=static_cast<uint32_t>(spill);
+	result.registerSlots=static_cast<uint32_t>(length-spill);
+	for(intptr_t bit=spill;bit-->0;)if(it.IsObject(bit))result.objects.push_back(abi.firstLocalOffset-bit*8);
+	return result;
 }
 template <typename Stubs>
 static std::vector<std::pair<SnapshotAnalysis::AsyncOperation, const dart::Code*>> AsyncSdkReferences()
@@ -154,6 +222,65 @@ static std::vector<SnapshotAnalysis::AsyncStubIdentity> ReadAsyncStubIdentities(
 		}
 	}
 	return result;
+}
+template <typename Stubs>
+static std::vector<std::tuple<std::string,const dart::Code*,bool>> CompletionExceptionReferences()
+{
+	std::vector<std::tuple<std::string,const dart::Code*,bool>> result;
+	if constexpr (requires { Stubs::NullCastErrorSharedWithoutFPURegs(); }) result.emplace_back("null_cast_without_fpu",&Stubs::NullCastErrorSharedWithoutFPURegs(),false);
+	if constexpr (requires { Stubs::NullCastErrorSharedWithFPURegs(); }) result.emplace_back("null_cast_with_fpu",&Stubs::NullCastErrorSharedWithFPURegs(),false);
+	if constexpr (requires { Stubs::Throw(); }) result.emplace_back("throw",&Stubs::Throw(),false);
+	if constexpr (requires { Stubs::ReThrow(); }) result.emplace_back("rethrow",&Stubs::ReThrow(),false);
+	if constexpr (requires { Stubs::AsyncExceptionHandler(); }) result.emplace_back("async_error",&Stubs::AsyncExceptionHandler(),true);
+	return result;
+}
+static std::map<uint64_t,SnapshotAnalysis::CompletionException> ReadCompletionExceptions(
+	const std::vector<dart::CodePtr>& codes, uintptr_t base, uintptr_t begin, uintptr_t end)
+{
+	std::map<uint64_t,SnapshotAnalysis::CompletionException> result;
+	std::set<uint64_t> ambiguous;
+	for (const auto& [kind,reference,tail]:CompletionExceptionReferences<dart::StubCode>()) {
+		if (reference->IsNull() || reference->Size()<=0 || reference->Size()>(1<<20)) continue;
+		auto append=[&](const dart::Code& code) {
+			const auto start=code.PayloadStart();
+			if (code.EntryPoint()!=start || start<begin || start>=end || code.Size()!=reference->Size() || static_cast<uint64_t>(code.Size())>end-start) return;
+			if (std::memcmp(reinterpret_cast<const void*>(start),reinterpret_cast<const void*>(reference->EntryPoint()),code.Size())!=0 || ambiguous.contains(start-base)) return;
+			const auto [found,inserted]=result.emplace(start-base,SnapshotAnalysis::CompletionException{start-base+code.Size(),kind,tail});
+			if (!inserted && (found->second.kind!=kind || found->second.tailOnly!=tail)) {
+				result.erase(found);ambiguous.insert(start-base);
+			}
+		};
+		append(*reference);
+		for (const auto ptr:codes) {
+			const auto& code=dart::Code::Handle(ptr);
+			if (code.owner()==dart::Object::null()) append(code);
+		}
+	}
+	return result;
+}
+static SnapshotAnalysis::CompletionBody ReadCompletionBody(const dart::InstructionsTable& table,
+	uintptr_t base,uint64_t payload,uint64_t end,size_t index)
+{
+	SnapshotAnalysis::CompletionBody result{end};
+	const auto first=table.rodata()->first_entry_with_code;
+	if (index<first) return result;
+	const auto& codes=dart::Array::Handle(table.code_objects());
+	if (index-first>=static_cast<uint64_t>(codes.Length())) return result;
+	const auto& code=dart::Code::Handle(dart::Code::RawCast(codes.At(index-first)));
+	if (code.IsNull() || code.IsUnknownDartCode() || code.PayloadStart()<base || code.PayloadStart()-base!=payload ||
+		code.Size()<=0 || static_cast<uint64_t>(code.Size())!=end-payload) return result;
+	const auto& handlers=dart::ExceptionHandlers::Handle(code.exception_handlers());
+	if (handlers.IsNull() || handlers.num_entries()<0 || handlers.num_entries()>1024) return result;
+	result.asyncErrorHandler=handlers.has_async_handler();
+	for (intptr_t n=0;n<handlers.num_entries();++n) {
+		const auto offset=handlers.HandlerPCOffset(n);
+		if (offset==dart::ExceptionHandlers::kInvalidPcOffset) continue;
+		if (offset>=end-payload || offset%4) return result;
+		result.handlers.push_back(payload+offset);
+	}
+	std::sort(result.handlers.begin(),result.handlers.end());
+	result.handlers.erase(std::unique(result.handlers.begin(),result.handlers.end()),result.handlers.end());
+	result.available=true;return result;
 }
 struct VmNativeReturnRecord {
 	SnapshotAnalysis::NativeReturnIdentity identity;
@@ -385,7 +512,26 @@ static std::optional<SnapshotAnalysis::InputObject> ReadInputObject(const dart::
 		if (entry < codeStart || entry >= imageEnd || (entry-base)%4) return {};
 		std::string name = function.UserVisibleNameCString();
 		if (name.size() > 4096) return {};
-		return SnapshotAnalysis::InputObject{kind, std::move(name), entry-base};
+		SnapshotAnalysis::InputObject value{kind, std::move(name), entry-base};
+        if (kind == "function" && function.kind() == dart::UntaggedFunction::kClosureFunction &&
+            function.signature().IsHeapObject() && !function.is_native() && !function.is_abstract()) {
+            const auto& signature = dart::FunctionType::Handle(function.signature());
+            const auto& frame = dart::runtime_frame_layout;
+            if (!signature.IsNull() && function.NumTypeParameters() == 0 &&
+                signature.NumOptionalParameters() == 0 && function.NumImplicitParameters() == 1 &&
+                signature.num_implicit_parameters() == 1 && signature.num_fixed_parameters() >= 1 &&
+                signature.num_fixed_parameters() <= 32 &&
+                signature.NumParameters() == signature.num_fixed_parameters() &&
+                dart::kWordSize == 8 && dart::SP == dart::R15 && dart::FPREG == dart::R29 &&
+                dart::compiler::target::kIntSpillFactor == 1 && dart::compiler::target::kDoubleSpillFactor == 1 &&
+                frame.saved_caller_fp_from_fp == 0 && frame.saved_caller_pc_from_fp == 1 &&
+                frame.last_param_from_entry_sp == 0) {
+                const auto fixed = static_cast<unsigned>(signature.num_fixed_parameters());
+                value.closureEntry = SnapshotAnalysis::ClosureEntryModel{entry-base,fixed,
+                    static_cast<int64_t>((fixed-1)*dart::kWordSize)};
+            }
+        }
+        return value;
 }
 
 // Optional numerical VM metadata audit, independent of IDA/asm exports.
@@ -543,7 +689,64 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		if (comma) of << ','; comma = true;
 		of << "{\"entry\":" << id.entry << ",\"payload\":" << id.payload << ",\"end\":" << id.end << ",\"kind\":\"allocate_growable_array\"}";
 	}
-	of << "],\"async_abi_supported\":" << (SupportedAsyncAbi() ? "true" : "false") << ",\"async_stub_references\":[";
+	of << "],\"completion_exception_references\":[";
+	comma=false;
+	for (const auto& [kind,reference,tail]:CompletionExceptionReferences<dart::StubCode>()) {
+		if(reference->IsNull() || reference->Size()<=0 || reference->Size()>(1<<20))continue;
+		if(comma)of<<',';comma=true;
+		std::string bytes;const auto* raw=reinterpret_cast<const uint8_t*>(reference->EntryPoint());
+		for(intptr_t n=0;n<reference->Size();++n)bytes+=std::format("{:02x}",raw[n]);
+		of<<"{\"kind\":"<<JsonNativeText(kind)<<",\"tail_only\":"<<(tail?"true":"false")<<",\"bytes\":"<<JsonNativeText(bytes)<<'}';
+	}
+	of << "],\"completion_exception_identities\":[";comma=false;
+	for(const auto& [entry,contract]:ReadCompletionExceptions(visitor.codes,app.base(),image,image+imageSize)) {
+		if(comma)of<<',';comma=true;
+		of<<"{\"entry\":"<<entry<<",\"end\":"<<contract.end<<",\"kind\":"<<JsonNativeText(contract.kind)<<",\"tail_only\":"<<(contract.tailOnly?"true":"false")<<'}';
+	}
+	of << "],\"completion_bodies\":[";comma=false;
+	for(intptr_t t=0;!tables.IsNull() && t<tables.Length();++t) {
+		const auto& table=dart::InstructionsTable::Handle(dart::InstructionsTable::RawCast(tables.At(t)));
+		if(!table.rodata())continue;
+		for(uint32_t n=table.rodata()->first_entry_with_code;n<table.rodata()->length;++n) {
+			const auto start=table.EntryPointAt(n);
+			const auto stop=n+1<table.rodata()->length?table.EntryPointAt(n+1):image+imageSize;
+			const auto body=ReadCompletionBody(table,app.base(),start-app.base(),stop-app.base(),n);
+			if(comma)of<<',';comma=true;
+			of<<"{\"payload\":"<<start-app.base()<<",\"end\":"<<body.end<<",\"available\":"<<(body.available?"true":"false")
+				<<",\"async_error_handler\":"<<(body.asyncErrorHandler?"true":"false")<<",\"handlers\":[";
+			for(size_t k=0;k<body.handlers.size();++k){if(k)of<<',';of<<body.handlers[k];}of<<"]}";
+		}
+	}
+	std::vector<std::pair<uint64_t,std::optional<uint32_t>>> capturedMapRegisters;
+	of<<"],\"saved_reference_stack_maps\":[";comma=false;
+	for(intptr_t t=0;!tables.IsNull() && t<tables.Length();++t) {
+		const auto& table=dart::InstructionsTable::Handle(dart::InstructionsTable::RawCast(tables.At(t)));
+		if(!table.rodata())continue;
+		for(uint32_t n=table.rodata()->first_entry_with_code;n<table.rodata()->length;++n) {
+			const auto start=table.EntryPointAt(n),stop=n+1<table.rodata()->length?table.EntryPointAt(n+1):image+imageSize;
+			const auto body=ReadCompletionBody(table,app.base(),start-app.base(),stop-app.base(),n);
+			if(!body.available || !body.asyncErrorHandler || stop<=start || stop-start>65536)continue;
+			for(auto pc=start;pc+4<stop;pc+=4) {
+				uint32_t word;std::memcpy(&word,reinterpret_cast<const void*>(pc),sizeof(word));
+				if((word&0xfc000000U)!=0x94000000U && (word&0xfffffc1fU)!=0xd63f0000U)continue;
+				const auto m=ReadSavedStackMap(table,app.base(),start-app.base(),pc-app.base());
+				capturedMapRegisters.emplace_back(m.site,m.registerSlots);
+				if(comma)of<<',';comma=true;of<<"{\"payload\":"<<m.payload<<",\"site\":"<<m.site<<",\"available\":"<<(m.available?"true":"false")<<",\"spill_slots\":"<<m.spillSlots<<",\"objects\":[";
+				for(size_t k=0;k<m.objects.size();++k){if(k)of<<',';of<<m.objects[k];}of<<"]}";
+			}
+		}
+	}
+	of<<"],\"captured_field_register_slots\":[";
+	for(size_t n=0;n<capturedMapRegisters.size();++n) {
+		if(n)of<<',';const auto& [site,count]=capturedMapRegisters[n];
+		of<<'['<<site<<','<<(count?std::to_string(*count):"null")<<']';
+	}
+	const auto savedAbi=ReadSavedFrameAbi();
+	of<<"],\"saved_reference_abi\":{\"supported\":"<<(savedAbi.supported?"true":"false")<<",\"first_local_offset\":"<<savedAbi.firstLocalOffset<<'}';
+	const auto futureAbi=ReadFutureBindingAbi();
+	of << ",\"future_binding_abi\":{\"supported\":" << (futureAbi.supported?"true":"false")
+		<< ",\"suspend_state_offset\":" << futureAbi.suspendStateOffset << '}';
+	of << ",\"async_abi_supported\":" << (SupportedAsyncAbi() ? "true" : "false") << ",\"async_stub_references\":[";
 	comma = false;
 	for (const auto& [operation, reference] : AsyncSdkReferences<dart::StubCode>()) {
 		if (reference->IsNull() || reference->Size() <= 0 || reference->Size() > (1 << 20)) continue;
@@ -592,14 +795,48 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	of << "],\"input_object_catalog\":[";
 	comma = false;
 	const auto& inputPool = app.GetObjectPool();
+    std::vector<std::pair<int64_t,SnapshotAnalysis::ClosureEntryModel>> closureModels;
 	for (intptr_t index = 0; index < inputPool.Length(); ++index) {
 		const auto object = ReadInputObject(inputPool, index, app.base(), image, image+imageSize);
 		if (!object) continue;
-		if (comma) of << ','; comma = true;
+        if (object->closureEntry) closureModels.emplace_back(index,*object->closureEntry);
+        if (comma) of << ','; comma = true;
 		of << "{\"pool_index\":" << index << ",\"kind\":" << JsonNativeText(object->kind) << ",\"text\":" << JsonNativeText(object->text)
 			<< ",\"entry\":" << (object->entry ? std::to_string(*object->entry) : "null") << '}';
 	}
-	of << "],\"pool_heap_classes\":[";
+	of << R"(],"closure_capture_layout":)";
+    SnapshotAnalysis::WriteClosureCaptureLayout(of,ReadClosureCaptureLayout());
+    of << R"(,"closure_entry_models":[)";
+    comma=false;
+    std::set<uint64_t> closureEntries;
+    for (const auto& [index,model] : closureModels) {
+        if(comma)of<<',';comma=true;
+        of << R"({"pool_index":)" << index << R"(,"entry":)" << model.entry
+           << R"(,"fixed":)" << model.fixed << R"(,"entry_sp_offset":)" << model.entrySpOffset << '}';
+        closureEntries.insert(model.entry);
+    }
+    of << R"(],"closure_capture_stack_maps":[)";comma=false;
+    for (intptr_t t=0;!tables.IsNull() && t<tables.Length();++t) {
+        const auto& table=dart::InstructionsTable::Handle(dart::InstructionsTable::RawCast(tables.At(t)));
+        if(!table.rodata())continue;
+        for(uint32_t n=0;n<table.rodata()->length;++n) {
+            const auto start=table.EntryPointAt(n), stop=n+1<table.rodata()->length?table.EntryPointAt(n+1):image+imageSize;
+            for(auto it=closureEntries.lower_bound(start-app.base());it!=closureEntries.end() && *it<stop-app.base();++it) {
+                const auto end=std::min<uint64_t>(*it+64,stop-app.base());
+                for(auto pc=*it;pc+4<=end;pc+=4) {
+                    uint32_t word;std::memcpy(&word,reinterpret_cast<const void*>(app.base()+pc),4);
+                    if((word&0xfc000000U)!=0x94000000U)continue;
+                    const auto m=ReadSavedStackMap(table,app.base(),start-app.base(),pc);
+                    if(comma)of<<',';comma=true;
+                    of<<R"({"payload":)"<<m.payload<<R"(,"site":)"<<m.site<<R"(,"available":)"<<(m.available?"true":"false")
+                      <<R"(,"spill_slots":)"<<m.spillSlots<<R"(,"register_slots":)"<<(m.registerSlots?std::to_string(*m.registerSlots):"null")<<R"(,"objects":[)";
+                    for(size_t j=0;j<m.objects.size();++j){if(j)of<<',';of<<m.objects[j];}
+                    of<<"]}";
+                }
+            }
+        }
+    }
+    of << "],\"pool_heap_classes\":[";
 	comma = false;
 	const auto& pool = app.GetObjectPool();
 	for (intptr_t i = 0; i < pool.Length(); ++i) if (pool.TypeAt(i) == dart::ObjectPool::EntryType::kTaggedObject) {
@@ -677,8 +914,17 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 	auditPredefined(arrayAllocation, dart::kArrayCid);
 	if (closureAllocation) auditPredefined(*closureAllocation, dart::kClosureCid);
 	auditPredefined(mintAllocation, dart::kMintCid);
-	of << "],\"heap_bits_register\":" << (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28 ? "\"x28\"" : "null");
-	of << ",\"array_body_contract\":[";
+	of << "],\"field_decision_abi\":{\"supported\":"
+        << ((dart::NULL_REG == dart::R22 && dart::compiler::target::kCompressedWordSize == 4) ? "true" : "false")
+        << ",\"true_offset\":" << dart::compiler::target::ObjectAlignment::kTrueOffsetFromNull
+        << ",\"false_offset\":" << dart::compiler::target::ObjectAlignment::kFalseOffsetFromNull << "}";
+    of << ",\"heap_bits_register\":" << (dart::compiler::target::kCompressedWordSize == 4 && dart::HEAP_BITS == dart::R28 ? "\"x28\"" : "null");
+	of << R"(,"decision_branch_abi":{"value_bit":)";
+    if constexpr (dart::NULL_REG == dart::R22 && dart::compiler::target::kCompressedWordSize == 4)
+        of << dart::compiler::target::ObjectAlignment::kBoolValueBitPosition;
+    else of << "null";
+    of << '}';
+    of << ",\"array_body_contract\":[";
 	if (!arrayAllocation.IsNull()) of << arrayAllocation.EntryPoint() - app.base() << ',' << dart::AllocateArrayABI::kLengthReg << ','
 		<< dart::Array::data_offset() - dart::kHeapObjectTag << ',' << dart::compiler::target::kCompressedWordSize << ',' << dart::kSmiTagShift;
 	of << "],\"array_length_layout\":[" << dart::kArrayCid << ',' << dart::Array::length_offset() - dart::kHeapObjectTag << ','
@@ -709,6 +955,8 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 		if (!mintAllocation.IsNull()) of << ',';
 		of << '[' << arrayBarrier.EntryPoint() - app.base() << ',' << barrierMask << ']';
 	}
+	of << "],\"fresh_content_allocators\":[";
+	if (!mintAllocation.IsNull()) of << mintAllocation.EntryPoint() - app.base();
 	of << "],\"class_allocations\":[";
 	comma = false;
 	for (const auto ptr : visitor.codes) {
@@ -719,7 +967,39 @@ void DartDumper::DumpCoverageAudit(const char* filename)
 			of << '[' << code.EntryPoint() - app.base() << ',' << dart::Class::Cast(owner).id() << ']';
 		}
 	}
-	of << "]}\n";
+	of << "],\"instance_field_metadata\":[";
+	const auto* classTable = thread->isolate_group()->class_table();
+	comma = false;
+	for (intptr_t cid = dart::kNumPredefinedCids; cid < classTable->NumCids(); ++cid) {
+		if (!classTable->HasValidClassAt(cid)) continue;
+		const auto& cls = dart::Class::Handle(zone, classTable->At(cid));
+		if (cls.IsTopLevel() || !cls.is_type_finalized()) continue;
+		if (comma) of << ','; comma = true;
+		const auto& parent = dart::Class::Handle(zone, cls.SuperClass());
+#ifdef HAS_SHARED_CLASS_TABLE
+		const auto bitmap = thread->isolate_group()->shared_class_table()->GetUnboxedFieldsMapAt(cid);
+#else
+		const auto bitmap = classTable->GetUnboxedFieldsMapAt(cid);
+#endif
+		of << '[' << cid << ',' << cls.host_next_field_offset() << ',' << cls.host_type_arguments_field_offset()
+			<< ',' << bitmap.Value() << ',' << (parent.IsNull() ? 0 : parent.id()) << ",[";
+		const auto& fields = dart::Array::Handle(zone, cls.fields());
+		bool fieldComma = false;
+		for (intptr_t n = 0; n < fields.Length(); ++n) {
+			const auto& field = dart::Field::Handle(zone, dart::Field::RawCast(fields.At(n)));
+			if (field.is_static() || field.is_unboxed()) continue;
+			if (fieldComma) of << ','; fieldComma = true;
+			const auto& type = dart::AbstractType::Handle(zone, field.type());
+			dart::ZoneTextBuffer typeName(zone);
+			type.PrintName(dart::Object::kScrubbedName, &typeName);
+			of << '[' << field.TargetOffset() << ',' << JsonNativeText(field.UserVisibleNameCString())
+				<< ',' << JsonNativeText(typeName.buffer()) << ']';
+		}
+		of << "]]";
+	}
+	of << "],\"instance_field_abi\":[" << dart::kHeapObjectTag << ',' << dart::kCompressedWordSize << ','
+		<< dart::Instance::NextFieldOffset() << ',' << dart::kContextCid << ',' << dart::Context::parent_offset()
+		<< ',' << dart::Context::variable_offset(0) << "]}\n";
 }
 #endif
 
@@ -1394,6 +1674,66 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	profile.dispatchRegister = ARM64_REG_X21;
 	profile.stackLimitOffset = TargetThreadOffset(dart::Thread::stack_limit_offset());
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) profile.wordReturnRegister = ARM64_REG_X0;
+	profile.futureBindingAbi=ReadFutureBindingAbi();
+    profile.closureCaptureLayout = ReadClosureCaptureLayout();
+    if constexpr (dart::NULL_REG == dart::R22 && dart::compiler::target::kCompressedWordSize == 4)
+        profile.fieldDecisionAbi = {true,
+            dart::compiler::target::ObjectAlignment::kTrueOffsetFromNull,
+            dart::compiler::target::ObjectAlignment::kFalseOffsetFromNull};
+	profile.describeInstanceLayout = [](uint32_t cid) {
+		SnapshotAnalysis::InstanceLayout result;
+		result.classId = cid;
+		if constexpr (dart::kCompressedWordSize != 4 || dart::kHeapObjectTag != 1) return result;
+		auto* thread = dart::Thread::Current();
+		auto* zone = thread->zone();
+		auto* table = thread->isolate_group()->class_table();
+		if (!table->IsValidIndex(cid) || !table->HasValidClassAt(cid)) return result;
+		const auto& cls = dart::Class::Handle(zone, table->At(cid));
+		result.header = dart::Instance::NextFieldOffset();
+		result.slotBytes = dart::kCompressedWordSize;
+		result.tag = dart::kHeapObjectTag;
+		if (cid == dart::kContextCid) {
+			result.kind = "context";
+			result.contextParent = dart::Context::parent_offset();
+			result.contextData = dart::Context::variable_offset(0);
+			result.end = result.contextData;
+			return result;
+		}
+		// Variable-sized VM classes (including closure payloads) need their own
+		// representation contracts. Do not interpret their body as Dart fields.
+		if (cid < dart::kNumPredefinedCids || cls.IsTopLevel() || !cls.is_type_finalized()) return result;
+		result.end = cls.host_next_field_offset();
+		if (result.end < result.header || result.end > 1048576) return result;
+		result.kind = "instance";
+#ifdef HAS_SHARED_CLASS_TABLE
+		const auto bitmap = thread->isolate_group()->shared_class_table()->GetUnboxedFieldsMapAt(cid);
+#else
+		const auto bitmap = table->GetUnboxedFieldsMapAt(cid);
+#endif
+		for (intptr_t off = result.header; off < result.end; off += result.slotBytes)
+			if (bitmap.Get(off / result.slotBytes)) result.unboxed.push_back(off);
+		auto& owner = dart::Class::Handle(zone, cls.ptr());
+		std::set<intptr_t> visited;
+		while (!owner.IsNull() && visited.insert(owner.id()).second) {
+			const auto typeOffset = owner.host_type_arguments_field_offset();
+			if (typeOffset >= result.header && typeOffset < result.end) result.excluded.push_back(typeOffset);
+			const auto& fields = dart::Array::Handle(zone, owner.fields());
+			for (intptr_t n = 0; n < fields.Length(); ++n) {
+				const auto& field = dart::Field::Handle(zone, dart::Field::RawCast(fields.At(n)));
+				if (field.is_static() || field.is_unboxed()) continue;
+				const auto& type = dart::AbstractType::Handle(zone, field.type());
+				dart::ZoneTextBuffer text(zone);
+				type.PrintName(dart::Object::kScrubbedName, &text);
+				result.fields.push_back({field.TargetOffset(), static_cast<uint32_t>(owner.id()),
+					field.UserVisibleNameCString(), text.buffer()});
+			}
+			owner = owner.SuperClass();
+		}
+		std::sort(result.excluded.begin(), result.excluded.end());
+		result.excluded.erase(std::unique(result.excluded.begin(), result.excluded.end()), result.excluded.end());
+		std::sort(result.fields.begin(), result.fields.end(), [](const auto& a, const auto& b) { return a.offset < b.offset; });
+		return result;
+	};
 	static_assert(dart::AllocateObjectABI::kResultReg == dart::R0);
 
 	if constexpr (dart::CallingConventions::kReturnReg == dart::R0) {
@@ -1413,7 +1753,7 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		profile.callInputAbi = ReadCallInputAbi();
 		profile.descriptorPrologueAbi = ReadDescriptorPrologueAbi();
 		profile.readInputCode = [&](uint64_t address, size_t bytes) {
-			if (!address || bytes > 512 || address > UINTPTR_MAX-app.base()) return std::vector<uint8_t>{};
+			if (!address || bytes > 65536 || address > UINTPTR_MAX-app.base()) return std::vector<uint8_t>{};
 			const auto absolute = app.base()+address;
 			if (absolute < codeStart || absolute >= imageEnd || bytes > imageEnd-absolute) return std::vector<uint8_t>{};
 			const auto* first = reinterpret_cast<const uint8_t*>(absolute);
@@ -1424,6 +1764,18 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		profile.stubInputContracts = SnapshotAnalysis::SelectStubInputContracts(
 			ReadInputRoleIdentities(visitor.codes, app.base(), codeStart, imageEnd),
 			SnapshotAnalysis::ReadStubInputAbis<dart::AllocateArrayABI, dart::AllocateClosureABI>(), bounds, true);
+		profile.completionExceptions=ReadCompletionExceptions(visitor.codes,app.base(),codeStart,imageEnd);
+		profile.savedFrameAbi=ReadSavedFrameAbi();
+    if constexpr (dart::NULL_REG == dart::R22 && dart::compiler::target::kCompressedWordSize == 4)
+        profile.booleanValueBit = dart::compiler::target::ObjectAlignment::kBoolValueBitPosition;
+		profile.describeSavedStackMap=[&](uint64_t payload,uint64_t site){return ReadSavedStackMap(rootTable,app.base(),payload,site);};
+		for (uint32_t n=0;n<rootTable.rodata()->first_entry_with_code;++n)
+            profile.discardedWithoutHandlers.insert(rootTable.EntryPointAt(n)-app.base());
+        profile.describeCompletionBody=[&](uint64_t payload) {
+			const auto found=std::lower_bound(outputRanges.begin(),outputRanges.end(),payload,[](const auto& range,uint64_t pc){return range.first<pc;});
+			if (found==outputRanges.end() || found->first!=payload) return SnapshotAnalysis::CompletionBody{};
+			return ReadCompletionBody(rootTable,app.base(),payload,found->second,found-outputRanges.begin());
+		};
 		profile.asyncContracts = SnapshotAnalysis::SelectAsyncContracts(
 			ReadAsyncStubIdentities(visitor.codes, app.base(), codeStart, imageEnd), bounds, SupportedAsyncAbi());
 		profile.sdkStubReturnClasses = SnapshotAnalysis::SdkStubReturnContracts(
@@ -1485,9 +1837,11 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	if (!arrayAllocation.IsNull() && profile.allocationReturns.contains(arrayAllocation.EntryPoint() - app.base()))
 		profile.arrayBodyContract = {static_cast<int64_t>(arrayAllocation.EntryPoint() - app.base()), 2,
 			AOT_Array_data_offset - dart::kHeapObjectTag, dart::compiler::target::kCompressedWordSize, dart::kSmiTagShift};
-	if (!mintAllocation.IsNull() && profile.allocationReturns.contains(mintAllocation.EntryPoint() - app.base()))
+	if (!mintAllocation.IsNull() && profile.allocationReturns.contains(mintAllocation.EntryPoint() - app.base())) {
 		profile.preservedCallRegisters.emplace(mintAllocation.EntryPoint() - app.base(),
 			static_cast<uint32_t>(dart::kDartAvailableCpuRegs) & ~(1U << dart::AllocateMintABI::kResultReg) & ~(1U << dart::AllocateMintABI::kTempReg));
+		profile.freshContentAllocators.insert(mintAllocation.EntryPoint() - app.base());
+	}
 #ifdef BLUTTER_NO_OBJECT_STORE_STUBS
 	const auto& stackCheck = dart::StubCode::StackOverflowSharedWithoutFPURegs();
 #else
@@ -1703,6 +2057,58 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 		else throw issue;
 	}, [&](const auto& result) {
 		appendResultNotes(SnapshotAnalysis::BuildRegisterResultNotes(result, annotations.Edges(), resultClassName));
+	}, [&](const SnapshotAnalysis::FutureBindingsResult& result) {
+		for (const auto& binding:result.bindings) if (binding.input.boundary.resumeSite) {
+			const auto note=SnapshotAnalysis::AwaitFutureBindingNote(binding,resultClassName);
+			if (!note.empty()) callerResultNotes[*binding.input.boundary.resumeSite].push_back(note);
+		}
+	}, [&](const SnapshotAnalysis::SavedReferencesResult& result) {
+		for(const auto& context:result.contexts)for(const auto& reference:context.observations)
+			callerResultNotes[reference.site].push_back(SnapshotAnalysis::RestoredReferenceNote(context,reference,resultClassName));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& result) {
+		for (const auto& context : result.contexts) for (const auto& access : context.accesses)
+			callerResultNotes[access.site].push_back(SnapshotAnalysis::AsyncFieldAccessNote(context,access,result.layouts.at(context.classId),resultClassName));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& fields, const std::vector<SnapshotAnalysis::CallInputOrigin>& origins,
+		const SnapshotAnalysis::FieldInputLinksResult& links) {
+		for (const auto& link : links.links) callerResultNotes[origins[link.origin].site].push_back(
+			SnapshotAnalysis::FieldInputNote(fields,origins,link,resultClassName));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& fields, const SnapshotAnalysis::CapturedFieldsResult& result) {
+		for(const auto& context:result.contexts) for(const auto& reload:context.reloads)
+			callerResultNotes[reload.site].push_back(SnapshotAnalysis::CapturedFieldNote(fields,context,reload));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& fields, const SnapshotAnalysis::CapturedFieldsResult& captures, const SnapshotAnalysis::FreshFieldsResult& result) {
+		for(const auto& c:result.contexts) if(c.write)
+			callerResultNotes[c.write->site].push_back(SnapshotAnalysis::FreshFieldNote(fields,captures,c));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& fields, const SnapshotAnalysis::CapturedFieldsResult& captures,
+		const SnapshotAnalysis::FreshFieldsResult& fresh, const std::vector<SnapshotAnalysis::CallInputOrigin>& origins,
+		const SnapshotAnalysis::FreshContentResult& result) {
+		for (const auto& c : result.contexts) for (const auto input : c.inputs)
+			callerResultNotes[*c.transfer].push_back(SnapshotAnalysis::FreshContentNote(fields,captures,fresh,origins,c,input));
+	}, [&](const SnapshotAnalysis::AsyncFieldsResult& fields, const SnapshotAnalysis::CapturedFieldsResult& captures,
+		const SnapshotAnalysis::FreshFieldsResult& fresh, const SnapshotAnalysis::FreshContentResult& contents,
+		const SnapshotAnalysis::CalleeEntryResult& result) {
+		for (const auto& link : result.links)
+			callerResultNotes[*contents.contexts[link.context].transfer].push_back(
+				SnapshotAnalysis::ContainerEntryReadNote(fields,captures,fresh,contents,result,link));
+	}, [&](const SnapshotAnalysis::JoinedReferencesResult& result) {
+        for (const auto& context : result.contexts) for (const auto& reference : context.observations)
+            callerResultNotes[reference.site].push_back(SnapshotAnalysis::JoinedReferenceNote(context,reference));
+	}, [&](const SnapshotAnalysis::JoinedReferencesResult& joined,
+		const SnapshotAnalysis::FieldBranchUsesResult& result) {
+		for (const auto& use : result.uses)
+			callerResultNotes[use.site].push_back(SnapshotAnalysis::FieldBranchNote(joined, use));
+        for (const auto& decision : result.decisions)
+            callerResultNotes[decision.site].push_back(SnapshotAnalysis::FieldDecisionNote(joined, result, decision));
+    }, [&](const SnapshotAnalysis::FieldBranchUsesResult& fields,
+        const SnapshotAnalysis::DecisionBranchesResult& result) {
+        for (const auto& use : result.uses)
+            callerResultNotes[use.site].push_back(SnapshotAnalysis::DecisionBranchNote(fields, result, use));
+    }, [&](const SnapshotAnalysis::ClosureCapturesResult& result) {
+        std::set<uint64_t> captureSites;
+        for (const auto& transfer : result.transfers) {
+            if (captureSites.insert(transfer.store).second)
+                callerResultNotes[transfer.store].push_back(SnapshotAnalysis::ClosureCaptureNote(transfer));
+            callerResultNotes[transfer.call].push_back(SnapshotAnalysis::ClosureCallbackNote(transfer));
+        }
 	});
 	// Render original words after the checked result pass. Only disassembly is
 	// repeated here; no receiver/context analysis is rerun for presentation.

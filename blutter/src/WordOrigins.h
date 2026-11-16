@@ -19,5 +19,5 @@ struct WordOriginResult { std::string stop; std::optional<WordOrigin> source; si
 // stores. Loads describe origins, not persistent heap contents or source types.
 WordOriginResult TraceWordInput(const cs_insn* instructions, size_t count, size_t consumer,
 	WordLocation location, const Profile& profile, const std::function<bool(uint64_t)>& isEntry = {},
-	size_t limit = 64, bool extended = true);
+	size_t limit = 64, bool extended = true, std::optional<uint16_t> invariantNull = {});
 }

@@ -3,9 +3,15 @@
 #include <map>
 namespace SnapshotAnalysis {
 struct Profile;
+struct ClosureEntryModel {
+    uint64_t entry;
+    unsigned fixed;
+    int64_t entrySpOffset;
+};
 struct InputObject {
 	std::string kind, text;
 	std::optional<uint64_t> entry;
+    std::optional<ClosureEntryModel> closureEntry;
 };
 struct InputOriginStep {
 	std::string relation;

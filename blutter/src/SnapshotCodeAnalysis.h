@@ -15,6 +15,12 @@
 #include "CallInputShapes.h"
 #include "DescriptorPrologue.h"
 #include "CallInputOrigins.h"
+#include "CompletionAnalysis.h"
+#include "AsyncFutureBindings.h"
+#include "SavedAsyncReferences.h"
+#include "ClosureCaptureTransfers.h"
+#include "FieldBranchUses.h"
+#include "AsyncFieldAccesses.h"
 
 // ARM64 instruction facts. This module has no Dart VM or vendor dependencies.
 namespace SnapshotAnalysis {
@@ -85,6 +91,9 @@ struct Profile {
 	std::map<uint64_t, std::string> nonReturningCalls;
 	// GPRs preserved by a specific SDK helper on both fast and slow paths.
 	std::map<uint64_t, uint32_t> preservedCallRegisters;
+	// Reviewed no-input allocators that cannot mutate an unescaped caller object.
+	// Register preservation and fresh-result/body contracts are required separately.
+	std::set<uint64_t> freshContentAllocators;
 	// Machine-code-proved effects, validated separately from SDK contracts.
 	std::set<uint64_t> frameSafeCallees;
 	// Optional matched ABI for full-word physical results. This does not imply
@@ -92,6 +101,17 @@ struct Profile {
 	arm64_reg wordReturnRegister = ARM64_REG_INVALID;
 	// Matched async boundaries; separate from ordinary result/effect summaries.
 	std::map<uint64_t, AsyncContract> asyncContracts;
+	std::map<uint64_t, CompletionBody> completionBodies;
+	std::function<CompletionBody(uint64_t)> describeCompletionBody;
+	std::map<uint64_t, CompletionException> completionExceptions;
+	FutureBindingAbi futureBindingAbi;
+	SavedFrameAbi savedFrameAbi;
+	FieldDecisionAbi fieldDecisionAbi;
+	ClosureCaptureLayout closureCaptureLayout;
+	std::set<uint64_t> discardedWithoutHandlers;
+	std::optional<unsigned> booleanValueBit;
+	std::function<SavedStackMap(uint64_t,uint64_t)> describeSavedStackMap;
+	std::function<InstanceLayout(uint32_t)> describeInstanceLayout;
 	// Matched SDK normal-result classes only. No frame, register, allocation
 	// body or heap-preservation effect is implied by membership in this map.
 	std::map<uint64_t, NativeReturnContract> nativeReturnClasses;
@@ -259,6 +279,11 @@ struct Edge {
 
 struct CallResultContextResult;
 struct RegisterContextResult;
+struct FieldInputLinksResult;
+struct CapturedFieldsResult;
+struct FreshFieldsResult;
+struct FreshContentResult;
+struct CalleeEntryResult;
 class Analyzer {
 public:
 	Analyzer(Profile profile, std::vector<Payload> payloads, std::vector<Name> names,
@@ -270,7 +295,22 @@ public:
 	void Write(const std::string& filename,
 		const std::function<void(const CallResultContextResult&)>& presentResults = {},
 		const std::function<void(uint64_t)>& reportSdkDecodeFailure = {},
-		const std::function<void(const RegisterContextResult&)>& presentRegisterResults = {}) const;
+		const std::function<void(const RegisterContextResult&)>& presentRegisterResults = {},
+		const std::function<void(const FutureBindingsResult&)>& presentFutureResults = {},
+		const std::function<void(const SavedReferencesResult&)>& presentSavedReferences = {},
+		const std::function<void(const AsyncFieldsResult&)>& presentAsyncFields = {},
+		const std::function<void(const AsyncFieldsResult&, const std::vector<CallInputOrigin>&,
+			const FieldInputLinksResult&)>& presentFieldInputs = {},
+		const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&)>& presentCapturedFields = {},
+		const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&)>& presentFreshFields = {},
+		const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&,
+			const std::vector<CallInputOrigin>&, const FreshContentResult&)>& presentFreshContents = {},
+		const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&,
+			const FreshContentResult&, const CalleeEntryResult&)>& presentEntryReads = {},
+		const std::function<void(const JoinedReferencesResult&)>& presentJoinedReferences = {},
+		const std::function<void(const JoinedReferencesResult&, const FieldBranchUsesResult&)>& presentFieldBranches = {},
+		const std::function<void(const FieldBranchUsesResult&, const DecisionBranchesResult&)>& presentDecisionBranches = {},
+		const std::function<void(const ClosureCapturesResult&)>& presentClosureCaptures = {}) const;
 	const std::vector<Reference>& References() const { return references; }
 	const std::vector<Edge>& Edges() const { return edges; }
 	const StubInputContracts& InputContracts() const { return profile.stubInputContracts; }
@@ -284,6 +324,13 @@ private:
 	std::vector<Reference> references;
 	std::vector<Edge> edges;
 	std::vector<AsyncInput> asyncInputs;
+	std::vector<CompletionSummary> completionSummaries;
+	size_t completionRemaining = 2000000;
+	std::vector<AwaitFutureInput> awaitFutureInputs;
+	std::map<uint64_t, std::vector<uint8_t>> futureBytes;
+	size_t futureBytesSize = 0, futureRemaining = 2000000;
+	std::map<uint64_t,std::vector<uint8_t>> savedReferenceBytes;
+	size_t savedReferenceBytesSize=0;
 	std::vector<CallInputOrigin> callInputOrigins;
 	std::map<int64_t, InputObject> inputObjects;
 	size_t inputOriginRemaining = 2000000, inputOriginSteps = 0;

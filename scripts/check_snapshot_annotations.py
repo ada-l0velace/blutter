@@ -206,6 +206,10 @@ def main():
     input_shapes_checked = check_shapes(graph, audit_data, read)
     from input_origins import check_origins
     input_origins_checked = check_origins(graph, audit_data, read)
+    from completion_summaries import check_completions
+    completions_checked = check_completions(graph, audit_data, read)
+    from async_future_bindings import check_future_bindings
+    future_bindings_checked = check_future_bindings(graph,audit_data,read)
     load_base = int(re.search(r'^libapp is loaded at (0x[0-9a-f]+)$', args.log.read_text(), re.M)[1], 16)
     manifest = json.loads((args.output / 'snapshot_code.json').read_text())
     nodes, profile = graph['nodes'], graph['profile']
@@ -573,8 +577,32 @@ def main():
                 assert entry['target'] % 4 == 0 and len(read(entry['target'], 4)) == 4
     from check_receiver_analysis import check_receivers
     receiver_checks = check_receivers(graph, read, lambda raw, start: decode_payload(md, raw, start), audit_data)
+    from saved_async_references import check_saved_references
+    saved_references_checked=check_saved_references(graph,audit_data,read)
+    from async_field_accesses import check_fields
+    fields_checked = check_fields(graph, audit_data, read)
+    from field_input_origins import check_field_inputs
+    field_inputs_checked = check_field_inputs(graph)
+    from captured_field_values import check_captures
+    captured_fields_checked = check_captures(graph, audit_data, read)
+    from fresh_field_initializations import check_fresh_fields
+    fresh_fields_checked = check_fresh_fields(graph, audit_data, read)
+    from fresh_content_uses import check_contents
+    contents_checked = check_contents(graph, audit_data, read)
+    from joined_async_references import check_joined
+    joined_checked = check_joined(graph, audit_data, read)
+    from field_branch_uses import check_branches
+    branches_checked = check_branches(graph, audit_data, read)
+    from field_decisions import check_decisions
+    decisions_checked = check_decisions(graph, audit_data, read)
+    from decision_branch_uses import check_uses
+    decision_uses_checked = check_uses(graph,audit_data,read)
+    from closure_capture_transfers import check_transfers
+    closure_transfers_checked=check_transfers(graph,audit_data,read)
+    from callee_entry_reads import check_entry_reads
+    entry_reads_checked = check_entry_reads(graph, audit_data, read)
     print(json.dumps({'status': 'PASSED', 'sample_sha256': hashlib.sha256(raw).hexdigest(),
-                      'stub_input_contracts_checked': input_contracts_checked, 'call_input_shapes_checked': input_shapes_checked, 'call_input_origins_checked': input_origins_checked, 'payloads': len(nodes), 'edges_checked_from_machine_words': len(graph['edges']),
+                      'stub_input_contracts_checked': input_contracts_checked, 'call_input_shapes_checked': input_shapes_checked, 'call_input_origins_checked': input_origins_checked, 'completion_summaries_checked': completions_checked, 'await_future_bindings_checked': future_bindings_checked, 'saved_references_checked': saved_references_checked, 'async_fields_checked': fields_checked, 'field_inputs_checked': field_inputs_checked, 'captured_fields_checked': captured_fields_checked, 'fresh_fields_checked': fresh_fields_checked, 'fresh_contents_checked': contents_checked, 'callee_entry_reads_checked': entry_reads_checked, 'joined_references_checked': joined_checked, 'field_branches_checked': branches_checked, 'field_decisions_checked': decisions_checked, 'decision_branch_uses_checked': decision_uses_checked, 'closure_capture_transfers_checked': closure_transfers_checked, 'payloads': len(nodes), 'edges_checked_from_machine_words': len(graph['edges']),
                       'edge_kinds': dict(Counter(e['kind'] for e in graph['edges'])),
                       'references_checked_backwards': len(graph['references']),
                       'reference_kinds': dict(Counter(r['kind'] for r in graph['references'])),

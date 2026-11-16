@@ -26,10 +26,10 @@ def render_origins(rows, objects):
     return lines
 
 
-def check_origins(graph, audit, read):
+def check_origins(graph, audit, read, *, allow_runtime_null=False, extra_entries=()):
     if graph.get('format',0)<36:return 0
     import capstone as cs
-    from check_snapshot_annotations import constant_move
+    from check_snapshot_annotations import constant_move, decode_payload
     from capstone import arm64 as a
     md=cs.Cs(cs.CS_ARCH_ARM64,cs.CS_MODE_LITTLE_ENDIAN);md.detail=True
     edges={e['site']:e for e in graph['edges']};nodes={n['start']:n for n in graph['nodes']}
@@ -40,6 +40,7 @@ def check_origins(graph, audit, read):
     entries={v['address'] for n in graph['nodes'] for v in n.get('names', [])}
     entries.update(e['target'] for e in graph['edges'] if e.get('target') is not None)
     entries.update(graph.get('dispatch_table', {}).get('entries', []))
+    entries.update(extra_entries)
     for node in graph['nodes']:
         if not node['decoded']:continue
         for n,(word,) in enumerate(struct.iter_unpack('<I',read(node['start'],node['end']-node['start']))):
@@ -93,6 +94,8 @@ def check_origins(graph, audit, read):
                     disp=(0 if i.writeback else m.disp)+part*size
                     if disp>=off+8 or disp+size<=off:continue
                     assert disp==off and size==8
+                    if allow_runtime_null and v.reg==a.ARM64_REG_X22 and first and kind=='runtime_null':
+                        assert value['bits']==22 and not compressed;return
                     if v.reg==a.ARM64_REG_XZR:
                         assert first and kind=='literal' and value['bits']==0;return
                     reg=number(v.reg);assert 0<=reg<31;memory=None;break
@@ -115,7 +118,10 @@ def check_origins(graph, audit, read):
                     assert first and kind=='literal' and not compressed and move[1]==reg and move[2]==64
                     assert value['bits']==(move[3] if move[0]=='literal' else 0);return
             if i.id==a.ARM64_INS_MOV and len(o)==2 and o[1].type==a.ARM64_OP_REG:
-                assert not compressed and width(o[1].reg)==8;reg=number(o[1].reg);continue
+                assert not compressed and width(o[1].reg)==8
+                if allow_runtime_null and first and kind=='runtime_null' and o[1].reg==a.ARM64_REG_X22:
+                    assert value['bits']==22;return
+                reg=number(o[1].reg);continue
             if i.id in (a.ARM64_INS_LDR,a.ARM64_INS_LDUR):
                 assert len(o)==2 and o[1].type==a.ARM64_OP_MEM and not o[1].mem.index
                 expected=dict(base=number(o[1].mem.base),displacement=o[1].mem.disp,bytes=width(o[0].reg))
@@ -153,6 +159,10 @@ def check_origins(graph, audit, read):
             value=step['source']
             if value:
                 assert node['start']<=value['site']<=consumer<node['end']
+                if value['kind']=='runtime_null':
+                    assert allow_runtime_null and graph['receiver_metadata']['null_register']=='x22'
+                    for insn in decode_payload(md,read(node['start'],node['end']-node['start']),node['start']):
+                        assert all(number(reg)!=22 for reg in insn.regs_access()[1]),'Canonical null register overwritten'
                 replay(value,consumer,location)
                 if value['kind']=='entry_register':assert value['site']==node['start']
             else:assert depth==len(row['chain'])-1

@@ -44,3 +44,11 @@ def run_cases(run):
           'ldr x4,[x27,#96]','bl 0x18000','ret'],helper,call_inputs='normal')
     mapped={v['index']:v['chain'][0]['source'] for v in g['call_input_origins']}
     assert mapped[1]['bits']==9 and mapped[2]['bits']==7
+
+    for layout,context in (('old',2),('new',3)):
+        g=run('input-origin-stub-without-ordinary-policy-'+layout,
+              ['ldr x1,[x27,#40]',f'mov x{context},x22','bl 0x12000','ret'],
+              {0x11000:['ret'],0x12000:['ret']},stub_inputs=layout,call_inputs='unsupported')
+        assert not g['call_input_abi']['supported'] and not g['call_input_shapes']
+        assert any(o['role']=='closure_function' for o in g['call_input_origins'])
+        assert all(o['role']!='supplied_input' for o in g['call_input_origins'])

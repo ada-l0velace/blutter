@@ -1,4 +1,9 @@
 #include "SnapshotCodeAnalysis.h"
+#include "FieldInputOrigins.h"
+#include "CapturedFieldValues.h"
+#include "FreshFieldInitializations.h"
+#include "FreshContentUses.h"
+#include "CalleeEntryReads.h"
 #include "ReceiverAnalysis.h"
 #include "RegisterContexts.h"
 #include "CallResultContexts.h"
@@ -665,7 +670,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 		if (!receiver.certificate.empty()) receiverCertificates.push_back(std::move(receiver.certificate));
 		receiverPoolClasses.insert(receiver.poolClasses.begin(), receiver.poolClasses.end());
 	}
-	if (profile.callInputAbi.supported) {
+	if (profile.callInputAbi.supported || !profile.stubInputContracts.empty() || !profile.asyncContracts.empty()) {
 		std::map<uint64_t, int64_t> poolLoads;
 		for (size_t i = firstReference; i < references.size(); ++i) {
 			const auto& ref = references[i];
@@ -690,7 +695,7 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 			const auto& edge = edges[i];
 			if (!edge.target) continue;
 			if (edge.kind == "call") {
-				if (const auto shape = callInputShapes.find(edge.site); shape != callInputShapes.end())
+				if (const auto shape = callInputShapes.find(edge.site); profile.callInputAbi.supported && shape != callInputShapes.end())
 					for (unsigned j = 0; j < shape->second.count; ++j) {
 						const int64_t offset = (shape->second.count-1-j)*8;
 						observe(edge, {0, NativeIr::Address{{15,64}, offset}}, {edge.site, edge.source, "supplied_input", j, {}, offset, {}});
@@ -705,14 +710,125 @@ std::map<uint64_t, std::string> Analyzer::Analyze(const cs_insn* instructions, s
 					boundary->operation == AsyncOperation::Await || boundary->operation == AsyncOperation::AwaitWithTypeCheck ? "await_input" : "completion_operand", {}, 0, {}, {}});
 		}
 	}
+	if (!profile.asyncContracts.empty()) {
+		std::map<uint64_t,int64_t> poolLoads;
+		for (size_t n=firstReference;n<references.size();++n) {
+			const auto& ref=references[n];
+			if (ref.kind=="pool" && ref.access=="load" && ref.width==8 && ref.poolIndex) poolLoads.emplace(ref.site,*ref.poolIndex);
+		}
+		bool candidate=false;
+		for (size_t n=firstEdge;n<edges.size();++n) if (edges[n].kind=="jump" && edges[n].target && profile.asyncContracts.contains(*edges[n].target)) {
+			const auto op=profile.asyncContracts.at(*edges[n].target).operation;
+			candidate|=op==AsyncOperation::CompleteValue || op==AsyncOperation::CompleteValueOrFuture;
+		}
+		if (candidate && !profile.completionBodies.contains(payload.start) && profile.describeCompletionBody)
+			profile.completionBodies.emplace(payload.start,profile.describeCompletionBody(payload.start));
+		const auto info=profile.completionBodies.find(payload.start);
+		const CompletionBody unknown{};
+		std::set<uint64_t> completionEntries;
+		if (candidate) {
+			// Include dispatch-only entries, restricted to this payload. No global
+			// entry-set copy is needed for local provenance or coverage roots.
+			for (const auto* known : {&entries, &receiverEntries})
+				completionEntries.insert(known->lower_bound(payload.start),known->lower_bound(payload.end));
+		}
+		if (auto summary=candidate ? AnalyzeCompletions(instructions,count,profile,info==profile.completionBodies.end()?unknown:info->second,completionEntries,poolLoads,completionRemaining) : std::nullopt) {
+			auto& head=comments[payload.start];if (!head.empty()) head+=" | ";head+=CompletionSummaryNote(*summary);
+			for (const auto& value:summary->completions) { auto& text=comments[value.site];if (!text.empty()) text+=" | ";text+=CompletionValueNote(value); }
+			if (profile.futureBindingAbi.supported && summary->closed && (summary->status == "exact_heap_class" ||
+				summary->status == "null_only" || summary->status == "value_or_future") && count <= 16384 &&
+				count*4 <= 8*1024*1024-futureBytesSize && !futureBytes.contains(payload.start)) {
+				std::vector<uint8_t> bytes;
+				for (size_t n=0;n<count;++n) bytes.insert(bytes.end(),instructions[n].bytes,instructions[n].bytes+4);
+				futureBytesSize += bytes.size(); futureBytes.emplace(payload.start,std::move(bytes));
+			}
+			completionSummaries.push_back(std::move(*summary));
+		}
+	}
+	if (profile.futureBindingAbi.supported) {
+		bool hasAwait=false;
+		for (size_t n=firstEdge;n<edges.size();++n) {
+			const auto& edge=edges[n];
+			if (edge.kind!="call" || !edge.target) continue;
+			const auto boundary=DescribeAsyncBoundary(edge.kind,edge.site,payload.start,payload.end,*edge.target,profile.asyncContracts);
+			if (!boundary || (boundary->operation!=AsyncOperation::Await && boundary->operation!=AsyncOperation::AwaitWithTypeCheck)) continue;
+			if (!profile.completionBodies.contains(payload.start) && profile.describeCompletionBody)
+				profile.completionBodies.emplace(payload.start,profile.describeCompletionBody(payload.start));
+			const auto found=profile.completionBodies.find(payload.start);const CompletionBody unknown{};
+			hasAwait=true;
+			awaitFutureInputs.push_back(ObserveAwaitFuture(instructions,count,(edge.site-payload.start)/4,*boundary,profile,
+				found==profile.completionBodies.end()?unknown:found->second,
+				[&](uint64_t pc) { return entries.contains(pc) || receiverEntries.contains(pc); },futureRemaining));
+		}
+		if(hasAwait && profile.savedFrameAbi.supported && count<=16384 && count*4<=8*1024*1024-savedReferenceBytesSize && !savedReferenceBytes.contains(payload.start)) {
+			std::vector<uint8_t> bytes;for(size_t n=0;n<count;++n)bytes.insert(bytes.end(),instructions[n].bytes,instructions[n].bytes+4);
+			savedReferenceBytesSize+=bytes.size();savedReferenceBytes.emplace(payload.start,std::move(bytes));
+		}
+	}
 	return comments;
 }
 
 void Analyzer::Write(const std::string& filename,
 	const std::function<void(const CallResultContextResult&)>& presentResults,
 	const std::function<void(uint64_t)>& reportSdkDecodeFailure,
-	const std::function<void(const RegisterContextResult&)>& presentRegisterResults) const
+	const std::function<void(const RegisterContextResult&)>& presentRegisterResults,
+	const std::function<void(const FutureBindingsResult&)>& presentFutureResults,
+	const std::function<void(const SavedReferencesResult&)>& presentSavedReferences,
+	const std::function<void(const AsyncFieldsResult&)>& presentAsyncFields,
+	const std::function<void(const AsyncFieldsResult&, const std::vector<CallInputOrigin>&,
+		const FieldInputLinksResult&)>& presentFieldInputs,
+	const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&)>& presentCapturedFields,
+	const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&)>& presentFreshFields,
+	const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&,
+		const std::vector<CallInputOrigin>&, const FreshContentResult&)>& presentFreshContents,
+	const std::function<void(const AsyncFieldsResult&, const CapturedFieldsResult&, const FreshFieldsResult&,
+		const FreshContentResult&, const CalleeEntryResult&)>& presentEntryReads,
+	const std::function<void(const JoinedReferencesResult&)>& presentJoinedReferences,
+	const std::function<void(const JoinedReferencesResult&, const FieldBranchUsesResult&)>& presentFieldBranches,
+    const std::function<void(const FieldBranchUsesResult&, const DecisionBranchesResult&)>& presentDecisionBranches,
+    const std::function<void(const ClosureCapturesResult&)>& presentClosureCaptures) const
 {
+	const auto futureBindings=BindAwaitFutures(profile,completionSummaries,awaitFutureInputs,futureBytes,futureRemaining);
+	if (presentFutureResults) presentFutureResults(futureBindings);
+	const auto savedReferences=RestoreAsyncReferences(profile,futureBindings,completionSummaries,savedReferenceBytes,receiverEntries);
+	if(presentSavedReferences)presentSavedReferences(savedReferences);
+	const auto joinedReferences=RestoreJoinedReferences(profile,futureBindings,savedReferences,savedReferenceBytes,receiverEntries);
+	if(presentJoinedReferences)presentJoinedReferences(joinedReferences);
+	const auto asyncFields=DescribeAsyncFields(profile,futureBindings,savedReferences,savedReferenceBytes,receiverEntries);
+	if(presentAsyncFields)presentAsyncFields(asyncFields);
+	const auto fieldBranches = DescribeFieldBranches(profile, joinedReferences, asyncFields, savedReferenceBytes, receiverEntries);
+	if (presentFieldBranches) presentFieldBranches(joinedReferences, fieldBranches);
+    const auto decisionBranches = RestoreDecisionBranches(profile, futureBindings, savedReferences,
+        joinedReferences, fieldBranches, savedReferenceBytes, receiverEntries);
+    if (presentDecisionBranches) presentDecisionBranches(fieldBranches, decisionBranches);
+    const auto closureCaptures = LinkClosureCaptures(profile, callInputOrigins, inputObjects, edges, payloads, entries);
+    if (presentClosureCaptures) presentClosureCaptures(closureCaptures);
+	const auto fieldInputs=LinkFieldInputs(asyncFields,callInputOrigins,profile,edges,callInputShapes);
+	if(presentFieldInputs)presentFieldInputs(asyncFields,callInputOrigins,fieldInputs);
+	std::set<uint64_t> capturedEntries;
+	if(std::any_of(asyncFields.contexts.begin(),asyncFields.contexts.end(),[](const auto& c){
+		return std::any_of(c.accesses.begin(),c.accesses.end(),[](const auto& a){return a.access=="read";});
+	})) {
+		capturedEntries=entries;
+		capturedEntries.insert(receiverEntries.begin(),receiverEntries.end());
+		for(const auto& binding:futureBindings.bindings)
+			capturedEntries.insert(binding.input.body.handlers.begin(),binding.input.body.handlers.end());
+	}
+	const auto capturedFields=PreserveCapturedFields(profile,asyncFields,savedReferences,savedReferenceBytes,capturedEntries);
+	if(presentCapturedFields)presentCapturedFields(asyncFields,capturedFields);
+	const auto freshFields=DescribeFreshFieldWrites(profile,asyncFields,capturedFields,savedReferenceBytes,capturedEntries);
+	if(presentFreshFields)presentFreshFields(asyncFields,capturedFields,freshFields);
+	std::set<uint64_t> contentEntries;
+	if (std::any_of(freshFields.contexts.begin(), freshFields.contexts.end(), [](const auto &c) { return c.write.has_value(); })) {
+		contentEntries = receiverEntries;
+		for (const auto &binding : futureBindings.bindings)
+			contentEntries.insert(binding.input.body.handlers.begin(), binding.input.body.handlers.end());
+	}
+	const auto freshContents = DescribeFreshContentUses(profile,asyncFields,capturedFields,freshFields,
+		savedReferenceBytes,contentEntries,callInputOrigins,edges,callInputShapes);
+	if (presentFreshContents) presentFreshContents(asyncFields,capturedFields,freshFields,callInputOrigins,freshContents);
+	const auto entryReads = LinkContainerEntryReads(profile,freshContents,payloads,edges);
+	if (presentEntryReads) presentEntryReads(asyncFields,capturedFields,freshFields,freshContents,entryReads);
 	using Bindings = std::vector<std::tuple<int64_t, std::string, uint64_t>>;
 	std::map<std::pair<uint64_t, Bindings>, std::vector<uint64_t>> groups;
 	std::map<uint64_t, uint64_t> globallyResolved;
@@ -983,7 +1099,7 @@ void Analyzer::Write(const std::string& filename,
 	std::ofstream out(filename);
 	if (!out) throw std::runtime_error("Cannot create snapshot call graph");
 	out.exceptions(std::ios::failbit | std::ios::badbit);
-	out << "{\"format\":36,\"export\":{\"detail\":" << Quoted(profile.includeGraphStates ? "full" : "compact")
+	out << "{\"format\":50,\"export\":{\"detail\":" << Quoted(profile.includeGraphStates ? "full" : "compact")
 		<< ",\"omitted\":" << (profile.includeGraphStates ? "[]" : "[\"receiver_blocks\",\"call_effect_states\"]")
 		<< "},\"address_basis\":\"ELF virtual addresses\",\"profile\":{\"name\":" << Quoted(profile.name)
 		<< ",\"pool_register\":" << Quoted(RegName(profile.poolRegister)) << ",\"thread_register\":" << Quoted(RegName(profile.threadRegister))
@@ -1209,7 +1325,124 @@ void Analyzer::Write(const std::string& filename,
 		} else out << "null";
 		out << '}';
 	}
-	out << "],\"call_input_origins\":[";
+	out << "],\"future_binding_abi\":{\"supported\":" << (profile.futureBindingAbi.supported?"true":"false")
+		<< ",\"suspend_state_offset\":" << profile.futureBindingAbi.suspendStateOffset << "},\"future_binding_bodies\":[";
+	std::set<uint64_t> futureBodies;
+	for (const auto& v:awaitFutureInputs) futureBodies.insert(v.boundary.payload);
+	for (const auto& v:futureBindings.producers) if(v.payload) futureBodies.insert(v.payload);
+	bool futureComma=false;
+	for (auto payload:futureBodies) {
+		if(futureComma)out<<',';futureComma=true;
+		const auto found=profile.completionBodies.find(payload);const CompletionBody unknown{};
+		const auto& body=found==profile.completionBodies.end()?unknown:found->second;
+		out<<"{\"payload\":"<<payload<<",\"end\":"<<body.end<<",\"available\":"<<(body.available?"true":"false")
+			<<",\"async_error_handler\":"<<(body.asyncErrorHandler?"true":"false")<<",\"handlers\":";Proof(out,body.handlers);out<<'}';
+	}
+	out<<"],\"future_producers\":[";futureComma=false;
+	for (const auto& v:futureBindings.producers) {
+		if(futureComma)out<<',';futureComma=true;
+		out<<"{\"entry\":"<<v.entry<<",\"payload\":"<<v.payload<<",\"end\":"<<v.end<<",\"status\":"<<Quoted(v.status)
+			<<",\"value_status\":"<<Quoted(v.valueStatus)<<",\"class_id\":"<<(v.classId?std::to_string(*v.classId):"null")
+			<<",\"null_value\":"<<(v.nullValue?"true":"false")<<",\"steps\":"<<v.steps<<",\"before_init\":";Proof(out,v.beforeInit);
+		out<<",\"after_init\":";Proof(out,v.afterInit);out<<",\"traps\":";Proof(out,v.traps);out<<",\"boundaries\":[";bool comma=false;
+		for(const auto& b:v.boundaries){if(comma)out<<',';comma=true;out<<"{\"site\":"<<b.site<<",\"operation\":"<<Quoted(b.operation)<<'}';}
+		out<<"],\"forwards\":[";comma=false;
+		for(const auto& f:v.forwards){if(comma)out<<',';comma=true;out<<"{\"completion\":"<<f.completion<<",\"call\":"<<f.call<<",\"producer\":"<<f.producer<<'}';}
+		out<<"]}";
+	}
+	out<<"],\"await_future_bindings\":[";futureComma=false;
+	for (const auto& v:futureBindings.bindings) {
+		if(futureComma)out<<',';futureComma=true;
+		const auto& b=v.input.boundary;const auto& origin=v.input.origin;
+		out<<"{\"site\":"<<b.site<<",\"payload\":"<<b.payload<<",\"callee\":"<<b.callee<<",\"operation\":"<<Quoted(AsyncOperationName(b.operation))
+			<<",\"resume_site\":"<<(b.resumeSite?std::to_string(*b.resumeSite):"null")<<",\"status\":"<<Quoted(v.status)
+			<<",\"input_status\":"<<Quoted(v.input.status)<<",\"call\":"<<(v.call?std::to_string(*v.call):"null")
+			<<",\"producer\":"<<(v.producer?std::to_string(*v.producer):"null")<<",\"producer_payload\":"<<(v.producerPayload?std::to_string(*v.producerPayload):"null")
+			<<",\"value\":"<<Quoted(v.value)<<",\"class_id\":"<<(v.classId?std::to_string(*v.classId):"null")
+			<<",\"conditions\":"<<(v.status=="conditional_delivery"?"[\"normal_producer_return\",\"successful_await_resume\",\"value_and_error_preserving_sdk_callbacks\"]":"[]")
+			<<",\"stop\":"<<Quoted(origin.stop)<<",\"trace_steps\":"<<origin.steps<<",\"source\":";
+		if(const auto& source=origin.source) {
+			out<<"{\"kind\":"<<Quoted(source->kind)<<",\"site\":"<<source->site<<",\"callee\":"<<(source->callee?std::to_string(*source->callee):"null")
+				<<",\"bits\":"<<(source->bits?std::to_string(*source->bits):"null")<<",\"load\":";
+			if(source->load)out<<"{\"base\":"<<source->load->base.id<<",\"displacement\":"<<source->load->displacement<<",\"bytes\":"<<(source->kind=="load_compressed"?4:8)<<'}';else out<<"null";
+			out<<",\"proof\":";Proof(out,source->proof);out<<'}';
+		}else out<<"null";
+		out<<'}';
+	}
+	out<<"],\"saved_reference_abi\":{\"supported\":"<<(profile.savedFrameAbi.supported?"true":"false")<<",\"first_local_offset\":"<<profile.savedFrameAbi.firstLocalOffset<<"},\"saved_reference_frames\":[";
+	bool savedComma=false;
+	for(const auto& f:savedReferences.frames){if(savedComma)out<<',';savedComma=true;
+		out<<"{\"payload\":"<<f.payload<<",\"status\":"<<Quoted(f.status)<<",\"steps\":"<<f.steps<<",\"points\":[";
+		bool comma=false;for(const auto& point:f.points){if(comma)out<<',';comma=true;out<<'['<<point.site<<','<<point.spUpper<<','<<(point.spExact?"true":"false")<<']';}out<<"]}";
+	}
+	out<<"],\"saved_reference_stack_maps\":[";savedComma=false;
+	for(const auto& m:savedReferences.maps){if(savedComma)out<<',';savedComma=true;out<<"{\"payload\":"<<m.payload<<",\"site\":"<<m.site<<",\"available\":"<<(m.available?"true":"false")<<",\"spill_slots\":"<<m.spillSlots<<",\"objects\":[";for(size_t n=0;n<m.objects.size();++n){if(n)out<<',';out<<m.objects[n];}out<<"]}";}
+	out<<"],\"saved_reference_contexts\":[";savedComma=false;
+	for(const auto& c:savedReferences.contexts){if(savedComma)out<<',';savedComma=true;out<<"{\"payload\":"<<c.payload<<",\"source_await\":"<<c.sourceAwait<<",\"class_id\":"<<c.classId<<",\"scope\":\"conditional_saved_reference_only\",\"status\":"<<Quoted(c.status)<<",\"steps\":"<<c.steps<<",\"observations\":[";bool comma=false;for(const auto& o:c.observations){if(comma)out<<',';comma=true;out<<"{\"site\":"<<o.site<<",\"store\":"<<o.store<<",\"suspension\":"<<o.suspension<<",\"slot\":"<<o.slot<<",\"register\":"<<o.reg<<'}';}out<<"]}";}
+	out<<"],\"saved_reference_work\":{\"limit\":2000000,\"steps\":"<<savedReferences.steps<<",\"remaining\":"<<savedReferences.remaining<<",\"map_drops\":"<<savedReferences.mapDrops<<",\"map_limit\":16384,\"region_limit\":2048,\"byte_limit\":8388608,\"bytes\":"<<savedReferenceBytesSize<<"}";
+	WriteJoinedReferences(out,joinedReferences);
+	WriteAsyncFields(out,asyncFields);
+	WriteFieldBranches(out, fieldBranches);
+	WriteFieldDecisions(out, profile, fieldBranches);
+    WriteDecisionBranches(out, profile, decisionBranches);
+    WriteClosureCaptures(out, profile, closureCaptures);
+	WriteFieldInputs(out,fieldInputs);
+	WriteCapturedFields(out,capturedFields);
+	WriteFreshFields(out,freshFields);
+	WriteFreshContentUses(out,profile,freshContents);
+	WriteCalleeEntryReads(out,entryReads);
+	size_t futureProducerSteps=0;for(const auto& producer:futureBindings.producers)futureProducerSteps+=producer.steps;
+	const auto futureTraceSteps=2000000-futureRemaining;
+	out<<",\"future_binding_work\":{\"limit\":2000000,\"remaining\":"<<futureBindings.remaining<<",\"steps\":"<<futureBindings.steps
+		<<",\"trace_steps\":"<<futureTraceSteps<<",\"producer_steps\":"<<futureProducerSteps
+		<<",\"resolution_steps\":"<<futureBindings.steps-futureTraceSteps-futureProducerSteps
+		<<",\"producer_limit\":4096,\"chain_limit\":8,\"byte_limit\":8388608,\"bytes\":"<<futureBytesSize;
+	out<<"}";
+	out<<",\"completion_exception_contracts\":[";
+	bool completionComma=false;
+	for (const auto& [entry,contract]:profile.completionExceptions) {
+		if (completionComma) out << ',';completionComma=true;
+		out << "{\"entry\":" << entry << ",\"end\":" << contract.end << ",\"kind\":" << Quoted(contract.kind) << ",\"tail_only\":" << (contract.tailOnly?"true":"false") << '}';
+	}
+	out << "],\"completion_bodies\":[";completionComma=false;
+	for (const auto& summary:completionSummaries) {
+		if (completionComma) out << ',';completionComma=true;
+		const auto found=profile.completionBodies.find(summary.payload);const CompletionBody unknown{};
+		const auto& body=found==profile.completionBodies.end()?unknown:found->second;
+		out << "{\"payload\":" << summary.payload << ",\"end\":" << body.end << ",\"available\":" << (body.available?"true":"false")
+			<< ",\"async_error_handler\":" << (body.asyncErrorHandler?"true":"false") << ",\"handlers\":";Proof(out,body.handlers);out << '}';
+	}
+	out << "],\"completion_summaries\":[";completionComma=false;
+	for (const auto& summary:completionSummaries) {
+		if (completionComma) out << ',';completionComma=true;
+		out << "{\"payload\":" << summary.payload << ",\"end\":" << summary.end << ",\"status\":" << Quoted(summary.status)
+			<< ",\"closed\":" << (summary.closed?"true":"false") << ",\"observed_null\":" << (summary.mayBeNull?"true":"false")
+			<< ",\"unknown_value\":" << (summary.hasUnknownValue?"true":"false") << ",\"value_or_future\":" << (summary.valueOrFuture?"true":"false")
+			<< ",\"exact_class\":" << (summary.exactClass?std::to_string(*summary.exactClass):"null") << ",\"steps\":" << summary.steps
+			<< ",\"scope\":\"covered_payload_entries_successful_value_completions\",\"entries\":";Proof(out,summary.entries);
+		out << ",\"initializations\":";Proof(out,summary.initializations);out << ",\"reached\":";Proof(out,summary.reached);
+		out << ",\"observed_classes\":[";bool comma=false;for (auto cid:summary.observedClasses) {if(comma)out<<',';comma=true;out<<cid;}
+		out << "],\"exits\":[";comma=false;
+		for (const auto& exit:summary.exits) {if(comma)out<<',';comma=true;out<<"{\"site\":"<<exit.site<<",\"target\":"<<(exit.target?std::to_string(*exit.target):"null")<<",\"kind\":"<<Quoted(exit.kind)<<'}';}
+		out << "],\"completions\":[";comma=false;
+		for (const auto& value:summary.completions) {
+			if(comma)out<<',';comma=true;
+			out<<"{\"site\":"<<value.site<<",\"callee\":"<<value.callee<<",\"operation\":"<<Quoted(AsyncOperationName(value.operation))
+				<<",\"value\":"<<Quoted(value.value)<<",\"basis\":"<<Quoted(value.basis)<<",\"class_id\":"<<(value.classId?std::to_string(*value.classId):"null")
+				<<",\"pool_index\":"<<(value.poolIndex?std::to_string(*value.poolIndex):"null")<<",\"stop\":"<<Quoted(value.origin.stop)<<",\"trace_steps\":"<<value.origin.steps<<",\"source\":";
+			if (value.origin.source) {
+				const auto& source=*value.origin.source;
+				out<<"{\"kind\":"<<Quoted(source.kind)<<",\"site\":"<<source.site<<",\"callee\":"<<(source.callee?std::to_string(*source.callee):"null")
+					<<",\"bits\":"<<(source.bits?std::to_string(*source.bits):"null")<<",\"load\":";
+				if(source.load)out<<"{\"base\":"<<source.load->base.id<<",\"displacement\":"<<source.load->displacement<<",\"bytes\":"<<(source.kind=="load_compressed"?4:8)<<'}';else out<<"null";
+				out<<",\"proof\":";Proof(out,source.proof);out<<'}';
+			}else out<<"null";
+			out<<'}';
+		}
+		out<<"]}";
+	}
+	out << "],\"completion_work\":{\"limit\":2000000,\"remaining\":" << completionRemaining << ",\"steps\":" << 2000000-completionRemaining << "},\"call_input_origins\":[";
+
 	bool originComma = false;
 	for (const auto& input : callInputOrigins) {
 		if (originComma) out << ','; originComma = true;

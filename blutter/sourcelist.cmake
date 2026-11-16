@@ -1,4 +1,27 @@
 set(SRCS 
+    CalleeEntryReads.h
+    CalleeEntryReads.cpp
+    FreshContentUses.h
+    FreshContentUses.cpp
+    FreshFieldInitializations.h
+    FreshFieldInitializations.cpp
+    CapturedFieldValues.h
+    CapturedFieldValues.cpp
+    FieldInputOrigins.h
+    FieldInputOrigins.cpp
+    AsyncFieldAccesses.h
+    AsyncFieldAccesses.cpp
+    AsyncFutureBindings.h
+    AsyncFutureBindings.cpp
+    SavedAsyncReferences.cpp
+    SavedAsyncReferences.h
+    ClosureCaptureTransfers.cpp
+    ClosureCaptureTransfers.h
+    FieldDecisions.cpp
+    FieldBranchUses.cpp
+    FieldBranchUses.h
+    CompletionAnalysis.h
+    CompletionAnalysis.cpp
     CallInputOrigins.h
     CallInputOrigins.cpp
     WordOrigins.h

@@ -21,6 +21,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--memcheck', action='store_true', help='Use ordinary binaries under Valgrind instead of sanitizers')
     parser.add_argument('--compare-compact', action='store_true', help='Compare compact/full facts and assembly for every fixture')
+    parser.add_argument('--saved-only', action='store_true', help='Run saved async reference cases only')
+    parser.add_argument('--fields-only', action='store_true', help='Run async field identity cases only')
+    parser.add_argument('--fresh-only', action='store_true', help='Run fresh field initialization cases only')
+    parser.add_argument('--closures-only', action='store_true', help='Run closure capture transfer controls only')
+    parser.add_argument('--joined-only', action='store_true', help='Run bounded suspension-alternative reference cases only')
+    parser.add_argument('--entry-reads-only', action='store_true', help='Run callee-entry container read cases only')
+    parser.add_argument('--contents-only', action='store_true', help='Run selected fresh-content survival cases only')
+    parser.add_argument('--captures-only', action='store_true', help='Run captured field local preservation cases only')
+    parser.add_argument('--field-inputs-only', action='store_true', help='Run role-proven field input cases only')
+    parser.add_argument('--futures-only', action='store_true', help='Run async Future binding cases only')
+    parser.add_argument('--completions-only', action='store_true', help='Run async completion cases only')
     parser.add_argument('--inputs-only', action='store_true', help='Run supplied-input and provenance cases only')
     args = parser.parse_args()
     if args.memcheck and not shutil.which('valgrind'):
@@ -41,6 +52,18 @@ def main():
                         str(root / 'tests/unit/snapshot_annotations_test.cpp'),
                         str(root / 'blutter/src/SnapshotCodeAnalysis.cpp'),
                         str(root / 'blutter/src/AsyncOrigins.cpp'),
+                        str(root / 'blutter/src/CompletionAnalysis.cpp'),
+                        str(root / 'blutter/src/AsyncFutureBindings.cpp'),
+                        str(root / 'blutter/src/SavedAsyncReferences.cpp'),
+                        str(root / 'blutter/src/FieldBranchUses.cpp'),
+                        str(root / 'blutter/src/FieldDecisions.cpp'),
+                        str(root / 'blutter/src/ClosureCaptureTransfers.cpp'),
+                        str(root / 'blutter/src/AsyncFieldAccesses.cpp'),
+                        str(root / 'blutter/src/FieldInputOrigins.cpp'),
+                        str(root / 'blutter/src/CapturedFieldValues.cpp'),
+                        str(root / 'blutter/src/FreshFieldInitializations.cpp'),
+                        str(root / 'blutter/src/FreshContentUses.cpp'),
+                        str(root / 'blutter/src/CalleeEntryReads.cpp'),
                         str(root / 'blutter/src/WordOrigins.cpp'),
                         str(root / 'blutter/src/CallInputOrigins.cpp'),
                         str(root / 'blutter/src/ReceiverAnalysis.cpp'),
@@ -58,7 +81,7 @@ def main():
                         str(root / 'blutter/src/StackCheckAnalysis.cpp'),
                         '-o', str(executable)] + flags, check=True)
 
-        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None, sdk_stub_returns=False, async_contracts=False, stub_inputs="", call_inputs=""):
+        def run(name, assembly, extra=None, suffix=b'', element_bytes=4, late_helper=False, helper_entry_offset=0, native_returns=False, selected_caller=None, sdk_stub_returns=False, async_contracts=False, stub_inputs="", call_inputs="", completions="", future_bindings="", saved_refs="", closure_captures=""):
             blocks = {0x1000: assembly, 0x2000: ['ret']}
             blocks.update(extra or {})
             blocks = {address: source for address, source in blocks.items() if source is not None}
@@ -89,7 +112,7 @@ def main():
                 BLUTTER_TEST_HELPER_ENTRY_OFFSET=str(helper_entry_offset),
                 BLUTTER_TEST_NATIVE_RETURNS='1' if native_returns else '0',
                 BLUTTER_TEST_SDK_STUB_RETURNS='1' if sdk_stub_returns else '0',
-                BLUTTER_TEST_STUB_INPUTS=stub_inputs, BLUTTER_TEST_CALL_INPUTS=call_inputs,
+                BLUTTER_TEST_CLOSURE_CAPTURES=closure_captures, BLUTTER_TEST_SAVED_REFERENCES=saved_refs, BLUTTER_TEST_FUTURE_BINDINGS=future_bindings, BLUTTER_TEST_COMPLETIONS=completions, BLUTTER_TEST_STUB_INPUTS=stub_inputs, BLUTTER_TEST_CALL_INPUTS=call_inputs,
                 BLUTTER_TEST_ASYNC_CONTRACTS='1' if async_contracts else '0',
                 BLUTTER_TEST_ANALYSIS_CALLER='' if selected_caller is None else hex(selected_caller),
                 ASAN_OPTIONS=f'halt_on_error=1:detect_leaks={leaks}', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
@@ -113,7 +136,8 @@ def main():
                     if start <= address and address+length <= start+len(raw):
                         return raw[address-start:address-start+length]
                 raise AssertionError('Read outside authored fixture bytes')
-            audit = {'heap_bits_register': 'x28' if element_bytes == 4 else None, 'word_return_register': 'x0', 'pool_heap_classes': [[3, 1], [4, 1], [5, 2]], 'class_allocations': [[0x2000, 1]],
+            audit = {'closure_capture_layout':dict(slot_bytes=0,tag=0,first_local_offset=0,context_offsets=[]),
+                     'closure_entry_models':[], 'closure_capture_stack_maps':[], 'decision_branch_abi': dict(value_bit=4), 'field_decision_abi': dict(supported=True, true_offset=32, false_offset=48), 'heap_bits_register': 'x28' if element_bytes == 4 else None, 'word_return_register': 'x0', 'pool_heap_classes': [[3, 1], [4, 1], [5, 2]], 'class_allocations': [[0x2000, 1]],
                              'pool_code_entries': [[2, 7, 0x2000], [2, 15, 0x2004], [6, 7, 0x5000], [7, 7, 0xa000], [8, 7, 0xc000]],
                              'leaf_math_contract': [0x80, 0x88, 0x90, 8],
                              'allocation_body_bounds': [[0x2000, 7, 31], [0x7000, 7, 15], [0x8000, 7, 39]],
@@ -141,16 +165,22 @@ def main():
                              known_stubs=[{'entry': 0xf000, 'size': 8}])
             audit.update(stub_input_abis=[], stub_input_references=[], stub_input_identities=[])
             if stub_inputs:
-                closure_kind = 'allocate_closure_2' if stub_inputs == 'new' else 'allocate_closure'
+                modern = stub_inputs in ('new', 'field-inputs')
+                field_inputs = stub_inputs.startswith('field-inputs')
+                closure_kind = 'allocate_closure_2' if modern else 'allocate_closure'
                 closure_inputs = [{'register':'x1','role':'closure_function'},
-                                  {'register':'x3' if stub_inputs == 'new' else 'x2','role':'closure_context'}]
-                if stub_inputs == 'new': closure_inputs.append({'register':'x2','role':'closure_length_flags'})
-                for entry, kind, inputs in [(0x11000,'allocate_array',[{'register':'x2','role':'array_length'}, {'register':'x1','role':'array_type_arguments'}]),
-                                            (0x12000,closure_kind,closure_inputs)]:
+                                  {'register':'x3' if modern else 'x2','role':'closure_context'}]
+                if modern: closure_inputs.append({'register':'x2','role':'closure_length_flags'})
+                for entry, kind, inputs in [(0x1a000 if field_inputs else 0x11000,'allocate_array',[{'register':'x2','role':'array_length'}, {'register':'x1','role':'array_type_arguments'}]),
+                                            (0x1b000 if field_inputs else 0x12000,closure_kind,closure_inputs)]:
                     raw = fixture_bytes[entry]
                     audit['stub_input_abis'].append(dict(kind=kind, inputs=inputs))
                     audit['stub_input_references'].append(dict(kind=kind, bytes=raw.hex()))
                     audit['stub_input_identities'].append(dict(entry=entry,payload=entry,end=entry+len(raw),kind=kind))
+            if saved_refs == 'fields-fresh':
+                audit['fresh_content_allocators'] = [0x7000]
+                audit['class_allocations'].append([0x1c000, 7])
+                audit['allocation_body_bounds'].append([0x1c000, 7, 31])
             from stub_input_roles import check_contracts
             check_contracts(result, audit, read)
             if call_inputs and call_inputs != 'unsupported':
@@ -168,14 +198,357 @@ def main():
                     audit['call_input_descriptors'][0].update(positional=1, named=[dict(index=1,name='first'),dict(index=2,name='last')])
                 check_shapes(result, audit, read)
             if result.get('call_input_origins'):
-                audit['input_object_catalog']=[dict(pool_index=3,kind='function',text='authored_callback',entry=0x19000)]
+                audit['input_object_catalog']=[dict(pool_index=3,kind='function',text='authored_capture' if closure_captures else 'authored_callback',entry=0x19000)]
                 from input_origins import check_origins
                 check_origins(result,audit,read)
+            audit['future_binding_abi']=dict(supported=bool(future_bindings) and future_bindings!='unsupported',
+                suspend_state_offset=-8 if future_bindings and future_bindings!='unsupported' else 0)
+            if completions:
+                audit['completion_exception_references'] = [dict(kind=kind, tail_only=tail, bytes=fixture_bytes[entry].hex()) for entry,kind,tail in
+                    [(0x17000,'null_cast_without_fpu',False),(0x17100,'async_error',True)]]
+                audit['completion_exception_identities'] = [dict(entry=entry,end=entry+len(fixture_bytes[entry]),kind=kind,tail_only=tail) for entry,kind,tail in
+                    [(0x17000,'null_cast_without_fpu',False),(0x17100,'async_error',True)]]
+                audit['completion_bodies'] = []
+                if completions != 'missing':
+                    for payload,raw in fixture_bytes.items():
+                        audit['completion_bodies'].append(dict(payload=payload,end=payload+len(raw)+(4 if completions=='limited' and payload==0x1000 else 0),
+                            available=True,async_error_handler=True,handlers=[0x1010] if completions=='handler' and payload==0x1000 else []))
+                if future_bindings:
+                    if future_bindings=='missing':audit['completion_bodies']=[]
+                    elif future_bindings=='handler':
+                        next(v for v in audit['completion_bodies'] if v['payload']==0x1000)['handlers']=[0x1004]
+                from completion_summaries import check_completions
+                check_completions(result,audit,read)
+                if name == 'completion-direct':
+                    for defect in ('class','site','proof','handler','body','exception','missing','duplicate','reached','status','steps','scope'):
+                        forged=copy.deepcopy(result);summary=forged['completion_summaries'][0]
+                        if defect=='class': summary['exact_class']+=1
+                        elif defect=='site': summary['completions'][0]['site']+=4
+                        elif defect=='proof': summary['completions'][0]['source']['proof']=[0x1000]
+                        elif defect=='handler': forged['completion_bodies'][0]['handlers']=[0x1008]
+                        elif defect=='body': forged['completion_bodies'][0]['end']+=4
+                        elif defect=='exception': forged['completion_exception_contracts'][0]['entry']+=4
+                        elif defect=='missing': summary['completions'].clear()
+                        elif defect=='duplicate': summary['completions']*=2
+                        elif defect=='reached': summary['reached'].pop()
+                        elif defect=='status': summary['status']='null_only'
+                        elif defect=='steps': summary['steps']+=1
+                        else: summary['scope']='ordinary_return'
+                        try: check_completions(forged,audit,read)
+                        except (AssertionError,KeyError): passed.append('completion-forged-'+defect)
+                        else: raise AssertionError('Forged completion accepted: '+defect)
+                if name == 'completion-allocated-ldtr-null-clobber':
+                    forged=copy.deepcopy(result);summary=forged['completion_summaries'][0]
+                    summary.update(status='null_only',observed_null=True,unknown_value=False)
+                    summary['completions'][0].update(value='null',basis='sdk_null_register',class_id=1,
+                        source=dict(kind='runtime_null',site=0x1008,callee=None,bits=22,load=None,proof=[0x1008,0x100c]))
+                    try:check_completions(forged,audit,read)
+                    except AssertionError as error:
+                        assert 'Canonical null register overwritten' in str(error)
+                        passed.append('completion-ldtr-null-forgery-refused')
+                    else:raise AssertionError('Overwritten null register accepted')
+                if name in ('completion-forward','completion-zero','completion-handler-bypass'):
+                    forged=copy.deepcopy(result);summary=forged['completion_summaries'][0]
+                    summary.update(status='exact_heap_class',exact_class=2,closed=True)
+                    try:check_completions(forged,audit,read)
+                    except (AssertionError,KeyError):passed.append(name+'-promotion-refused')
+                    else:raise AssertionError('Unsafe completion promotion accepted')
+            else:
+                from completion_summaries import check_completions
+                check_completions(result,audit,read)
+            from async_future_bindings import check_future_bindings,check_binding_stream
+            try:check_future_bindings(result,audit,read)
+            except AssertionError as error:raise AssertionError((name,str(error))) from error
+            with (temp/'out.json.asm').open() as stream:check_binding_stream(result,stream)
+            from saved_async_references import check_saved_references,check_saved_stream
+            audit['saved_reference_abi']=dict(supported=bool(saved_refs and saved_refs!='unsupported'),first_local_offset=-8 if saved_refs and saved_refs!='unsupported' else 0)
+            audit['saved_reference_stack_maps']=[]
+            for edge in result['edges']:
+                if edge['kind']!='call':continue
+                available=saved_refs not in ('missing-map', 'fields-missing-map')
+                audit['saved_reference_stack_maps'].append(dict(payload=edge['source'],site=edge['site'],available=available,spill_slots=32 if available else 0,
+                    objects=[-8-bit*8 for bit in range(31,-1,-1) if saved_refs not in ('nonpointer', 'fields-nonpointer') or -8-bit*8!=-16] if available else []))
+            if saved_refs == 'fields-gap':
+                for m in audit['saved_reference_stack_maps']:
+                    if m['available']:m.update(spill_slots=0, objects=[])
+            audit['captured_field_register_slots'] = [[m['site'], 0 if m['available'] else None] for m in audit['saved_reference_stack_maps']]
+            try:check_saved_references(result,audit,read)
+            except AssertionError as error:raise AssertionError((name,str(error))) from error
+            with (temp/'out.json.asm').open() as stream:check_saved_stream(result,stream)
+            if saved_refs.startswith('fields'):
+                audit['instance_field_abi'] = [1, 4, 8, 99, 8, 16]
+                audit['instance_field_metadata'] = [[2, 32, 16, (1 << 6) | (1 << 7), 0, [[8, 'enabled', 'bool?']]]]
+                if saved_refs == 'fields-fresh':audit['instance_field_metadata'].append([7, 32, 16, (1 << 6) | (1 << 7), 0, [[8, 'enabled', 'bool?']]])
+            if closure_captures:
+                legacy=closure_captures=='legacy'
+                audit['closure_capture_layout']=dict(slot_bytes=4,tag=1,first_local_offset=-8,context_offsets=[['allocate_closure' if legacy else 'allocate_closure_2',19 if legacy else 35]])
+                audit['closure_entry_models']=[] if closure_captures=='missing-model' else [
+                    dict(pool_index=3,entry=0x19000,fixed=3 if closure_captures=='arity' else 2,entry_sp_offset=16 if closure_captures=='arity' else 8)]
+                audit['instance_field_abi']=[1,4,8,99,8,16]
+                audit['instance_field_metadata']=[[4,32,16,(1<<6)|(1<<7),0,[]]]
+                audit.setdefault('completion_bodies',[]).append(dict(payload=0x19000,end=0x19000+len(fixture_bytes[0x19000]),available=closure_captures not in ('discarded','missing-body'),async_error_handler=False,handlers=[0x19018] if closure_captures=='handler' else []))
+                if closure_captures=='discarded':
+                    audit['tables']=[dict(first_with_code=1,entries=[dict(index=0,entry=0x19000)])]
+                audit['closure_capture_stack_maps']=[dict(payload=0x19000,site=0x19024,
+                    available=closure_captures!='missing-map',spill_slots=0 if closure_captures=='missing-map' else 1,
+                    register_slots=None if closure_captures=='missing-map' else 0,
+                    objects=[-8] if closure_captures not in ('missing-map','untagged') else [])]
+            from async_field_accesses import check_fields, check_stream as check_field_stream
+            check_fields(result, audit, read)
+            with (temp/'out.json.asm').open() as stream:check_field_stream(result, stream)
+            from field_input_origins import check_field_inputs, check_stream as check_field_input_stream
+            check_field_inputs(result)
+            with (temp/'out.json.asm').open() as stream:check_field_input_stream(result, stream)
+            from captured_field_values import check_captures, check_stream as check_captured_stream
+            check_captures(result, audit, read)
+            if name == 'captured-tagged-local':
+                for defect in ('slot', 'store', 'call', 'target', 'register', 'map', 'active-frame'):
+                    forged = copy.deepcopy(result)
+                    row = next(c for c in forged['captured_field_contexts'] if c['reloads'])
+                    reload = row['reloads'][0]
+                    if defect in ('slot', 'store', 'call', 'target'):reload[defect] += 8
+                    elif defect == 'register':reload['register'] = 4
+                    elif defect == 'map':forged['captured_field_stack_maps'][0]['objects'].remove(reload['slot'])
+                    else:
+                        frame = next(f for f in forged['saved_reference_frames'] if f['payload'] == 0x1000)
+                        frame['points'] = [p for p in frame['points'] if p[0] != reload['site']]
+                    try:check_captures(forged, audit, read)
+                    except (AssertionError, KeyError):passed.append('captured-forged-' + defect)
+                    else:raise AssertionError('Forged captured value proof accepted: ' + defect)
+            with (temp/'out.json.asm').open() as stream:check_captured_stream(result, stream)
+            from fresh_field_initializations import check_fresh_fields, check_stream as check_fresh_stream
+            check_fresh_fields(result, audit, read)
+            from fresh_content_uses import check_contents, check_stream as check_content_stream
+            check_contents(result, audit, read)
+            from joined_async_references import check_joined, check_stream as check_joined_stream
+            check_joined(result, audit, read)
+            with (temp/'out.json.asm').open() as stream:check_joined_stream(result, stream)
+            from field_branch_uses import check_branches, check_stream as check_branch_stream, expected_notes
+            check_branches(result, audit, read)
+            if name == 'joined-field-tbnz':
+                for defect in ('offset', 'bit', 'clear_target', 'reference', 'missing'):
+                    forged = copy.deepcopy(result)
+                    if defect == 'missing':
+                        forged['field_branch_uses'].clear()
+                    else:
+                        forged['field_branch_uses'][0][defect] += 1
+                    try:
+                        check_branches(forged, audit, read)
+                    except AssertionError:
+                        passed.append('field-branch-forged-' + defect)
+                    else:
+                        raise AssertionError('Forged field branch accepted: ' + defect)
+            expected_branches = expected_notes(result)
+            with (temp/'out.json.asm').open() as stream:
+                assert check_branch_stream(stream, expected_branches) == expected_branches
+            from field_decisions import check_decisions, check_stream as check_decision_stream, expected_notes as decision_notes
+            check_decisions(result, audit, read)
+            if name == 'decision-base':
+                for defect in ('bit-sense', 'comparison', 'slot', 'site', 'parent', 'missing', 'abi'):
+                    forged = copy.deepcopy(result)
+                    if defect == 'missing':
+                        forged['field_decisions'].clear()
+                    elif defect == 'abi':
+                        forged['field_decision_abi']['true_offset'] += 16
+                    else:
+                        row = forged['field_decisions'][0]
+                        if defect == 'bit-sense': row['on_set'] = not row['on_set']
+                        elif defect == 'comparison': row['non_null_true'] = not row['non_null_true']
+                        else: row[{'slot':'fp_offset', 'site':'site', 'parent':'branch_use'}[defect]] += 1
+                    try:
+                        check_decisions(forged, audit, read)
+                    except AssertionError:
+                        passed.append('decision-forged-' + defect)
+                    else:
+                        raise AssertionError('Forged field decision accepted: ' + defect)
+            decision_expected = decision_notes(result)
+            with (temp/'out.json.asm').open() as stream:
+                assert check_decision_stream(stream, decision_expected) == decision_expected
+            from decision_branch_uses import check_uses, check_stream as check_decision_uses, expected_notes as decision_use_notes
+            check_uses(result,audit,read)
+            if name == 'decision-saved-use':
+                for defect in ('target','reload','definition','slot','map','bit','missing'):
+                    forged = copy.deepcopy(result)
+                    c = forged['decision_reference_contexts'][0]
+                    if defect == 'target': forged['decision_branch_uses'][0]['true_target'] += 4
+                    elif defect == 'reload': c['reloads'][0]['site'] += 4
+                    elif defect == 'definition': c['reloads'][0]['store'] += 4
+                    elif defect == 'slot': c['reloads'][0]['slot'] -= 8
+                    elif defect == 'bit': forged['decision_branch_abi']['value_bit'] += 1
+                    elif defect == 'missing': forged['decision_branch_uses'].clear()
+                    else:
+                        for m in forged['saved_reference_stack_maps']:
+                            if -24 in m['objects']: m['objects'].remove(-24)
+                    try: check_uses(forged,audit,read)
+                    except (AssertionError,KeyError,IndexError):
+                        passed.append('decision-use-forged-' + defect)
+                    else: raise AssertionError('Forged decision use accepted: '+defect)
+            expected_uses = decision_use_notes(result)
+            with (temp/'out.json.asm').open() as stream:
+                assert check_decision_uses(stream,expected_uses) == expected_uses
+            from closure_capture_transfers import check_transfers, expected_notes as closure_notes, check_stream as check_closure_stream
+            check_transfers(result,audit,read)
+            if name == 'closure-base' and result['closure_capture_transfers']:
+                for defect in ('source','destination','local','entry','map','missing'):
+                    forged=copy.deepcopy(result)
+                    if defect=='missing': forged['closure_capture_transfers'].clear()
+                    else:
+                        row=forged['closure_capture_transfers'][0]
+                        if defect=='map': row['stack_map']['objects']=[]
+                        else: row[{'source':'value_displacement','destination':'destination_offset','local':'saved_slot','entry':'entry_sp_offset'}[defect]]+=4
+                    try:check_transfers(forged,audit,read)
+                    except (AssertionError,KeyError,IndexError):passed.append('closure-forged-'+defect)
+                    else:raise AssertionError('Forged closure transfer accepted: '+defect)
+            closure_expected=closure_notes(result)
+            with (temp/'out.json.asm').open() as stream:
+                assert check_closure_stream(stream,closure_expected)==closure_expected
+            from callee_entry_reads import check_entry_reads, check_stream as check_entry_stream
+            check_entry_reads(result, audit, read)
+            with (temp/'out.json.asm').open() as stream:check_entry_stream(result, stream)
+            with (temp/'out.json.asm').open() as stream:check_content_stream(result, stream)
+            if name == 'joined-optional':
+                for defect in ('history', 'missing-alternative', 'store', 'slot', 'register', 'map', 'entry', 'source'):
+                    forged=copy.deepcopy(result);row=next(c for c in forged['joined_reference_contexts'] if c['observations']);o=row['observations'][0];reader=read
+                    if defect=='history':o['last_suspensions']=[None,o['last_suspensions'][1]+4]
+                    elif defect=='missing-alternative':o['last_suspensions']=[o['last_suspensions'][1]]
+                    elif defect=='store':o['store']+=4
+                    elif defect=='slot':o['slot']-=8
+                    elif defect=='register':o['register']+=1
+                    elif defect=='map':next(m for m in forged['saved_reference_stack_maps'] if m['site']==o['last_suspensions'][1])['objects'].remove(o['slot'])
+                    elif defect=='entry':forged['receiver_metadata']['entries'].append(o['site'])
+                    else:row['source_await']+=4
+                    try:check_joined(forged,audit,reader)
+                    except (AssertionError,KeyError,IndexError):passed.append('joined-forged-'+defect)
+                    else:raise AssertionError('Forged joined-reference proof accepted: '+defect)
+            if name in ('entry-base', 'entry-guard') and result['callee_entry_read_contracts']:
+                for defect in ('load-offset', 'load-width', 'load-register', 'prefix', 'scope', 'call-target', 'caller-word', 'guard'):
+                    if defect == 'guard' and name != 'entry-guard':continue
+                    forged = copy.deepcopy(result);row = forged['callee_entry_read_contracts'][0];reader = read
+                    if defect == 'load-offset':row['reads'][0]['entry_sp_offset'] += 8
+                    elif defect == 'load-width':row['reads'][0]['bytes'] = 4
+                    elif defect == 'load-register':row['reads'][0]['register'] += 1
+                    elif defect == 'prefix':row['prefix'].pop(1)
+                    elif defect == 'scope':forged['container_entry_read_links'][0]['scope'] = 'source_parameter'
+                    elif defect == 'guard':row['guard']['stub'] = 0x7000
+                    else:
+                        context = forged['fresh_content_contexts'][forged['container_entry_read_links'][0]['context']]
+                        changed = context['transfer'] if defect == 'call-target' else context['transfer'] - 4
+                        replacement = bytes.fromhex('00000094') if defect == 'call-target' else bytes.fromhex('e20500f9')
+                        def reader(address, size):
+                            data = bytearray(read(address, size))
+                            if address <= changed and changed + 4 <= address + size:data[changed-address:changed-address+4] = replacement
+                            return bytes(data)
+                    try:check_entry_reads(forged, audit, reader)
+                    except (AssertionError, KeyError, IndexError):passed.append(name + '-forged-' + defect)
+                    else:raise AssertionError('Forged callee-entry proof accepted: ' + defect)
+            if name == 'contents-mint-diamond':
+                for defect in ('path', 'role', 'allocator', 'registers', 'entry', 'seed', 'branch-store'):
+                    forged = copy.deepcopy(result)
+                    row = next(c for c in forged['fresh_content_contexts'] if c['inputs'])
+                    f = forged['fresh_field_contexts'][row['initialization']]
+                    pc = f['write']['site'];reader = read
+                    if defect == 'path':
+                        row['proof'].remove(pc + 8);row['steps'] -= 1
+                        forged['fresh_content_work']['steps'] -= 1;forged['fresh_content_work']['remaining'] += 1
+                    elif defect == 'role':forged['call_input_origins'][row['inputs'][0]]['role'] = 'register_observation'
+                    elif defect == 'allocator':forged['fresh_content_allocators'] = []
+                    elif defect == 'registers':forged['receiver_metadata']['preserved_call_registers'][0][1] = 1
+                    elif defect == 'entry':forged['receiver_metadata']['entries'].append(pc + 16)
+                    elif defect == 'seed':f['write'].update(offset=20, index=1)
+                    else:
+                        # Replace the auxiliary Mint store on just one path with
+                        # an overwrite of the selected array element.
+                        changed = pc + 12
+                        def reader(address, size):
+                            data = bytearray(read(address, size))
+                            if address <= changed and changed + 4 <= address + size:
+                                data[changed-address:changed-address+4] = bytes.fromhex('43f000b8')
+                            return bytes(data)
+                    try:check_contents(forged, audit, reader)
+                    except (AssertionError, KeyError, IndexError):passed.append('contents-forged-' + defect)
+                    else:raise AssertionError('Forged selected-content proof accepted: ' + defect)
+            if name == 'fresh-array-element':
+                for defect in ('offset', 'index', 'base', 'register', 'length', 'bits', 'allocation-alias'):
+                    forged = copy.deepcopy(result);row = next(c for c in forged['fresh_field_contexts'] if c['write'])
+                    if defect in ('offset', 'base', 'register'):row['write'][defect] += 1
+                    elif defect == 'index':row['write']['index'] += 1;row['write']['offset'] += row['write']['bytes']
+                    elif defect == 'length':row['length'] += 1
+                    elif defect == 'bits':row['length_source']['bits'] += 2;row['length'] += 1
+                    else:row['write']['base'] = 4
+                    try:check_fresh_fields(forged, audit, read)
+                    except (AssertionError, KeyError):passed.append('fresh-forged-' + defect)
+                    else:raise AssertionError('Forged fresh-write proof accepted: ' + defect)
+            with (temp/'out.json.asm').open() as stream:check_fresh_stream(result, stream)
+            if name=='saved-direct':
+                for defect in ('class','source','scope','slot','store','suspension','register','frame','map','work','duplicate','missing-context'):
+                    forged=copy.deepcopy(result);context=next(c for c in forged['saved_reference_contexts'] if c['observations']);ref=context['observations'][0]
+                    if defect=='class':context['class_id']+=1
+                    elif defect=='source':context['source_await']+=4
+                    elif defect=='scope':context['scope']='unconditional'
+                    elif defect=='slot':ref['slot']-=8
+                    elif defect=='store':ref['store']+=4
+                    elif defect=='suspension':ref['suspension']-=4
+                    elif defect=='register':ref['register']=3
+                    elif defect=='frame':forged['saved_reference_frames'][0]['points'].pop()
+                    elif defect=='map':next(m for m in forged['saved_reference_stack_maps'] if m['site']==ref['suspension'])['objects'].remove(ref['slot'])
+                    elif defect=='work':forged['saved_reference_work']['steps']+=1
+                    elif defect=='duplicate':context['observations']*=2
+                    else:forged['saved_reference_contexts'].remove(context)
+                    try:check_saved_references(forged,audit,read)
+                    except (AssertionError,KeyError):passed.append('saved-forged-'+defect)
+                    else:raise AssertionError('Forged saved reference accepted: '+defect)
+                lines=(temp/'out.json.asm').read_text().splitlines(keepends=True)
+                for defect in ('scope','class','slot','site','missing','duplicate'):
+                    forged=[]
+                    for line in lines:
+                        if '// async restored-reference:' in line:
+                            if defect=='missing':continue
+                            if defect=='duplicate':forged.append(line)
+                            if defect=='scope':line=line.replace('conditional: ','')
+                            if defect=='class':line=line.replace('heap class 0x2','heap class 0x7')
+                            if defect=='slot':line=line.replace('FP-16','FP-24')
+                            if defect=='site':line=line.replace('await 0x101c','await 0x1020')
+                        forged.append(line)
+                    try:check_saved_stream(result,forged)
+                    except (AssertionError,KeyError):passed.append('saved-note-forged-'+defect)
+                    else:raise AssertionError('Forged restored-reference comment accepted: '+defect)
+            if name=='future-direct':
+                for defect in ('class','conditions','producer','call','resume','origin','entry','frame','missing','duplicate','abi','body','work','value-alias'):
+                    forged=copy.deepcopy(result);row=forged['await_future_bindings'][0];producer=forged['future_producers'][0]
+                    if defect=='class':row['class_id']+=1
+                    elif defect=='conditions':row['conditions']=[]
+                    elif defect=='producer':row['producer']+=4
+                    elif defect=='call':row['call']-=4
+                    elif defect=='resume':row['resume_site']+=4
+                    elif defect=='origin':row['source']['proof']=[0x1000]
+                    elif defect=='entry':producer['entry']+=4
+                    elif defect=='frame':producer['after_init'].clear()
+                    elif defect=='missing':forged['await_future_bindings'].clear()
+                    elif defect=='duplicate':forged['await_future_bindings']*=2
+                    elif defect=='abi':forged['future_binding_abi']['suspend_state_offset']-=8
+                    elif defect=='body':forged['future_binding_bodies'][0]['handlers']=[0x101c]
+                    elif defect=='work':forged['future_binding_work']['steps']+=1
+                    else:producer['class_id']+=1
+                    try:check_future_bindings(forged,audit,read)
+                    except (AssertionError,KeyError):passed.append('future-forged-'+defect)
+                    else:raise AssertionError('Forged Future binding accepted: '+defect)
+                lines=(temp/'out.json.asm').read_text().splitlines(keepends=True)
+                for defect in ('unscoped','class','site','missing','duplicate'):
+                    forged=[]
+                    for line in lines:
+                        if '// async delivered-value:' in line:
+                            if defect=='missing':continue
+                            if defect=='duplicate':forged.append(line)
+                            if defect=='unscoped':line=line.replace('conditional: ','')
+                            if defect=='class':line=line.replace('heap class 0x2','heap class 0x7')
+                            if defect=='site':line=line.replace('await 0x101c','await 0x1018')
+                        forged.append(line)
+                    try:check_binding_stream(result,forged)
+                    except (AssertionError,KeyError):passed.append('future-note-forged-'+defect)
+                    else:raise AssertionError('Forged await note accepted: '+defect)
             def verify(value):
-                if sdk_stub_returns:
-                    from check_snapshot_annotations import decode_payload
-                    return check_receivers(value, read, lambda raw, address: decode_payload(decoder, raw, address), audit)
-                return check_receivers(value, read, lambda raw, address: list(decoder.disasm(raw, address)), audit)
+                from check_snapshot_annotations import decode_payload
+                return check_receivers(value, read, lambda raw, address: decode_payload(decoder, raw, address), audit)
             if name == 'call-input-result-scope':
                 for defect in ('class', 'site', 'proof', 'duplicate', 'binding'):
                     forged = copy.deepcopy(result)
@@ -436,6 +809,71 @@ def main():
                         raise AssertionError('Forged array context accepted: ' + defect)
             passed.append(name)
             return result
+
+        if args.closures_only:
+            from closure_capture_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} closure capture cases passed')
+            return
+
+        if args.joined_only:
+            from joined_reference_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} joined-reference cases passed')
+            return
+
+        if args.entry_reads_only:
+            from callee_entry_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} callee-entry read cases passed')
+            return
+
+        if args.contents_only:
+            from fresh_content_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} selected content cases passed')
+            return
+        if args.fresh_only:
+            from fresh_field_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} fresh initialization cases passed')
+            return
+
+        if args.captures_only:
+            from captured_field_cases import run_cases
+            run_cases(run)
+            print(f'{len(passed)} captured field cases passed')
+            return
+
+        if args.field_inputs_only:
+            from field_input_cases import run_cases
+            run_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
+
+        if args.fields_only:
+            from async_field_cases import run_cases
+            run_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
+
+        if args.saved_only:
+            from saved_reference_cases import run_cases
+            run_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
+
+        if args.futures_only:
+            from future_binding_cases import run_cases
+            run_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
+
+        if args.completions_only:
+            from completion_cases import run_cases
+            run_cases(run)
+            print(json.dumps(dict(status='PASSED',case_count=len(passed),cases=passed,memcheck=args.memcheck)))
+            return
 
         if args.inputs_only:
             from input_origin_cases import run_cases as origin_cases
@@ -1620,8 +2058,11 @@ def main():
             described = run('async-boundary-'+name, body, async_stubs, async_contracts=True)
             assert [(v['operation'], v['resume_site']) for v in described['async_boundaries']] == expected
             assert len(described['async_contracts']) == 6
-            assert {k:v for k,v in described.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs')} == {
-                k:v for k,v in ordinary.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs')}, 'Async contracts changed ordinary analysis facts'
+            assert not ordinary['call_input_origins']
+            assert len(described['call_input_origins']) == sum(b['operation']!='init_async' for b in described['async_boundaries'])
+            assert all(o['role'] in ('await_input','completion_operand') and o['register']==0 for o in described['call_input_origins'])
+            assert {k:v for k,v in described.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs', 'completion_exception_contracts', 'completion_bodies', 'completion_summaries', 'completion_work', 'call_input_origins', 'input_origin_work')} == {
+                k:v for k,v in ordinary.items() if k not in ('async_boundaries', 'async_contracts', 'async_inputs', 'completion_exception_contracts', 'completion_bodies', 'completion_summaries', 'completion_work', 'call_input_origins', 'input_origin_work')}, 'Async contracts changed ordinary analysis facts'
             text = (temp / 'out.json.asm').read_text()
             assert 'async resume entry:' in text
             if any(k.startswith('await') for k, _ in expected):
@@ -1643,6 +2084,8 @@ def main():
             helpers = async_stubs | {0x4000: ['ret'], 0x5000: ['ret']}
             ordinary = run('async-origin-baseline-'+name, body, helpers)
             observed = run('async-origin-'+name, body, helpers, async_contracts=True)
+            assert not ordinary['call_input_origins']
+            assert all(o['role'] in ('await_input','completion_operand') and o['register']==0 for o in observed['call_input_origins'])
             row = observed['async_inputs'][-1]
             assert row['stop'] == stop and row['condition'] == 'normal_fallthrough'
             assert row['steps'] <= 64
@@ -1651,8 +2094,8 @@ def main():
             else:
                 assert row['source']['kind'] == kind and row['source']['site'] == site
                 assert row['source']['proof'][0] == site and row['source']['proof'][-1] == row['site']
-            assert {k:v for k,v in observed.items() if k not in ('async_boundaries','async_contracts','async_inputs')} == {
-                k:v for k,v in ordinary.items() if k not in ('async_boundaries','async_contracts','async_inputs')}
+            assert {k:v for k,v in observed.items() if k not in ('async_boundaries','async_contracts','async_inputs','completion_exception_contracts','completion_bodies','completion_summaries','completion_work','call_input_origins','input_origin_work')} == {
+                k:v for k,v in ordinary.items() if k not in ('async_boundaries','async_contracts','async_inputs','completion_exception_contracts','completion_bodies','completion_summaries','completion_work','call_input_origins','input_origin_work')}
         input_helpers = {0x4000: ['ldr x0, [x27, #40]', 'ret'], 0x3000: ['ret']}
         observed = run('call-input-result-scope', prologue + [
             'bl 0x4000', 'mov x1,x0', 'str x1,[x15]', 'bl 0x3000'] + epilogue, input_helpers)
@@ -1679,6 +2122,28 @@ def main():
                       {0x11000:['ret'], 0x12000:['ret']}, stub_inputs='new')
         from stub_input_roles import input_records
         assert all(v['kind'] == 'unknown' for v in input_records(unknown))
+        from future_binding_cases import run_cases as run_future_cases
+        run_future_cases(run)
+        from saved_reference_cases import run_cases as run_saved_cases
+        run_saved_cases(run)
+        from async_field_cases import run_cases as run_field_cases
+        run_field_cases(run)
+        from fresh_field_cases import run_cases as run_fresh_cases
+        run_fresh_cases(run)
+        from closure_capture_cases import run_cases as run_closure_cases
+        run_closure_cases(run)
+        from joined_reference_cases import run_cases as run_joined_cases
+        run_joined_cases(run)
+        from callee_entry_cases import run_cases as run_entry_cases
+        run_entry_cases(run)
+        from fresh_content_cases import run_cases as run_content_cases
+        run_content_cases(run)
+        from captured_field_cases import run_cases as run_captured_cases
+        run_captured_cases(run)
+        from field_input_cases import run_cases as run_field_input_cases
+        run_field_input_cases(run)
+        from completion_cases import run_cases as run_completion_cases
+        run_completion_cases(run)
         from input_origin_cases import run_cases as run_origin_cases
         run_origin_cases(run)
         from call_input_shape_cases import run_cases

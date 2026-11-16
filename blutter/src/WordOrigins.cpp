@@ -55,7 +55,7 @@ std::optional<std::vector<Store>> PlainStores(const cs_insn& i) {
 }
 }
 WordOriginResult TraceWordInput(const cs_insn* raw, size_t count, size_t consumer,
-	WordLocation location, const Profile& profile, const std::function<bool(uint64_t)>& isEntry, size_t limit, bool extended)
+	WordLocation location, const Profile& profile, const std::function<bool(uint64_t)>& isEntry, size_t limit, bool extended, std::optional<uint16_t> invariantNull)
 {
 	WordOriginResult result{"unknown", {}, 0};
 	if (!raw || consumer >= count || !Valid(raw[consumer]) || location.reg >= 31 ||
@@ -126,6 +126,7 @@ WordOriginResult TraceWordInput(const cs_insn* raw, size_t count, size_t consume
 				const auto r = d.operands[part].reg;
 				if (r == ARM64_REG_XZR) { result.source = source(n, "literal"); result.source->bits = 0; return finish("matched"); }
 				const auto stored = Register(r); if (!stored) return finish("unsupported_spill_source");
+				if (invariantNull == stored && *stored == 22) { result.source = source(n, "runtime_null"); result.source->bits=22; return finish("matched"); }
 				reg = *stored; memory.reset(); matched = true; break;
 			}
 			if (!matched) {
@@ -147,6 +148,7 @@ WordOriginResult TraceWordInput(const cs_insn* raw, size_t count, size_t consume
 				}
 				const auto stored = Register(store.source);
 				if (!stored) return finish("unsupported_spill_source");
+				if (invariantNull == stored && *stored == 22) { result.source = source(n, "runtime_null"); result.source->bits=22; return finish("matched"); }
 				reg = *stored; memory.reset(); break;
 			}
 			continue;
@@ -170,7 +172,10 @@ WordOriginResult TraceWordInput(const cs_insn* raw, size_t count, size_t consume
 		if (compressed && !std::holds_alternative<NativeIr::Load>(lowered->operation)) return finish("compressed_definition");
 		if (effects.destination->storageBits != 64 || (effects.destination->valueBits != 64 && !(compressed && effects.destination->valueBits == 32))) return finish("narrow_definition");
 		if (const auto* assign = std::get_if<NativeIr::Assign>(&lowered->operation)) {
-			if (const auto* input = std::get_if<NativeIr::RegisterView>(&assign->value); input && input->bits == 64 && input->id < 31) reg = input->id;
+			if (const auto* input = std::get_if<NativeIr::RegisterView>(&assign->value); input && input->bits == 64 && input->id < 31) {
+				if (invariantNull == input->id && input->id == 22) { result.source = source(n,"runtime_null"); result.source->bits=22; return finish("matched"); }
+				reg = input->id;
+			}
 			else if (const auto* literal = std::get_if<NativeIr::Literal>(&assign->value)) {
 				result.source = source(n, "literal"); result.source->bits = literal->value; return finish("matched");
 			} else return finish("unsupported_copy");

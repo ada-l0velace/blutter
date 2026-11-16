@@ -1,5 +1,46 @@
 set(BLUTTER_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src")
 
+add_executable(fresh_content_uses_test unit/fresh_content_uses_test.cpp
+    "${BLUTTER_SOURCE_DIR}/FreshContentUses.cpp" "${BLUTTER_SOURCE_DIR}/FieldInputOrigins.cpp"
+    "${BLUTTER_SOURCE_DIR}/CallInputShapes.cpp" "${BLUTTER_SOURCE_DIR}/CallInputRoles.cpp"
+    "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp" "${BLUTTER_SOURCE_DIR}/NativeIr.cpp")
+target_include_directories(fresh_content_uses_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(fresh_content_uses_test PRIVATE capstone)
+blutter_instrument_test_target(fresh_content_uses_test)
+add_test(NAME fresh_content_uses COMMAND fresh_content_uses_test)
+
+add_executable(fresh_field_initializations_test unit/fresh_field_initializations_test.cpp
+    "${BLUTTER_SOURCE_DIR}/FreshFieldInitializations.cpp" "${BLUTTER_SOURCE_DIR}/AsyncFieldAccesses.cpp"
+    "${BLUTTER_SOURCE_DIR}/WordOrigins.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp" "${BLUTTER_SOURCE_DIR}/NativeIr.cpp")
+target_include_directories(fresh_field_initializations_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(fresh_field_initializations_test PRIVATE capstone)
+blutter_instrument_test_target(fresh_field_initializations_test)
+add_test(NAME fresh_field_initializations COMMAND fresh_field_initializations_test)
+
+add_executable(captured_field_values_test unit/captured_field_values_test.cpp
+    "${BLUTTER_SOURCE_DIR}/CapturedFieldValues.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp")
+target_include_directories(captured_field_values_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(captured_field_values_test PRIVATE capstone)
+blutter_instrument_test_target(captured_field_values_test)
+add_test(NAME captured_field_values COMMAND captured_field_values_test)
+
+add_executable(field_input_origins_test unit/field_input_origins_test.cpp
+    "${BLUTTER_SOURCE_DIR}/FieldInputOrigins.cpp" "${BLUTTER_SOURCE_DIR}/CallInputShapes.cpp"
+    "${BLUTTER_SOURCE_DIR}/CallInputRoles.cpp")
+target_include_directories(field_input_origins_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(field_input_origins_test PRIVATE capstone)
+blutter_instrument_test_target(field_input_origins_test)
+add_test(NAME field_input_origins COMMAND field_input_origins_test)
+
+add_executable(async_field_accesses_test unit/async_field_accesses_test.cpp
+    "${BLUTTER_SOURCE_DIR}/AsyncFieldAccesses.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp")
+target_include_directories(async_field_accesses_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(async_field_accesses_test PRIVATE capstone)
+blutter_instrument_test_target(async_field_accesses_test)
+add_test(NAME async_field_accesses COMMAND async_field_accesses_test)
+
 add_executable(arm64_analyzer_test
     integration/arm64_analyzer_test.cpp
     "${BLUTTER_SOURCE_DIR}/Arm64GdtAnalysis.cpp"
@@ -189,3 +230,43 @@ target_include_directories(word_origins_test PRIVATE "${BLUTTER_SOURCE_DIR}")
 target_link_libraries(word_origins_test PRIVATE capstone)
 blutter_instrument_test_target(word_origins_test)
 add_test(NAME word_origins COMMAND word_origins_test)
+
+add_executable(completion_analysis_test unit/completion_analysis_test.cpp "${BLUTTER_SOURCE_DIR}/CompletionAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/WordOrigins.cpp" "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(completion_analysis_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(completion_analysis_test PRIVATE capstone)
+blutter_instrument_test_target(completion_analysis_test)
+add_test(NAME completion_analysis COMMAND completion_analysis_test)
+
+add_executable(async_future_bindings_test unit/async_future_bindings_test.cpp
+    "${BLUTTER_SOURCE_DIR}/AsyncFutureBindings.cpp" "${BLUTTER_SOURCE_DIR}/CompletionAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/WordOrigins.cpp" "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(async_future_bindings_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(async_future_bindings_test PRIVATE capstone)
+blutter_instrument_test_target(async_future_bindings_test)
+add_test(NAME async_future_bindings COMMAND async_future_bindings_test)
+
+add_executable(saved_async_references_test unit/saved_async_references_test.cpp
+    "${BLUTTER_SOURCE_DIR}/SavedAsyncReferences.cpp" "${BLUTTER_SOURCE_DIR}/AsyncFutureBindings.cpp"
+    "${BLUTTER_SOURCE_DIR}/CompletionAnalysis.cpp" "${BLUTTER_SOURCE_DIR}/WordOrigins.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(saved_async_references_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(saved_async_references_test PRIVATE capstone)
+blutter_instrument_test_target(saved_async_references_test)
+add_test(NAME saved_async_references COMMAND saved_async_references_test)
+add_executable(callee_entry_reads_test unit/callee_entry_reads_test.cpp
+    "${BLUTTER_SOURCE_DIR}/CalleeEntryReads.cpp" "${BLUTTER_SOURCE_DIR}/StackCheckAnalysis.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(callee_entry_reads_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(callee_entry_reads_test PRIVATE capstone)
+blutter_instrument_test_target(callee_entry_reads_test)
+add_test(NAME callee_entry_reads COMMAND callee_entry_reads_test)
+
+add_executable(joined_async_references_test unit/joined_async_references_test.cpp
+    "${BLUTTER_SOURCE_DIR}/SavedAsyncReferences.cpp" "${BLUTTER_SOURCE_DIR}/AsyncFutureBindings.cpp"
+    "${BLUTTER_SOURCE_DIR}/CompletionAnalysis.cpp" "${BLUTTER_SOURCE_DIR}/WordOrigins.cpp"
+    "${BLUTTER_SOURCE_DIR}/NativeIr.cpp" "${BLUTTER_SOURCE_DIR}/Arm64Ir.cpp")
+target_include_directories(joined_async_references_test PRIVATE "${BLUTTER_SOURCE_DIR}")
+target_link_libraries(joined_async_references_test PRIVATE capstone)
+blutter_instrument_test_target(joined_async_references_test)
+add_test(NAME joined_async_references COMMAND joined_async_references_test)

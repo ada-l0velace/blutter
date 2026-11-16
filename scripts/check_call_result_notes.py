@@ -217,7 +217,33 @@ def metadata_class_names(script):
 
 
 def check_output(graph, output):
+    from closure_capture_transfers import check_output as check_closure_captures
+    closure_capture_notes=check_closure_captures(graph,output) if graph.get('format',0)>=50 else 0
+    from decision_branch_uses import check_output as check_decision_branches
+    decision_branches = check_decision_branches(graph,output) if graph.get('format',0) >= 49 else 0
+    from field_decisions import check_output as check_decision_output
+    decision_notes = check_decision_output(graph, output) if graph.get('format', 0) >= 48 else 0
+    from field_branch_uses import check_output as check_branch_output
+    branch_notes = check_branch_output(graph, output) if graph.get('format', 0) >= 47 else 0
+    from joined_async_references import check_output as check_joined_output
+    joined_notes = check_joined_output(graph, output) if graph.get('format', 0) >= 46 else 0
+    from callee_entry_reads import check_output as check_entry_output
+    entry_notes = check_entry_output(graph, output) if graph.get('format', 0) >= 45 else 0
+    from fresh_content_uses import check_output as check_contents_output
+    content_notes = check_contents_output(graph, output) if graph.get('format', 0) >= 44 else 0
+    from fresh_field_initializations import check_output as check_fresh_output
+    fresh_notes = check_fresh_output(graph, output) if graph.get("format", 0) >= 43 else 0
+    from captured_field_values import check_output as check_captured_output
+    captured_notes = check_captured_output(graph, output) if graph.get("format", 0) >= 42 else 0
+    from field_input_origins import check_output as check_field_input_output
+    field_input_notes = check_field_input_output(graph, output) if graph.get('format', 0) >= 41 else 0
+    from async_field_accesses import check_output as check_field_output
+    field_notes = check_field_output(graph, output) if graph.get('format', 0) >= 40 else 0
+    from saved_async_references import check_saved_output
+    saved_notes=check_saved_output(graph,output) if graph.get('format',0)>=39 else 0
     expected = expected_facts(graph)
+    from async_future_bindings import check_binding_output
+    future_notes = check_binding_output(graph, output) if graph.get('format',0) >= 38 else 0
     by_site = facts_by_site(expected)
     catalogue = output / 'blutter_frida.js'
     class_names = metadata_class_names(catalogue.read_text()) if catalogue.exists() else None
@@ -237,8 +263,8 @@ def check_output(graph, output):
             except AssertionError as error:
                 raise AssertionError(f'{path}: {error}') from error
         typed_count += sum(typed.values()); files += bool(typed)
-    return {'status': 'PASSED', 'expected_facts': len(expected), 'native_notes': sum(native.values()),
-            'typed_notes': typed_count, 'typed_files_with_notes': files,
+    return {'status': 'PASSED', 'expected_facts': len(expected), 'native_notes': sum(native.values()), 'container_input_notes': content_notes,
+            'typed_notes': typed_count, 'container_consumer_notes': entry_notes, 'joined_reference_notes': joined_notes, 'field_branch_notes': branch_notes, 'field_decision_notes': decision_notes, 'decision_branch_notes': decision_branches, 'closure_capture_notes': closure_capture_notes, 'conditional_await_notes': future_notes, 'restored_reference_notes': saved_notes, 'async_field_notes': field_notes, 'field_input_notes': field_input_notes, 'captured_field_notes': captured_notes, 'fresh_field_notes': fresh_notes, 'typed_files_with_notes': files,
             'class_name_scope': 'Retained non-predefined names; predefined Frida aliases excluded. Numeric classes and scopes are checked for every note.'}
 
 
