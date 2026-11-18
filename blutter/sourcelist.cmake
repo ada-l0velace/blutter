@@ -119,6 +119,8 @@ set(SRCS
     il.cpp
     il.h
     main.cpp
+    ReaderProbe.cpp
+    ReaderProbe.h
     #pch.cpp
     pch.h
 )

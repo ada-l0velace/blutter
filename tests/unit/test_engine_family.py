@@ -84,7 +84,8 @@ class EngineFamily(unittest.TestCase):
                 self.assertIsNotNone(blutter.get_dart_lib_info('authored-input', 'authored-engine').reader_profile)
             with patch.object(extract, 'is_shorebird_engine', return_value=True), \
                     patch.object(extract, 'extract_dart_info', return_value=metadata), \
-                    patch.object(extract, 'extract_libflutter_info', return_value=(['2' * 40], profile.version, 'arm64', 'android')):
+                    patch.object(extract, 'extract_libflutter_info', return_value=(['2' * 40], profile.version, 'arm64', 'android')), \
+                    patch('reader_compatibility._source', return_value=b'authored non-engine metadata'):
                 with self.assertRaisesRegex(RuntimeError, 'engine revision is unverified'):
                     blutter.get_dart_lib_info('authored-input', 'authored-engine')
 

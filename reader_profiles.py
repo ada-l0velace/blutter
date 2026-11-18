@@ -53,11 +53,14 @@ def reader_profile(version, os_name, arch, compressed, snapshot_hash):
             f'Unsupported snapshot format: {UNSUPPORTED_FORMATS[snapshot_hash]} '
             f'({snapshot_hash}). A compatible reader has not been verified; '
             'an upstream SDK download or hash replacement will not supply one.')
-    for name, profile in RUNTIME_PROFILES.items():
-        if snapshot_hash == profile.snapshot_hash:
-            if (version, os_name, arch, compressed) != (profile.version, 'android', 'arm64', True):
-                raise RuntimeError(f'Known Shorebird snapshot requires Dart {profile.version}, Android ARM64 and compressed pointers')
+    matching = [(name, profile) for name, profile in RUNTIME_PROFILES.items()
+                if snapshot_hash == profile.snapshot_hash]
+    for name, profile in matching:
+        if (version, os_name, arch, compressed) == (profile.version, 'android', 'arm64', True):
             return name
+    if matching:
+        versions = ', '.join(sorted({profile.version for _, profile in matching}))
+        raise RuntimeError(f'Known Shorebird snapshot requires Dart {versions}, Android ARM64 and compressed pointers')
     return None
 
 
@@ -66,6 +69,30 @@ def verify_engine_profile(profile, engine_ids, flags):
     if selected:
         if selected.engine not in engine_ids:
             raise RuntimeError('Shorebird snapshot matches, but the engine revision is unverified')
-        required = {'product', 'no-shared_data', 'compressed-pointers'}
-        if not required.issubset(flags):
-            raise RuntimeError('Unsupported build flags for the Shorebird snapshot reader')
+        verify_build_flags(flags)
+
+
+def verify_build_flags(flags):
+    required = {'product', 'no-shared_data', 'compressed-pointers'}
+    if not required.issubset(flags):
+        raise RuntimeError('Unsupported build flags for the Shorebird snapshot reader')
+
+
+def candidate_profiles(version, os_name, arch, compressed, snapshot_hash):
+    """Candidate discovery only; each unregistered build still requires probing."""
+    if (snapshot_hash in UNSUPPORTED_FORMATS or
+            (os_name, arch, compressed) != ('android', 'arm64', True)):
+        return ()
+    minor = version.split('.')[:2]
+    implementations = {}
+    for name, profile in RUNTIME_PROFILES.items():
+        if profile.snapshot_hash == snapshot_hash and profile.version.split('.')[:2] == minor:
+            key = (profile.version, profile.source_base, profile.macro, profile.patch)
+            implementations.setdefault(key, name)
+    return tuple(implementations.values())
+
+
+def profile_cmake_options(selected):
+    active = runtime_profile(selected).macro if selected else None
+    return [f'-D{macro}={"ON" if macro == active else "OFF"}'
+            for macro in sorted({p.macro for p in RUNTIME_PROFILES.values()})]

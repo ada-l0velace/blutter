@@ -22,6 +22,7 @@ BIN_DIR = os.path.join(SCRIPT_DIR, 'bin')
 PKG_INC_DIR = os.path.join(SCRIPT_DIR, 'packages', 'include')
 PKG_LIB_DIR = os.path.join(SCRIPT_DIR, 'packages', 'lib')
 BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
+READER_EVIDENCE_DIR = os.path.join(BIN_DIR, 'reader-evidence')
 
 
 def analysis_caller_address(value):
@@ -215,12 +216,30 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     print('flags: ' + ' '.join(flags))
 
     has_compressed_ptrs = 'compressed-pointers' in flags
-    info = DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
-    if shorebird and not info.reader_profile:
-        raise RuntimeError(
-            f'Shorebird engine detected, but snapshot format {snapshot_hash} '
-            f'(Dart {dart_version}) has no verified reader. No upstream runtime will be downloaded.')
-    if info.reader_profile:
+    if shorebird:
+        from extract_dart_info import extract_libflutter_info
+        from reader_compatibility import select_reader
+        from reader_profiles import runtime_profile, candidate_profiles
+        if not candidate_profiles(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash):
+            # Preserve target/explicit-format refusals before engine lookup.
+            info = DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+            raise RuntimeError(
+                f'Shorebird engine detected, but snapshot format {snapshot_hash} '
+                f'(Dart {dart_version}) has no verified reader. No upstream runtime will be downloaded.')
+        engine_ids, _, _, _ = extract_libflutter_info(libflutter_path)
+        selection = select_reader(dart_version, os_name, arch, has_compressed_ptrs,
+                                  snapshot_hash, engine_ids, flags,
+                                  READER_EVIDENCE_DIR)
+        profile = runtime_profile(selection.profile)
+        info = DartLibInfo(profile.version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+        info.reader_selection = selection
+        info.observed_version = dart_version
+        info.libflutter_path = libflutter_path
+        print(f'Reader profile: {selection.profile} '
+              f'({"compatibility probe required" if selection.needs_probe else "registered runtime build"})')
+    else:
+        info = DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+    if info.reader_profile and not shorebird:
         from extract_dart_info import extract_libflutter_info
         from reader_profiles import verify_engine_profile
         engine_ids, _, _, _ = extract_libflutter_info(libflutter_path)
@@ -229,6 +248,10 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     return info
 
 def build_and_run(input: BlutterInput):
+    selection = input.dart_info.reader_selection
+    needs_probe = selection is not None and selection.needs_probe
+    if needs_probe and input.create_vs_sln:
+        raise RuntimeError('An unregistered runtime requires a native reader probe before Visual Studio solution generation')
     dartlib_file = library_path(input.dart_info, os.path.dirname(PKG_LIB_DIR), os.name == 'nt')
     runtime_metadata = read_verified(dartlib_file, input.dart_info, 'runtime')
     if runtime_metadata:
@@ -238,7 +261,8 @@ def build_and_run(input: BlutterInput):
     input.call_input_capability = (runtime_metadata or reader_metadata or {}).get('call_input_capability')
     capability_changed = (reader_metadata is not None and runtime_metadata is not None and
                           reader_metadata.get('call_input_capability') != input.call_input_capability)
-    if not reader_metadata or capability_changed or input.rebuild_blutter or input.create_vs_sln:
+    probe_missing = needs_probe and reader_metadata is not None and reader_metadata.get('reader_probe_schema') != 1
+    if not reader_metadata or capability_changed or probe_missing or input.rebuild_blutter or input.create_vs_sln:
         # before fetch and build, check the existence of compiled library first
         #   so the src and build directories can be deleted
         dartlib_file = library_path(input.dart_info, os.path.dirname(PKG_LIB_DIR), os.name == 'nt')
@@ -285,6 +309,19 @@ def build_and_run(input: BlutterInput):
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
             write_verified(input.blutter_file, input.dart_info, 'reader', runtime_metadata, input.no_analysis)
+
+        if needs_probe:
+            from reader_probe import run_probe
+            from reader_compatibility import write_selection_report
+            reader_metadata = read_verified(input.blutter_file, input.dart_info, 'reader', input.no_analysis)
+            if reader_metadata is None or reader_metadata.get('reader_probe_schema') != 1:
+                raise RuntimeError('The candidate reader has no verified native probe capability')
+            print('Probing candidate reader against the original snapshot and engine.', flush=True)
+            proof = run_probe(input.blutter_file, input.libapp_path, input.dart_info.libflutter_path)
+            write_selection_report(input.outdir, selection, reader_metadata, proof)
+            print(f'Reader compatibility validated for this input: {proof["payload_count"]} payloads, '
+                  f'{proof["vm_stub_count"]} ordered VM stubs, {proof["guard_sites_checked"]} native guards. '
+                  'Engine remains unregistered.', flush=True)
 
         # execute blutter    
         command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir, '--graph-detail', input.graph_detail]

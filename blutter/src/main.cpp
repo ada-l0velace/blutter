@@ -5,6 +5,7 @@
 #include "FridaWriter.h"
 #include "args.hxx"
 #include "AnalysisSelection.h"
+#include "ReaderProbe.h"
 #include <filesystem>
 #include <fstream>
 
@@ -27,6 +28,7 @@ int main(int argc, char** argv)
 	args::ValueFlag<std::string> outdir(reqGrp, "outdir", "out path", { 'o', "out"});
 	args::ValueFlag<std::string> analysisCaller(parser, "ELF address", "Supplement call-result analysis for one native payload start", { "analysis-caller" });
 	args::ValueFlag<std::string> graphDetail(parser, "compact|full", "Graph detail: compact (default) or full verification states", { "graph-detail" });
+	args::ValueFlag<std::string> readerProbe(parser, "JSON path", "Probe snapshot deserialization and native table consistency before analysis", { "probe-reader" });
 	AnalysisDiagnostics diagnostics(std::cerr);
 	std::filesystem::path outDir;
 
@@ -37,6 +39,8 @@ int main(int argc, char** argv)
 			throw args::ValidationError("Graph detail must be compact or full");
 		std::optional<uint64_t> selectedCaller;
 		if (analysisCaller) {
+			if (readerProbe)
+				throw args::ValidationError("A reader probe cannot run selected-caller analysis");
 			selectedCaller = SnapshotAnalysis::ParseAnalysisCaller(args::get(analysisCaller));
 #ifndef HAS_INSTRUCTIONS_TABLE_RODATA
 			throw std::runtime_error("Selected caller analysis requires a supported native instructions-table profile");
@@ -63,6 +67,14 @@ int main(int argc, char** argv)
 		app.ExitScope();
 
 		app.EnterScope();
+		if (readerProbe) {
+			WriteReaderProbe(args::get(readerProbe), static_cast<uintptr_t>(app.base()));
+			app.ExitScope();
+			if (!writeAnalysisStatus(outDir, "probe_complete", 0))
+				throw std::runtime_error("Cannot write reader probe status");
+			std::cout << "Snapshot reader probe: deserialization and native table checks completed.\n";
+			return 0;
+		}
 #ifndef NO_CODE_ANALYSIS
 		std::cout << "Analyzing the application\n";
 		CodeAnalyzer analyzer{ app, diagnostics };

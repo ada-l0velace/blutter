@@ -7,7 +7,7 @@ import sys
 import re
 import uuid
 from sdk_abi_features import inspect_source
-from reader_profiles import reader_profile, runtime_profile, RUNTIME_PROFILES
+from reader_profiles import reader_profile, runtime_profile, profile_cmake_options
 from reader_cache import source_snapshot_hash, write_verified, library_path
 
 # assume git and cmake (64 bits) command is in PATH
@@ -60,6 +60,11 @@ class DartLibInfo:
         elif not self.has_compressed_ptrs:
             self.sdk_key += '_no_compressed_ptrs'
         self.lib_name = f'dartvm{self.sdk_key}_{os_name}_{arch}'
+        # Artifact identity describes the actual reader build. A separately
+        # observed input may use it only after compatibility qualification.
+        self.reader_selection = None
+        self.observed_version = version
+        self.libflutter_path = None
 
 
 class ReaderSourceMismatch(RuntimeError):
@@ -255,8 +260,7 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # Note: pointer compression feature is set from Flutter and no one change it when building app.
     #       so only one build of Dart runtime is enough
     builddir = os.path.join(BUILD_DIR, info.lib_name)
-    profile_macros = [f'-D{profile.macro}={"ON" if info.reader_profile == name else "OFF"}'
-                      for name, profile in RUNTIME_PROFILES.items()]
+    profile_macros = profile_cmake_options(info.reader_profile)
     subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
         f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + profile_macros,
         cwd=target_dir, check=True)

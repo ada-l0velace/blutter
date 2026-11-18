@@ -93,6 +93,8 @@ def write_verified(path, info, kind, source, no_analysis=False):
     result = {'schema': 1, 'identity': identity(info, kind, no_analysis),
               'source_revision': source['source_revision'], 'source_hash': source['source_hash'],
               'artifact_sha256': artifact_hash(path)}
+    if kind == 'reader':
+        result['reader_probe_schema'] = 1
     if kind == 'runtime':
         result['headers_sha256'] = installed_headers_hash(path, info)
     elif 'headers_sha256' in source:
