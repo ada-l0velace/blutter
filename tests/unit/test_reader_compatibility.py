@@ -158,6 +158,40 @@ class ReaderCompatibility(unittest.TestCase):
             report.assert_not_called()
             export.assert_not_called()
 
+    def test_registered_stub_abi_runs_its_probe_and_reaches_export(self):
+        from dataclasses import replace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        profile = replace(self.profile, abi_probe='arm64_stub_layout_v1')
+        proof = {'abi_kind': profile.abi_probe, 'payload_count': 2,
+                 'vm_stub_count': 3, 'abi_stubs_checked': 2, 'thread_accesses_checked': 5}
+        output = StringIO()
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': profile}), \
+                patch.object(blutter, 'read_verified', return_value={'reader_probe_schema': 1}), \
+                patch.object(build, 'refresh_call_input_capability', side_effect=lambda i, p, m: m), \
+                patch('reader_probe.run_probe', return_value=proof) as native, \
+                patch.object(compatibility, 'write_selection_report') as report, \
+                patch.object(blutter, 'run_blutter') as export, redirect_stdout(output):
+            request = self.request(candidate=False)
+            blutter.build_and_run(request)
+            native.assert_called_once_with(request.blutter_file, request.libapp_path,
+                                           request.dart_info.libflutter_path,
+                                           expected_abi=profile.abi_probe)
+            report.assert_called_once()
+            export.assert_called_once()
+        self.assertIn('2 ABI stubs, 5 Thread accesses', output.getvalue())
+        self.assertIn('Registered engine; per-input proof required', output.getvalue())
+
+    def test_unknown_registered_proof_kind_cannot_skip_validation(self):
+        from dataclasses import replace
+        from reader_probe import validate_probe
+        kind = 'authored-unsupported'
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': replace(self.profile, abi_probe=kind)}):
+            self.assertTrue(self.request(candidate=False).dart_info.reader_selection.needs_probe)
+            with self.assertRaisesRegex(RuntimeError, 'unsupported reader ABI proof kind'):
+                validate_probe({'schema': 1, 'status': 'deserialized', 'abi_kind': kind},
+                               'unused-app', 'unused-engine', expected_abi=kind)
+
     def test_older_cached_candidate_requires_a_probe_capable_rebuild(self):
         with patch.object(blutter, 'read_verified', return_value={'schema': 1}), \
                 patch.object(build, 'refresh_call_input_capability', side_effect=lambda i, p, m: m), \

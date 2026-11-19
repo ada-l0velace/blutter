@@ -28,7 +28,7 @@ def _integer(report, name):
     return value
 
 
-def _original_table(path, report):
+def _original_table(path, report, ranges=None):
     with open_binary_input(path, 64, MAX_LIBRARY_BYTES) as (stream, file_size):
         elf = ELFFile(stream)
         _require(elf.elfclass == 64 and elf.little_endian and elf['e_machine'] == 'EM_AARCH64',
@@ -102,17 +102,30 @@ def _original_table(path, report):
                      (previous is None or previous < pc), 'invalid original native payload ordering')
             _require(16 + count * 8 <= stack_map < maps_end, 'invalid original stack-map extent')
             previous = pc
+        if ranges is not None:
+            for index, (pc, _) in enumerate(records):
+                ranges[start + pc] = start + (records[index + 1][0] if index + 1 < count else image_size)
         return count
 
 
-def validate_probe(report, libapp, libflutter):
+def validate_probe(report, libapp, libflutter, expected_abi="guarded"):
     _require(isinstance(report, dict) and report.get('schema') == PROBE_SCHEMA and
              report.get('status') == 'deserialized', 'invalid native probe report')
-    count = _original_table(libapp, report)
+    _require(expected_abi in ('guarded', 'arm64_stub_layout_v1'), 'unsupported reader ABI proof kind')
+    actual_abi = report.get('abi_kind', 'guarded')
+    _require(actual_abi == expected_abi, 'unexpected reader ABI proof kind')
+    ranges = {} if actual_abi == 'arm64_stub_layout_v1' else None
+    count = _original_table(libapp, report, ranges) if ranges is not None else _original_table(libapp, report)
     names = report.get('vm_stubs')
     _require(isinstance(names, list) and 1 <= len(names) <= 4096 and
              all(isinstance(n, str) and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]{0,127}', n) for n in names) and
              len(set(names)) == len(names), 'invalid ordered VM stub names')
+    if actual_abi == 'arm64_stub_layout_v1':
+        from reader_stub_evidence import OriginalElf, validate_stub_abi
+        proof = validate_stub_abi(report, OriginalElf(libapp), OriginalElf(libflutter), ranges)
+        return dict(proof, schema=PROBE_SCHEMA, libapp_sha256=artifact_hash(libapp),
+                    libflutter_sha256=artifact_hash(libflutter), payload_count=count,
+                    vm_stub_count=len(names), vm_tag_offset=_integer(report, 'vm_tag_offset'))
     blob = b''.join(name.encode('ascii') + b'\0' for name in names)
     with open_binary_input(libflutter, 64, MAX_LIBRARY_BYTES) as (stream, size):
         engine = read_exact(stream, size)
@@ -137,7 +150,7 @@ def _limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
 
 
-def run_probe(reader, libapp, libflutter, timeout=120):
+def run_probe(reader, libapp, libflutter, timeout=120, expected_abi="guarded"):
     with tempfile.TemporaryDirectory(prefix='blutter-reader-probe-') as temporary:
         root = Path(temporary)
         report, output = root / 'probe.json', root / 'output'
@@ -162,4 +175,4 @@ def run_probe(reader, libapp, libflutter, timeout=120):
         except (OSError, ValueError) as error:
             raise RuntimeError('Reader probe produced invalid completion data') from error
         _require(status == {'status': 'probe_complete', 'analysis_errors': 0}, 'probe did not finish cleanly')
-        return validate_probe(native, libapp, libflutter)
+        return validate_probe(native, libapp, libflutter, expected_abi)

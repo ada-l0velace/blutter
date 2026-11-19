@@ -1,0 +1,54 @@
+--- a/runtime/vm/app_snapshot.cc
++++ b/runtime/vm/app_snapshot.cc
+@@ -728,6 +728,9 @@
+   }
+
+   ObjectPtr Ref(intptr_t index) const {
++    if (index <= 0 || index > num_objects_) {
++      FATAL("Snapshot reference index out of range: %" Pd, index);
++    }
+     ASSERT(index > 0);
+     ASSERT(index <= num_objects_);
+     return refs_->untag()->element(index);
+@@ -765,6 +768,13 @@
+   void ReadDispatchTable() {
+     ReadDispatchTable(&stream_, /*deferred=*/false, InstructionsTable::Handle(),
+                       -1, -1);
++  }
++  void ReadEmptyIndirectStaticCallTable() {
++    // The compiled reference reads an unsigned count after the dispatch table.
++    // Only the canonical empty representation is understood by this reader.
++    if (stream_.PendingBytes() != 1 || Read<uint8_t>() != 0x80) {
++      FATAL("Unsupported indirect static call table or root extent");
++    }
+   }
+   void ReadDispatchTable(ReadStream* stream,
+                          bool deferred,
+@@ -7597,6 +7607,7 @@
+
+     // Deserialize dispatch table (when applicable)
+     d->ReadDispatchTable();
++    d->ReadEmptyIndirectStaticCallTable();
+   }
+
+   void PostLoad(Deserializer* d, const Array& refs) override {
+@@ -10079,6 +10090,9 @@
+     }
+
+     // We should have completely filled the ref array.
++    if (next_ref_index_ - kFirstReference != num_objects_) {
++      FATAL("Snapshot object allocation count mismatch");
++    }
+     ASSERT_EQUAL(next_ref_index_ - kFirstReference, num_objects_);
+
+     {
+@@ -10093,6 +10107,9 @@
+     }
+
+     roots->ReadRoots(this);
++    if (stream_.PendingBytes() != 0) {
++      FATAL("Unread snapshot root data: %" Pd, stream_.PendingBytes());
++    }
+
+ #if defined(DEBUG)
+     int32_t section_marker = Read<int32_t>();

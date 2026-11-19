@@ -102,6 +102,14 @@ if (BLUTTER_SHOREBIRD_7D8F)
 	list(APPEND defines BLUTTER_SHOREBIRD_7D8F)
 endif()
 
+option(BLUTTER_SHOREBIRD_26A7 "Reader for the verified Shorebird Android format" OFF)
+if (BLUTTER_SHOREBIRD_26A7)
+    if (BLUTTER_SHOREBIRD_3C9C OR BLUTTER_SHOREBIRD_8399 OR BLUTTER_SHOREBIRD_7D8F)
+        message(FATAL_ERROR "Select only one custom runtime profile")
+    endif()
+    list(APPEND defines BLUTTER_SHOREBIRD_26A7)
+endif()
+
 if (MSVC)
 	# remove compiler exception handler options
 	string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})

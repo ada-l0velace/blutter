@@ -10,8 +10,10 @@
 void WriteReaderProbe(const std::filesystem::path& destination, uintptr_t libraryBase)
 {
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
+#if !defined(BLUTTER_SHOREBIRD_26A7)
 	if (!TargetRuntime::hasNativeCallGuard)
 		throw std::runtime_error("Reader probing requires a supported guarded runtime family");
+#endif
 	const auto images = ElfHelper::findSnapshots(reinterpret_cast<const uint8_t*>(libraryBase));
 	if (!images.isolate_snapshot_instructions)
 		throw std::runtime_error("Reader probe has no isolate instructions image");
@@ -68,7 +70,29 @@ void WriteReaderProbe(const std::filesystem::path& destination, uintptr_t librar
 	file << '"' << #name << '"';
 	VM_STUB_CODE_LIST(WRITE_STUB_NAME);
 #undef WRITE_STUB_NAME
+#if defined(BLUTTER_SHOREBIRD_26A7)
+	file << "],\"abi_kind\":\"arm64_stub_layout_v1\",\"thread_offsets\":{";
+	bool firstOffset = true;
+	for (const auto& [offset, name] : GetThreadOffsetsMap()) {
+		if (!firstOffset) file << ',';
+		firstOffset = false;
+		file << '"' << name << "\":" << offset;
+	}
+	file << "},\"stub_ranges\":[";
+	comma = false;
+#define WRITE_STUB_RANGE(name) { \
+	const auto& code = dart::StubCode::name(); \
+	if (comma) file << ','; \
+	comma = true; \
+	file << std::format("{{\"name\":\"{}\",\"start\":{},\"size\":{}}}", \
+		#name, code.PayloadStart() - libraryBase, code.Size()); \
+}
+	VM_STUB_CODE_LIST(WRITE_STUB_RANGE);
+#undef WRITE_STUB_RANGE
 	file << "]}\n";
+#else
+	file << "]}\n";
+#endif
 	file.close();
 	if (!file) throw std::runtime_error("Cannot finish reader probe report");
 #else

@@ -19,9 +19,15 @@ class RuntimeProfile:
     source_base: str
     macro: str
     patch: str
+    abi_probe: str = 'guarded'
 
 
 RUNTIME_PROFILES = {
+    'shorebird_26a7': RuntimeProfile('3.14.0', '26a7b50c0924ef9952d7cc8b84c67e13',
+                                     'f0a7d29193ea6e077e02080a3511b405a4401b6f',
+                                     'fa8c1270c374c1346931583a17c3b7f278d3822d',
+                                     'BLUTTER_SHOREBIRD_26A7', 'shorebird_26a7_runtime.patch',
+                                     'arm64_stub_layout_v1'),
     'shorebird_7d8f': RuntimeProfile('3.11.4', '7d8fb82a698d78184f7d1e3bbc00540a',
                                      'a8578c0205c4f52bc8a0d07c5d75f2a19e208187',
                                      '02abc57898bebc334a997e609ce5827c8ef207d7',

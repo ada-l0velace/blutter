@@ -35,7 +35,8 @@ class ReaderSelection:
 
     @property
     def needs_probe(self):
-        return self.source_evidence is not None
+        return (self.source_evidence is not None or
+                runtime_profile(self.profile).abi_probe != 'guarded')
 
 
 def _source(cache, repository, revision, path):

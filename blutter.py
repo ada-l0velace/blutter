@@ -317,11 +317,19 @@ def build_and_run(input: BlutterInput):
             if reader_metadata is None or reader_metadata.get('reader_probe_schema') != 1:
                 raise RuntimeError('The candidate reader has no verified native probe capability')
             print('Probing candidate reader against the original snapshot and engine.', flush=True)
-            proof = run_probe(input.blutter_file, input.libapp_path, input.dart_info.libflutter_path)
+            from reader_profiles import runtime_profile
+            proof = run_probe(input.blutter_file, input.libapp_path, input.dart_info.libflutter_path,
+                              expected_abi=runtime_profile(selection.profile).abi_probe)
             write_selection_report(input.outdir, selection, reader_metadata, proof)
+            if proof.get('abi_kind') == 'arm64_stub_layout_v1':
+                detail = (f'{proof["abi_stubs_checked"]} ABI stubs, '
+                          f'{proof["thread_accesses_checked"]} Thread accesses')
+            else:
+                detail = f'{proof["guard_sites_checked"]} native guards'
+            registration = ('Engine remains unregistered.' if selection.source_evidence is not None
+                            else 'Registered engine; per-input proof required.')
             print(f'Reader compatibility validated for this input: {proof["payload_count"]} payloads, '
-                  f'{proof["vm_stub_count"]} ordered VM stubs, {proof["guard_sites_checked"]} native guards. '
-                  'Engine remains unregistered.', flush=True)
+                  f'{proof["vm_stub_count"]} ordered VM stubs, {detail}. {registration}', flush=True)
 
         # execute blutter    
         command = [input.blutter_file, '-i', input.libapp_path, '-o', input.outdir, '--graph-detail', input.graph_detail]

@@ -74,7 +74,20 @@ static void initThreadOffsetNames()
 	LEAF_RUNTIME_ENTRY_LIST(DEFINE_LEFT_FN_INFO);
 #undef DEFINE_LEFT_FN_INFO
 
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399) || defined(BLUTTER_SHOREBIRD_7D8F)
+#if defined(BLUTTER_SHOREBIRD_26A7)
+	decltype(threadOffsetNames) targetNames;
+	for (const auto& [offset, name] : threadOffsetNames) {
+		// The tail fields have no established target layout in this family.
+		if (offset > dart::Thread::MemoryMove_entry_point_offset()) continue;
+		if (!targetNames.emplace(TargetThreadOffset(offset), name).second)
+			throw std::runtime_error("Conflicting target Thread offset names");
+	}
+	threadOffsetNames = std::move(targetNames);
+	decltype(leafFunctionMap) targetLeafFunctions;
+	for (const auto& [offset, info] : leafFunctionMap)
+		targetLeafFunctions.emplace(TargetThreadOffset(offset), info);
+	leafFunctionMap = std::move(targetLeafFunctions);
+#elif defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8399) || defined(BLUTTER_SHOREBIRD_7D8F)
 	decltype(threadOffsetNames) targetNames;
 	for (const auto& [offset, name] : threadOffsetNames)
 		targetNames.emplace(TargetThreadOffset(offset), name);
