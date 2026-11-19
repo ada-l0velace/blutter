@@ -90,6 +90,8 @@ void WriteReaderProbe(const std::filesystem::path& destination, uintptr_t librar
 	VM_STUB_CODE_LIST(WRITE_STUB_RANGE);
 #undef WRITE_STUB_RANGE
 	file << "]}\n";
+#elif defined(BLUTTER_SHOREBIRD_DB65)
+	file << "],\"abi_kind\":\"guarded_relocations_v1\"}\n";
 #else
 	file << "]}\n";
 #endif

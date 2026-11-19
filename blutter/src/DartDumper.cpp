@@ -1659,7 +1659,9 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 			std::tuple(found->second.primary->Address(), found->second.primary->FullName())) found->second.primary = function;
 	}
 	const auto& pool = app.GetObjectPool();
-#if defined(BLUTTER_SHOREBIRD_26A7)
+#if defined(BLUTTER_SHOREBIRD_DB65)
+	const std::string profileName = "shorebird_db65";
+#elif defined(BLUTTER_SHOREBIRD_26A7)
 	const std::string profileName = "shorebird_26a7";
 #elif defined(BLUTTER_SHOREBIRD_7D8F)
 	const std::string profileName = "shorebird_7d8f";

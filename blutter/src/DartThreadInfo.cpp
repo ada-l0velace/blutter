@@ -74,7 +74,7 @@ static void initThreadOffsetNames()
 	LEAF_RUNTIME_ENTRY_LIST(DEFINE_LEFT_FN_INFO);
 #undef DEFINE_LEFT_FN_INFO
 
-#if defined(BLUTTER_SHOREBIRD_26A7)
+#if defined(BLUTTER_SHOREBIRD_26A7) || defined(BLUTTER_SHOREBIRD_DB65)
 	decltype(threadOffsetNames) targetNames;
 	for (const auto& [offset, name] : threadOffsetNames) {
 		// The tail fields have no established target layout in this family.

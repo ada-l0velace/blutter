@@ -15,7 +15,7 @@ def require(condition, message):
         raise RuntimeError('Reader probe rejected: ' + message)
 
 
-def packed_relative_relocations(data):
+def packed_relative_relocations(data, destinations=None):
     """Decode the bounded Android APS2 RELA subset, following bionic's iterator."""
     require(data[:4] == b'APS2', 'unsupported Android relocation encoding')
     position = 4
@@ -67,6 +67,26 @@ def packed_relative_relocations(data):
                 relative[address] = addend
             seen += 1
     require(position == len(data), 'unread packed relocation bytes')
+    if destinations is not None:
+        destinations.update(addresses)
+    return relative
+
+
+def plain_relative_relocations(data, destinations=None):
+    """Read bounded little-endian ELF64 RELA records, retaining relative pointers."""
+    record = struct.Struct('<QQq')
+    require(len(data) % record.size == 0 and
+            0 < len(data) // record.size <= MAX_RELOCATIONS, 'invalid ELF64 RELA extent')
+    relative, addresses = {}, set()
+    for address, info, addend in record.iter_unpack(data):
+        require(address not in addresses, 'duplicate ELF64 relocation address')
+        addresses.add(address)
+        if info & 0xffffffff == 1027:
+            require(info >> 32 == 0 and address % 8 == 0,
+                    'invalid relative ELF64 relocation')
+            relative[address] = addend
+    if destinations is not None:
+        destinations.update(addresses)
     return relative
 
 
@@ -87,10 +107,18 @@ class OriginalElf:
                         s['p_memsz'] <= (1 << 64) - s['p_vaddr'], 'invalid original stub ELF segment')
             relocation = elf.get_section_by_name('.rela.dyn')
             self.relocation_bytes = None
+            self.relocation_encoding = None
             if relocation is not None:
                 offset, length = relocation['sh_offset'], relocation['sh_size']
-                require(offset <= size and length <= size - offset, 'unmapped packed relocation section')
+                require(offset <= size and length <= size - offset, 'unmapped relocation section')
                 self.relocation_bytes = self.data[offset:offset + length]
+                if relocation['sh_type'] == 'SHT_RELA':
+                    require(relocation['sh_entsize'] == 24, 'invalid ELF64 RELA entry size')
+                    self.relocation_encoding = 'rela'
+                elif relocation['sh_type'] in (0x60000002, 'SHT_ANDROID_RELA'):
+                    self.relocation_encoding = 'aps2'
+                else:
+                    raise RuntimeError('Reader probe rejected: unsupported Android relocation section')
 
     def read(self, address, length, executable=False):
         require(type(address) is int and type(length) is int and address >= 0 and
@@ -112,17 +140,31 @@ class OriginalElf:
 
 def validate_engine_stub_table(engine, names):
     require(engine.relocation_bytes is not None, 'Android stub relocation section missing')
-    pointers = packed_relative_relocations(engine.relocation_bytes)
+    require(2 <= len(names) <= 4096, 'invalid VM stub order length')
+    destinations = set()
+    pointers = (plain_relative_relocations(engine.relocation_bytes, destinations)
+                if engine.relocation_encoding == 'rela'
+                else packed_relative_relocations(engine.relocation_bytes, destinations))
     starts = [address for address, target in pointers.items() if engine.string_equals(target, names[0])]
     matches = []
     for address in starts:
-        if all(address + index * 8 in pointers and
-               engine.string_equals(pointers[address + index * 8], name)
-               for index, name in enumerate(names)):
-            engine.read(address, len(names) * 8)
-            matches.append(address)
+        for stride in (8, 16):
+            if not all(address + index * stride in pointers and
+                       engine.string_equals(pointers[address + index * stride], name)
+                       for index, name in enumerate(names)):
+                continue
+            if stride == 16:
+                # StubCodeEntry is {nullptr, name} before snapshot initialization.
+                if address < 8 or any(address + index * stride - 8 in destinations or
+                        engine.read(address + index * stride - 8, 8) != bytes(8)
+                        for index in range(len(names))):
+                    continue
+                engine.read(address - 8, len(names) * stride)
+            else:
+                engine.read(address, len(names) * stride)
+            matches.append((address, stride))
     require(len(matches) == 1, 'no unique relocated Android VM stub order')
-    return matches[0]
+    return matches[0][0]
 
 
 # Register roles and order follow the pinned ARM64 source generators. Offsets

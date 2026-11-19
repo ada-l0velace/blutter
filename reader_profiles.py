@@ -23,6 +23,11 @@ class RuntimeProfile:
 
 
 RUNTIME_PROFILES = {
+    'shorebird_db65': RuntimeProfile('3.10.9', 'db65a563da4e182bf14dd4caee095ad7',
+                                     'dda6221689d0b21dabed81b20f6a13c89cb0b5a2',
+                                     '7c8a3e077e8a3c6209c865301aada26e9fde764a',
+                                     'BLUTTER_SHOREBIRD_DB65', 'shorebird_db65_runtime.patch',
+                                     'guarded_relocations_v1'),
     'shorebird_26a7': RuntimeProfile('3.14.0', '26a7b50c0924ef9952d7cc8b84c67e13',
                                      'f0a7d29193ea6e077e02080a3511b405a4401b6f',
                                      'fa8c1270c374c1346931583a17c3b7f278d3822d',

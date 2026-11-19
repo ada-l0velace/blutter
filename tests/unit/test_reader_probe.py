@@ -57,6 +57,29 @@ class ReaderProbe(unittest.TestCase):
             with self.subTest(update=update), self.assertRaises(RuntimeError):
                 self.validate(dict(self.report, **update))
 
+    def test_legacy_guarded_probe_accepts_a_verified_interleaved_table(self):
+        from test_reader_stub_evidence import engine_fixture
+        self.engine.write_bytes(engine_fixture(encoding='rela', stride=16))
+        result = self.validate()
+        self.assertEqual(result['engine_stub_table'], 0x208)
+        self.assertEqual(result['guard_sites_checked'], 2)
+        self.assertNotIn('abi_kind', result)
+
+    def test_registered_relocation_mode_requires_the_original_pointer_table(self):
+        from test_reader_stub_evidence import engine_fixture
+        report = dict(self.report, abi_kind='guarded_relocations_v1')
+        with patch.object(probe, '_original_table', return_value=2):
+            with self.assertRaisesRegex(RuntimeError, 'stub order'):
+                probe.validate_probe(report, self.app, self.engine, 'guarded_relocations_v1')
+            self.engine.write_bytes(engine_fixture(encoding='rela', stride=16))
+            result = probe.validate_probe(report, self.app, self.engine, 'guarded_relocations_v1')
+            self.assertEqual(result['abi_kind'], 'guarded_relocations_v1')
+            self.assertEqual(result['engine_stub_table'], 0x208)
+            self.assertEqual(result['guard_sites_checked'], 2)
+            self.app.write_bytes(elf_fixture(pack_words(guard_words())))
+            with self.assertRaisesRegex(RuntimeError, 'both leaf and native'):
+                probe.validate_probe(report, self.app, self.engine, 'guarded_relocations_v1')
+
     def table_fixture(self):
         raw = bytearray(0x1200)
         raw[0x200:0x204] = b'\xf5\xf5\xdc\xdc'

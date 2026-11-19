@@ -9,7 +9,13 @@
 static intptr_t ExpectedThreadOffset(intptr_t offset)
 {
 	// Keep the supported mappings independent of the production layout table.
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_DB65)
+	if (offset >= 0x288 && offset <= 0x6d8) return offset + 0x10;
+	if (offset >= 0x6e0 && offset <= 0x880) return offset + 0x20;
+#elif defined(BLUTTER_SHOREBIRD_26A7)
+	if (offset >= 0x290 && offset <= 0x748) return offset + 0x10;
+	if (offset >= 0x750 && offset <= 0x8e0) return offset + 0x20;
+#elif defined(BLUTTER_SHOREBIRD_3C9C)
 	if (offset >= 0x290 && offset <= 0x700) return offset + 0x10;
 	if (offset >= 0x708 && offset <= 0x8a0) return offset + 0x20;
 	if (offset >= 0x8e0 && offset <= 0x908) return offset + 0x80;
@@ -66,7 +72,9 @@ static void CheckLayoutContract()
 			throw std::runtime_error("Invalid native-call state offset accepted");
 		}
 	}
-#if defined(BLUTTER_SHOREBIRD_3C9C)
+#if defined(BLUTTER_SHOREBIRD_DB65)
+	constexpr std::optional<intptr_t> expectedStateOffset = 0x8d8;
+#elif defined(BLUTTER_SHOREBIRD_3C9C)
 	constexpr std::optional<intptr_t> expectedStateOffset = 0x8f0;
 #elif defined(BLUTTER_SHOREBIRD_8399)
 	constexpr std::optional<intptr_t> expectedStateOffset = 0x8e0;
@@ -95,8 +103,25 @@ int main()
 		Check(0x48, 0x48); // stack_limit
 		Check(0x278, 0x278); // jump_to_frame_entry_point
 		Check(0x280, 0x280); // slow_type_test_entry_point
+#if !defined(BLUTTER_SHOREBIRD_DB65)
 		Check(0x288, 0x288); // resume_interpreter_adjusted_entry_point
-#if defined(BLUTTER_SHOREBIRD_8399)
+#endif
+#if defined(BLUTTER_SHOREBIRD_DB65)
+		Check(0x288, 0x298); // bootstrap native wrapper
+		Check(0x688, 0x698); // top exit frame
+		Check(0x6b0, 0x6c0); // VM tag
+		Check(0x6d8, 0x6e8); // saved shadow call stack
+		Check(0x6e0, 0x700); // execution state
+		Check(0x728, 0x748); // LibcPow
+		Check(0x880, 0x8a0); // MemoryMove
+		Check(0x888, 0x888); // unproved tail is not translated
+#elif defined(BLUTTER_SHOREBIRD_26A7)
+		Check(0x290, 0x2a0);
+		Check(0x720, 0x730); // VM tag
+		Check(0x750, 0x770); // execution state
+		Check(0x8e0, 0x900);
+		Check(0x8e8, 0x8e8);
+#elif defined(BLUTTER_SHOREBIRD_8399)
 		Check(0x290, 0x2a0); // bootstrap_native_wrapper_entry_point
 		Check(0x688, 0x698); // isolate_group
 		Check(0x690, 0x6a0); // saved_stack_limit

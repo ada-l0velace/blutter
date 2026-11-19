@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 
 from elftools.elf.elffile import ELFFile
+from elftools.common.exceptions import ELFError
 
 from binary_input import open_binary_input, read_exact
 from reader_cache import artifact_hash
@@ -111,7 +112,8 @@ def _original_table(path, report, ranges=None):
 def validate_probe(report, libapp, libflutter, expected_abi="guarded"):
     _require(isinstance(report, dict) and report.get('schema') == PROBE_SCHEMA and
              report.get('status') == 'deserialized', 'invalid native probe report')
-    _require(expected_abi in ('guarded', 'arm64_stub_layout_v1'), 'unsupported reader ABI proof kind')
+    _require(expected_abi in ('guarded', 'guarded_relocations_v1', 'arm64_stub_layout_v1'),
+             'unsupported reader ABI proof kind')
     actual_abi = report.get('abi_kind', 'guarded')
     _require(actual_abi == expected_abi, 'unexpected reader ABI proof kind')
     ranges = {} if actual_abi == 'arm64_stub_layout_v1' else None
@@ -129,7 +131,14 @@ def validate_probe(report, libapp, libflutter, expected_abi="guarded"):
     blob = b''.join(name.encode('ascii') + b'\0' for name in names)
     with open_binary_input(libflutter, 64, MAX_LIBRARY_BYTES) as (stream, size):
         engine = read_exact(stream, size)
-    _require(blob in engine, 'reader VM stub order not found in the original engine')
+    table = None
+    if expected_abi == 'guarded_relocations_v1' or blob not in engine:
+        from reader_stub_evidence import OriginalElf, validate_engine_stub_table
+        try:
+            table = validate_engine_stub_table(OriginalElf(libflutter), names)
+        except (ELFError, OSError, ValueError) as error:
+            raise RuntimeError('Reader probe rejected: reader VM stub order not found '
+                               'in the original engine: ' + str(error)) from error
     guards = collect_guard_evidence(libapp)
     _require(guards.status == GuardStatus.CONSISTENT, f'native guard evidence is {guards.status.value}')
     _require({s.kind for s in guards.observations} == {GuardKind.LEAF, GuardKind.NATIVE},
@@ -138,10 +147,15 @@ def validate_probe(report, libapp, libflutter, expected_abi="guarded"):
     _require(state > 0 and tag > 0 and state % 8 == 0 and tag % 8 == 0, 'invalid reader Thread offsets')
     _require(all(s.offsets.state == state and s.offsets.vm_tag == tag for s in guards.observations),
              'reader Thread offsets disagree with original native guards')
-    return {'schema': PROBE_SCHEMA, 'libapp_sha256': artifact_hash(libapp),
+    proof = {'schema': PROBE_SCHEMA, 'libapp_sha256': artifact_hash(libapp),
             'libflutter_sha256': artifact_hash(libflutter), 'payload_count': count,
             'vm_stub_count': len(names), 'guard_sites_checked': len(guards.observations),
             'native_call_state_offset': state, 'vm_tag_offset': tag}
+    if table is not None:
+        proof['engine_stub_table'] = table
+    if expected_abi != 'guarded':
+        proof['abi_kind'] = expected_abi
+    return proof
 
 
 def _limits():

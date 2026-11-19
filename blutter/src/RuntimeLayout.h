@@ -44,8 +44,14 @@ constexpr bool ValidLayout(const Layout& candidate)
 }
 
 // The selected SDK exports these flags; callers use the layout, not its identity.
-#if (defined(BLUTTER_SHOREBIRD_3C9C) + defined(BLUTTER_SHOREBIRD_8399) + defined(BLUTTER_SHOREBIRD_7D8F) + defined(BLUTTER_SHOREBIRD_26A7)) > 1
+#if (defined(BLUTTER_SHOREBIRD_3C9C) + defined(BLUTTER_SHOREBIRD_8399) + defined(BLUTTER_SHOREBIRD_7D8F) + defined(BLUTTER_SHOREBIRD_26A7) + defined(BLUTTER_SHOREBIRD_DB65)) > 1
 #error "Select only one runtime layout"
+#elif defined(BLUTTER_SHOREBIRD_DB65)
+inline constexpr std::array<ThreadOffsetRange, 2> threadOffsets = {{
+	{0x288, 0x6d8, 0x10},
+	{0x6e0, 0x880, 0x20},
+}};
+inline constexpr Layout layout{threadOffsets, 0x8d8};
 #elif defined(BLUTTER_SHOREBIRD_26A7)
 inline constexpr std::array<ThreadOffsetRange, 2> threadOffsets = {{
 	{0x290, 0x748, 0x10},

@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT))
 import blutter
 
 TESTS = ('joined_async_references_test', 'callee_entry_reads_test', 'fresh_content_uses_test', 'fresh_field_initializations_test', 'captured_field_values_test', 'field_input_origins_test', 'async_field_accesses_test', 'arm64_analyzer_test', 'arm64_decoder_test', 'arm64_boxing_test',
-         'thread_layout_upstream_test', 'thread_layout_shorebird_3c9c_test', 'thread_layout_shorebird_8399_test', 'thread_layout_shorebird_7d8f_test',
-         'runtime_features_upstream_test', 'runtime_features_shorebird_3c9c_test', 'runtime_features_shorebird_8399_test', 'runtime_features_shorebird_7d8f_test',
+         'thread_layout_upstream_test', 'thread_layout_shorebird_3c9c_test', 'thread_layout_shorebird_8399_test', 'thread_layout_shorebird_7d8f_test', 'thread_layout_shorebird_26a7_test', 'thread_layout_shorebird_db65_test',
+         'runtime_features_upstream_test', 'runtime_features_shorebird_3c9c_test', 'runtime_features_shorebird_8399_test', 'runtime_features_shorebird_7d8f_test', 'runtime_features_shorebird_26a7_test', 'runtime_features_shorebird_db65_test',
          'arm64_patterns_test', 'arm64_memory_test', 'async_contracts_test', 'async_origins_test', 'word_origins_test', 'completion_analysis_test', 'async_future_bindings_test', 'saved_async_references_test', 'analysis_diagnostics_test', 'snapshot_code_ranges_test', 'read_unaligned_test',
          'native_ir_test', 'arm64_ir_test', 'array_length_test', 'stack_check_test', 'entry_predicate_test', 'native_returns_test', 'sdk_stub_returns_test', 'register_inputs_test', 'call_result_annotations_test', 'call_input_roles_test', 'call_input_shapes_test')
 

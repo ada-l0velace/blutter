@@ -12,7 +12,8 @@ def main():
     compiler = os.environ.get('CXX', 'c++')
     source = root / 'tests/unit/thread_layout_test.cpp'
     flags = ['-std=c++20', '-O2', '-Wall', '-Wextra', '-Werror', '-I' + str(root / 'blutter/src')]
-    profiles = (None, 'BLUTTER_SHOREBIRD_3C9C', 'BLUTTER_SHOREBIRD_8399', 'BLUTTER_SHOREBIRD_7D8F')
+    profiles = (None, 'BLUTTER_SHOREBIRD_3C9C', 'BLUTTER_SHOREBIRD_8399', 'BLUTTER_SHOREBIRD_7D8F',
+                'BLUTTER_SHOREBIRD_26A7', 'BLUTTER_SHOREBIRD_DB65')
     with tempfile.TemporaryDirectory(prefix='thread-layout-') as temporary:
         for index, profile in enumerate(profiles):
             executable = Path(temporary) / ('layout-' + str(index))

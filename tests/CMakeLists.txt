@@ -82,7 +82,7 @@ target_link_libraries(async_origins_test PRIVATE capstone)
 blutter_instrument_test_target(async_origins_test)
 add_test(NAME async_origins COMMAND async_origins_test)
 
-foreach(profile IN ITEMS upstream shorebird_3c9c shorebird_8399 shorebird_7d8f)
+foreach(profile IN ITEMS upstream shorebird_3c9c shorebird_8399 shorebird_7d8f shorebird_26a7 shorebird_db65)
     add_executable(thread_layout_${profile}_test unit/thread_layout_test.cpp)
     target_include_directories(thread_layout_${profile}_test PRIVATE "${BLUTTER_SOURCE_DIR}")
     if(NOT profile STREQUAL "upstream")

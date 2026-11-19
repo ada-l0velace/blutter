@@ -45,6 +45,15 @@ class ReaderCompatibility(unittest.TestCase):
         self.assertEqual(selected.observed_version, '3.12.2')
         source.assert_not_called()
 
+    def test_registered_relocation_profile_still_requires_a_probe(self):
+        from dataclasses import replace
+        with patch.dict(profiles.RUNTIME_PROFILES,
+                        {'authored': replace(self.profile, abi_probe='guarded_relocations_v1')}, clear=True), \
+                patch.object(compatibility, '_source') as source:
+            selected = self.select('3.12.2', self.profile.engine)
+            self.assertTrue(selected.needs_probe)
+            source.assert_not_called()
+
     def test_candidate_preserves_observed_and_actual_reader_versions(self):
         with patch.object(compatibility, '_engine_source', return_value=('4' * 40, '5' * 40)), \
                 patch.object(compatibility, '_contract', return_value=[{'path': 'authored', 'sha256': '6' * 64}]):

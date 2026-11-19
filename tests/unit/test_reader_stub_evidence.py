@@ -1,10 +1,11 @@
-"""Authored packed relocations and ARM64 words; no application snapshots."""
+"""Authored ELF relocations and ARM64 words; no application snapshots."""
 from pathlib import Path
 import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from elftools.common.exceptions import ELFError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import reader_probe
@@ -33,11 +34,13 @@ def packed(entries):
     return bytes(data)
 
 
-def engine_fixture(duplicate=False):
-    entries = [(0x200, 1027, 0x300), (0x208, 1027, 0x320)]
+def engine_fixture(duplicate=False, encoding='aps2', stride=8):
+    base = 0x208 if stride == 16 else 0x200
+    entries = [(base, 1027, 0x300), (base + stride, 1027, 0x320)]
     if duplicate:
-        entries.extend([(0x220, 1027, 0x300), (0x228, 1027, 0x320)])
-    encoded = packed(entries)
+        entries.extend([(base + 0x40, 1027, 0x300), (base + 0x40 + stride, 1027, 0x320)])
+    encoded = (b''.join(struct.pack('<QQq', *row) for row in entries)
+               if encoding == 'rela' else packed(entries))
     data = bytearray(0x500)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
     data[:64] = ELF_HEADER.pack(ident, 3, 183, 1, 0, 64, 0x400, 0, 64, 56, 1, 64, 3, 1)
@@ -49,7 +52,9 @@ def engine_fixture(duplicate=False):
     data[0x380:0x380 + len(strings)] = strings
     section = struct.Struct('<IIQQQQIIQQ')
     section.pack_into(data, 0x440, 1, 3, 0, 0, 0x380, len(strings), 0, 0, 1, 0)
-    section.pack_into(data, 0x480, 11, 0x60000002, 0, 0x100, 0x100, len(encoded), 0, 0, 1, 0)
+    section.pack_into(data, 0x480, 11, 4 if encoding == 'rela' else 0x60000002,
+                      0, 0x100, 0x100, len(encoded), 0, 0, 8 if encoding == 'rela' else 1,
+                      24 if encoding == 'rela' else 0)
     return data
 
 
@@ -98,6 +103,33 @@ class PackedRelocations(unittest.TestCase):
                 evidence.packed_relative_relocations(packed([(0x200, 1027, 0x300), (0x200, second_kind, 0x320)]))
 
 
+class PlainRelocations(unittest.TestCase):
+    def test_signed_addends_and_all_write_destinations(self):
+        data = b''.join(struct.pack('<QQq', *row) for row in
+                        [(0x200, 1027, 0x300), (0x208, 1025, 0), (0x210, 1027, -8)])
+        writes = set()
+        self.assertEqual(evidence.plain_relative_relocations(data, writes),
+                         {0x200: 0x300, 0x210: -8})
+        self.assertEqual(writes, {0x200, 0x208, 0x210})
+
+    def test_record_extent_and_count_limits(self):
+        record = struct.pack('<QQq', 0x200, 1027, 0x300)
+        for size in range(24):
+            with self.subTest(size=size), self.assertRaises(RuntimeError):
+                evidence.plain_relative_relocations(record[:size])
+        with patch.object(evidence, 'MAX_RELOCATIONS', 1), self.assertRaises(RuntimeError):
+            evidence.plain_relative_relocations(record + struct.pack('<QQq', 0x208, 1027, 0x320))
+
+    def test_duplicate_writes_alignment_and_symbol_relative_refuse(self):
+        first = struct.pack('<QQq', 0x200, 1027, 0x300)
+        for kind in (1025, 1027):
+            with self.subTest(kind=kind), self.assertRaisesRegex(RuntimeError, 'duplicate'):
+                evidence.plain_relative_relocations(first + struct.pack('<QQq', 0x200, kind, 0))
+        for address, info in [(0x201, 1027), (0x200, (1 << 32) | 1027)]:
+            with self.subTest(address=address, info=info), self.assertRaises(RuntimeError):
+                evidence.plain_relative_relocations(struct.pack('<QQq', address, info, 0x300))
+
+
 class OriginalStubEvidence(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -120,6 +152,42 @@ class OriginalStubEvidence(unittest.TestCase):
         self.path.write_bytes(engine_fixture(duplicate=True))
         with self.assertRaisesRegex(RuntimeError, 'unique'):
             evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_both_relocation_formats_and_name_layouts(self):
+        for encoding in ('aps2', 'rela'):
+            for stride in (8, 16):
+                with self.subTest(encoding=encoding, stride=stride):
+                    self.path.write_bytes(engine_fixture(encoding=encoding, stride=stride))
+                    self.assertEqual(evidence.validate_engine_stub_table(
+                        evidence.OriginalElf(self.path), self.names), 0x208 if stride == 16 else 0x200)
+                    self.path.write_bytes(engine_fixture(duplicate=True, encoding=encoding, stride=stride))
+                    with self.assertRaisesRegex(RuntimeError, 'unique'):
+                        evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_interleaved_companion_must_be_null_and_unrelocated(self):
+        for encoding in ('aps2', 'rela'):
+            data = engine_fixture(encoding=encoding, stride=16)
+            struct.pack_into('<Q', data, 0x200, 1)
+            self.path.write_bytes(data)
+            with self.subTest(encoding=encoding), self.assertRaisesRegex(RuntimeError, 'unique'):
+                evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+            rows = [(0x208, 1027, 0x300), (0x218, 1027, 0x320), (0x200, 1025, 0)]
+            encoded = (packed(rows) if encoding == 'aps2' else
+                       b''.join(struct.pack('<QQq', *row) for row in rows))
+            data = engine_fixture(encoding=encoding, stride=16)
+            data[0x100:0x100 + len(encoded)] = encoded
+            struct.pack_into('<Q', data, 0x480 + 32, len(encoded))
+            self.path.write_bytes(data)
+            with self.subTest(encoding=encoding), self.assertRaisesRegex(RuntimeError, 'unique'):
+                evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_relocation_section_type_and_entry_size_are_checked(self):
+        for offset, value in [(0x480 + 4, 1), (0x480 + 56, 8)]:
+            data = engine_fixture(encoding='rela')
+            struct.pack_into('<I' if offset == 0x484 else '<Q', data, offset, value)
+            self.path.write_bytes(data)
+            with self.subTest(offset=offset), self.assertRaises((RuntimeError, ELFError)):
+                evidence.OriginalElf(self.path)
 
     def test_target_and_file_mapping_checks(self):
         data = engine_fixture()
