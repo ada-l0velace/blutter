@@ -4,10 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import struct
+from typing import Optional
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.constants import P_FLAGS
-from elftools.elf.elffile import ELFFile
+from elftools.elf.structs import ELFStructs
 from binary_input import EvidenceError, open_binary_input, read_exact
 
 MAX_LIBRARY_BYTES = 256 * 1024 * 1024
@@ -50,7 +51,7 @@ class GuardKind(Enum):
 @dataclass(frozen=True)
 class GuardOffsets:
     state: int
-    vm_tag: int | None
+    vm_tag: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -89,21 +90,30 @@ class _CodeSegment:
 
 def _code_segments(stream, file_size):
     try:
-        elf = ELFFile(stream)
-        if elf.elfclass != 64 or not elf.little_endian or elf['e_machine'] != 'EM_AARCH64':
+        stream.seek(0)
+        data = read_exact(stream, ELF64_HEADER_BYTES)
+        if data[:6] != b'\x7fELF\x02\x01':
             raise EvidenceError('Guard collection requires a little-endian ARM64 ELF')
-        if (elf['e_type'] not in ('ET_DYN', 'ET_EXEC') or elf['e_version'] != 'EV_CURRENT' or
-                elf['e_ident']['EI_VERSION'] != 'EV_CURRENT'):
+        # ELFFile on older pyelftools eagerly loads section-name metadata.
+        # Guard evidence depends only on the ELF and program headers.
+        structs = ELFStructs(little_endian=True, elfclass=64)
+        structs.create_basic_structs()
+        header = structs.Elf_Ehdr.parse(data)
+        if header['e_machine'] != 'EM_AARCH64':
+            raise EvidenceError('Guard collection requires a little-endian ARM64 ELF')
+        if (header['e_type'] not in ('ET_DYN', 'ET_EXEC') or header['e_version'] != 'EV_CURRENT' or
+                header['e_ident']['EI_VERSION'] != 'EV_CURRENT'):
             raise EvidenceError('Unsupported ELF type or version')
-        count, offset, entry_size = elf['e_phnum'], elf['e_phoff'], elf['e_phentsize']
-        if (elf['e_ehsize'] != ELF64_HEADER_BYTES or entry_size != ELF64_PROGRAM_HEADER_BYTES or
+        count, offset, entry_size = header['e_phnum'], header['e_phoff'], header['e_phentsize']
+        if (header['e_ehsize'] != ELF64_HEADER_BYTES or entry_size != ELF64_PROGRAM_HEADER_BYTES or
                 count > MAX_PROGRAM_HEADERS):
             raise EvidenceError('Unsupported ELF header sizes or program-header count')
         if (offset > file_size or count * entry_size > file_size - offset or
                 count and offset < ELF64_HEADER_BYTES):
             raise EvidenceError('Program headers lie outside the ELF input')
+        structs.create_advanced_structs(header['e_type'], header['e_machine'], header['e_ident']['EI_OSABI'])
         stream.seek(offset)
-        headers = [elf.structs.Elf_Phdr.parse(read_exact(stream, entry_size)) for _ in range(count)]
+        headers = [structs.Elf_Phdr.parse(read_exact(stream, entry_size)) for _ in range(count)]
     except ELFError as error:
         raise EvidenceError('Invalid ELF input') from error
 

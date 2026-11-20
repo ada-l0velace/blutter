@@ -190,14 +190,13 @@ class RuntimeEvidence(unittest.TestCase):
         data = elf_fixture(code)
         struct.pack_into('<Q', data, 40, (1 << 64) - 1)
         struct.pack_into('<HHH', data, 58, 64, 0xffff, 0xffff)
-        with patch.object(evidence.ELFFile, 'get_section', side_effect=AssertionError('section traversal')):
+        with patch('elftools.elf.elffile.ELFFile.__init__', side_effect=AssertionError('section-aware parsing')):
             self.assertEqual(len(self.collect(data).observations), 1)
 
     def test_dynamic_segments_do_not_trigger_section_or_symbol_loading(self):
         dynamic = (2, 6, (1 << 64) - 1, 0, 0, (1 << 64) - 1, 0, 0)
         data = elf_fixture(pack_words(guard_words()), [dynamic])
-        with patch.object(evidence.ELFFile, 'get_section', side_effect=AssertionError('section traversal')), \
-                patch.object(evidence.ELFFile, 'get_segment', side_effect=AssertionError('segment construction')):
+        with patch('elftools.elf.elffile.ELFFile.__init__', side_effect=AssertionError('section-aware parsing')):
             self.assertEqual(len(self.collect(data).observations), 1)
 
     def test_adjacent_segments_are_not_joined_into_a_guard(self):
@@ -221,7 +220,7 @@ class RuntimeEvidence(unittest.TestCase):
     def test_oversized_input_is_rejected_before_elf_parsing(self):
         data = elf_fixture(pack_words(guard_words()))
         with patch.object(evidence, 'MAX_LIBRARY_BYTES', len(data) - 1), \
-                patch.object(evidence, 'ELFFile', side_effect=AssertionError('parsed oversized file')):
+                patch.object(evidence, 'ELFStructs', side_effect=AssertionError('parsed oversized file')):
             self.reject(data, 'bounded regular')
 
     def test_code_budget_is_total_and_checked_before_scanning(self):

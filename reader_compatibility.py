@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+from typing import Optional
 
 import requests
 
@@ -31,7 +32,7 @@ class ReaderSelection:
     profile: str
     observed_version: str
     engine_revision: str
-    source_evidence: dict | None = None
+    source_evidence: Optional[dict] = None
 
     @property
     def needs_probe(self):
