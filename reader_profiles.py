@@ -20,9 +20,41 @@ class RuntimeProfile:
     macro: str
     patch: str
     abi_probe: str = 'guarded'
+    probe_required: bool = False
 
 
 RUNTIME_PROFILES = {
+    'shorebird_3b9d': RuntimeProfile('3.12.0', '3b9dd32ebfb285543e9955e017f2d6f9',
+                                     '6500c84eba818b598fb967bd0276e6e50cdd02c9',
+                                     '98116461144f4429ab873f8497023a5ec3b08127',
+                                     'BLUTTER_SHOREBIRD_8399', 'shorebird_8399_runtime.patch',
+                                     probe_required=True),
+    'shorebird_270d': RuntimeProfile('3.13.7', '270d238dfe6d46dd89e5a6bccb71fcd6',
+                                     '3f9fd7b230491dab27d914895c601ef1305ae0b4',
+                                     '416e33b0ffaef062a60ec966bb8c82ed2b83f128',
+                                     'BLUTTER_SHOREBIRD_3C9C', 'shorebird_3c9c_runtime.patch',
+                                     probe_required=True),
+    'shorebird_8768': RuntimeProfile('3.13.7', '8768db8be79c422430ba6e69be750f8b',
+                                     'c99fa680350f97a951ff5b59f7bad41c2f15f3f9',
+                                     '416e33b0ffaef062a60ec966bb8c82ed2b83f128',
+                                     'BLUTTER_SHOREBIRD_8768', 'shorebird_8768_runtime.patch',
+                                     'arm64_stub_layout_v1',
+                                     probe_required=True),
+    'shorebird_bc05': RuntimeProfile('3.11.0', 'bc05d4f613fbdf7e168164a9d12fb895',
+                                     'c10186c6dcacd5a481b0a0cb6587830cf974e5bd',
+                                     '1a420a3f9a9ae64426d90b711cf1e6d73e953f23',
+                                     'BLUTTER_SHOREBIRD_7D8F', 'shorebird_7d8f_runtime.patch',
+                                     probe_required=True),
+    'shorebird_2b8c': RuntimeProfile('3.12.2', '2b8c174ed4a6df16d4c081e0ea77326f',
+                                     '27bc060323bfdfe2f5b6732174d4e499e74eca70',
+                                     'd684a576a6aa954ae107a03b2b4e1d61c3bebe93',
+                                     'BLUTTER_SHOREBIRD_8399', 'shorebird_8399_runtime.patch',
+                                     probe_required=True),
+    'shorebird_6bb4': RuntimeProfile('3.10.0', '6bb4b502aa008f00b70e1c7259d257fa',
+                                     'aadc5100597a5330de0ec89b144f95ec96e8f66f',
+                                     'b1a587b650acd12239743dd1f9d88d6fe19ae442',
+                                     'BLUTTER_SHOREBIRD_DB65', 'shorebird_db65_runtime.patch',
+                                     'guarded_relocations_v1'),
     'shorebird_db65': RuntimeProfile('3.10.9', 'db65a563da4e182bf14dd4caee095ad7',
                                      'dda6221689d0b21dabed81b20f6a13c89cb0b5a2',
                                      '7c8a3e077e8a3c6209c865301aada26e9fde764a',

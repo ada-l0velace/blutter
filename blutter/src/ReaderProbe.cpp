@@ -10,7 +10,7 @@
 void WriteReaderProbe(const std::filesystem::path& destination, uintptr_t libraryBase)
 {
 #ifdef HAS_INSTRUCTIONS_TABLE_RODATA
-#if !defined(BLUTTER_SHOREBIRD_26A7)
+#if !defined(BLUTTER_SHOREBIRD_26A7) && !defined(BLUTTER_SHOREBIRD_8768)
 	if (!TargetRuntime::hasNativeCallGuard)
 		throw std::runtime_error("Reader probing requires a supported guarded runtime family");
 #endif
@@ -70,7 +70,7 @@ void WriteReaderProbe(const std::filesystem::path& destination, uintptr_t librar
 	file << '"' << #name << '"';
 	VM_STUB_CODE_LIST(WRITE_STUB_NAME);
 #undef WRITE_STUB_NAME
-#if defined(BLUTTER_SHOREBIRD_26A7)
+#if defined(BLUTTER_SHOREBIRD_26A7) || defined(BLUTTER_SHOREBIRD_8768)
 	file << "],\"abi_kind\":\"arm64_stub_layout_v1\",\"thread_offsets\":{";
 	bool firstOffset = true;
 	for (const auto& [offset, name] : GetThreadOffsetsMap()) {

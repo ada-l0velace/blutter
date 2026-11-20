@@ -41,6 +41,30 @@
    }
 
    void PostLoad(Deserializer* d, const Array& refs) override {
+@@ -9999,6 +10019,11 @@
+     }
+
+     // We should have completely filled the ref array.
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++    if (next_ref_index_ - kFirstReference != num_objects_) {
++      FATAL("Snapshot object allocation count mismatch");
++    }
++#endif
+     ASSERT_EQUAL(next_ref_index_ - kFirstReference, num_objects_);
+
+     {
+@@ -10013,6 +10038,11 @@
+     }
+
+     roots->ReadRoots(this);
++#if defined(BLUTTER_SHOREBIRD_3C9C)
++    if (stream_.PendingBytes() != 0) {
++      FATAL("Unread snapshot root data: %" Pd, stream_.PendingBytes());
++    }
++#endif
+
+ #if defined(DEBUG)
+     int32_t section_marker = Read<int32_t>();
 --- a/runtime/vm/stub_code_list.h
 +++ b/runtime/vm/stub_code_list.h
 @@ -26,9 +26,35 @@

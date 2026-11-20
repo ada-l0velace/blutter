@@ -54,6 +54,64 @@ class ReaderCompatibility(unittest.TestCase):
             self.assertTrue(selected.needs_probe)
             source.assert_not_called()
 
+    def test_registered_guarded_profile_can_require_probing_without_changing_abi(self):
+        from dataclasses import replace
+        profile = replace(self.profile, probe_required=True)
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': profile}, clear=True), \
+                patch.object(compatibility, '_source') as source:
+            selected = self.select('3.12.2', profile.engine)
+            self.assertTrue(selected.needs_probe)
+            self.assertEqual(profiles.runtime_profile(selected.profile).abi_probe, 'guarded')
+            self.assertIsNone(selected.source_evidence)
+            source.assert_not_called()
+
+    def test_registered_required_probe_runs_on_every_cached_launch(self):
+        from dataclasses import replace
+        profile = replace(self.profile, probe_required=True)
+        proof = {'payload_count': 2, 'vm_stub_count': 2, 'guard_sites_checked': 2}
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': profile}), \
+                patch.object(blutter, 'read_verified', return_value={'reader_probe_schema': 1}), \
+                patch.object(build, 'refresh_call_input_capability', side_effect=lambda i, p, m: m), \
+                patch('reader_probe.run_probe', return_value=proof) as native, \
+                patch.object(compatibility, 'write_selection_report') as report, \
+                patch.object(blutter, 'cmake_blutter') as compile_call, \
+                patch.object(blutter, 'run_blutter') as export:
+            request = self.request(candidate=False)
+            for _ in range(2):
+                blutter.build_and_run(request)
+            self.assertEqual(native.call_count, 2)
+            self.assertEqual(report.call_count, 2)
+            self.assertEqual(export.call_count, 2)
+            native.assert_called_with(request.blutter_file, request.libapp_path,
+                                      request.dart_info.libflutter_path, expected_abi='guarded')
+            compile_call.assert_not_called()
+
+    def test_registered_required_probe_failure_prevents_export(self):
+        from dataclasses import replace
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': replace(self.profile, probe_required=True)}), \
+                patch.object(blutter, 'read_verified', return_value={'reader_probe_schema': 1}), \
+                patch.object(build, 'refresh_call_input_capability', side_effect=lambda i, p, m: m), \
+                patch('reader_probe.run_probe', side_effect=RuntimeError('authored required-probe refusal')), \
+                patch.object(compatibility, 'write_selection_report') as report, \
+                patch.object(blutter, 'run_blutter') as export:
+            with self.assertRaisesRegex(RuntimeError, 'authored required-probe refusal'):
+                blutter.build_and_run(self.request(candidate=False))
+            report.assert_not_called()
+            export.assert_not_called()
+
+    def test_registered_required_probe_rebuilds_reader_without_probe_capability(self):
+        from dataclasses import replace
+        with patch.dict(profiles.RUNTIME_PROFILES, {'authored': replace(self.profile, probe_required=True)}), \
+                patch.object(blutter, 'read_verified', return_value={'schema': 1}), \
+                patch.object(build, 'refresh_call_input_capability', side_effect=lambda i, p, m: m), \
+                patch.object(blutter, 'cmake_blutter', side_effect=RuntimeError('authored required rebuild')) as compile_call, \
+                patch('reader_probe.run_probe') as native, patch.object(blutter, 'run_blutter') as export:
+            with self.assertRaisesRegex(RuntimeError, 'authored required rebuild'):
+                blutter.build_and_run(self.request(candidate=False))
+            compile_call.assert_called_once()
+            native.assert_not_called()
+            export.assert_not_called()
+
     def test_candidate_preserves_observed_and_actual_reader_versions(self):
         with patch.object(compatibility, '_engine_source', return_value=('4' * 40, '5' * 40)), \
                 patch.object(compatibility, '_contract', return_value=[{'path': 'authored', 'sha256': '6' * 64}]):

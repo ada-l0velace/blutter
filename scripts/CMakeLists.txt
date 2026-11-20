@@ -118,6 +118,14 @@ if (BLUTTER_SHOREBIRD_DB65)
     list(APPEND defines BLUTTER_SHOREBIRD_DB65)
 endif()
 
+option(BLUTTER_SHOREBIRD_8768 "Reader for the verified Shorebird ARM64 stub ABI" OFF)
+if (BLUTTER_SHOREBIRD_8768)
+    if (BLUTTER_SHOREBIRD_3C9C OR BLUTTER_SHOREBIRD_8399 OR BLUTTER_SHOREBIRD_7D8F OR BLUTTER_SHOREBIRD_26A7 OR BLUTTER_SHOREBIRD_DB65)
+        message(FATAL_ERROR "Select only one custom runtime profile")
+    endif()
+    list(APPEND defines BLUTTER_SHOREBIRD_8768)
+endif()
+
 if (MSVC)
 	# remove compiler exception handler options
 	string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})

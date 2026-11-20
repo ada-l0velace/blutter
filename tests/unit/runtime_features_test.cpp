@@ -1,4 +1,4 @@
-#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
+#if defined(BLUTTER_SHOREBIRD_3C9C) || defined(BLUTTER_SHOREBIRD_8768) || defined(HAS_INSTRUCTIONS_TABLE_RODATA)
 constexpr bool previousTableSupport = true;
 #else
 constexpr bool previousTableSupport = false;

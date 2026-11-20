@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dartvm_fetch_build import DartLibInfo
@@ -11,10 +12,37 @@ from reader_profiles import (
     SHOREBIRD_ENGINE, SHOREBIRD_HASH, SHOREBIRD_PROFILE,
     reader_profile, verify_engine_profile,
     RUNTIME_PROFILES, runtime_profile,
+    RuntimeProfile, candidate_profiles, profile_cmake_options,
 )
 
 
 class ReaderProfiles(unittest.TestCase):
+    def test_shared_layout_keeps_format_artifacts_distinct_and_requires_probes(self):
+        from reader_compatibility import ReaderSelection
+        shared = 'AUTHORED_SHARED_LAYOUT'
+        definitions = {
+            'authored_first': RuntimeProfile('3.10.0', '1' * 32, '2' * 40, '3' * 40,
+                                            shared, 'authored.patch', 'guarded_relocations_v1'),
+            'authored_second': RuntimeProfile('3.10.9', '4' * 32, '5' * 40, '6' * 40,
+                                             shared, 'authored.patch', 'guarded_relocations_v1'),
+        }
+        with patch.dict(RUNTIME_PROFILES, definitions, clear=True):
+            first = DartLibInfo('3.10.0', 'android', 'arm64', True, '1' * 32)
+            second = DartLibInfo('3.10.9', 'android', 'arm64', True, '4' * 32)
+            self.assertEqual(first.reader_profile, 'authored_first')
+            self.assertEqual(second.reader_profile, 'authored_second')
+            self.assertNotEqual(first.sdk_key, second.sdk_key)
+            self.assertNotEqual(first.lib_name, second.lib_name)
+            for name in definitions:
+                self.assertEqual(profile_cmake_options(name), ['-D' + shared + '=ON'])
+                self.assertTrue(ReaderSelection(name, definitions[name].version,
+                                                definitions[name].engine).needs_probe)
+            self.assertEqual(candidate_profiles('3.10.1', 'android', 'arm64', True, '1' * 32),
+                             ('authored_first',))
+            self.assertEqual(candidate_profiles('3.10.1', 'android', 'arm64', True, '4' * 32),
+                             ('authored_second',))
+            self.assertEqual(candidate_profiles('3.10.1', 'android', 'arm64', True, '0' * 32), ())
+
     def test_every_profile_has_its_own_base_patch_engine_and_target(self):
         keys = set()
         for name, profile in RUNTIME_PROFILES.items():

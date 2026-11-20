@@ -15,6 +15,9 @@ static intptr_t ExpectedThreadOffset(intptr_t offset)
 #elif defined(BLUTTER_SHOREBIRD_26A7)
 	if (offset >= 0x290 && offset <= 0x748) return offset + 0x10;
 	if (offset >= 0x750 && offset <= 0x8e0) return offset + 0x20;
+#elif defined(BLUTTER_SHOREBIRD_8768)
+	if (offset >= 0x290 && offset <= 0x700) return offset + 0x10;
+	if (offset >= 0x708 && offset <= 0x898) return offset + 0x20;
 #elif defined(BLUTTER_SHOREBIRD_3C9C)
 	if (offset >= 0x290 && offset <= 0x700) return offset + 0x10;
 	if (offset >= 0x708 && offset <= 0x8a0) return offset + 0x20;
@@ -121,6 +124,14 @@ int main()
 		Check(0x750, 0x770); // execution state
 		Check(0x8e0, 0x900);
 		Check(0x8e8, 0x8e8);
+#elif defined(BLUTTER_SHOREBIRD_8768)
+		Check(0x290, 0x2a0); // bootstrap native wrapper
+		Check(0x6d8, 0x6e8); // VM tag
+		Check(0x700, 0x710); // saved shadow call stack
+		Check(0x708, 0x728); // execution state
+		Check(0x750, 0x770); // LibcPow
+		Check(0x898, 0x8b8); // last proved leaf entry
+		Check(0x8a0, 0x8a0); // unproved tail is not translated
 #elif defined(BLUTTER_SHOREBIRD_8399)
 		Check(0x290, 0x2a0); // bootstrap_native_wrapper_entry_point
 		Check(0x688, 0x698); // isolate_group

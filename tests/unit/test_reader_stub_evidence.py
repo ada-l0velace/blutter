@@ -138,6 +138,68 @@ class OriginalStubEvidence(unittest.TestCase):
         self.path.write_bytes(engine_fixture())
         self.names = ['AuthoredFirst', 'AuthoredLast']
 
+    def relative_table(self, duplicate=False, flags=4, start=0x200, relocation=0x180):
+        data = engine_fixture(encoding='rela')
+        strings = [name.encode('ascii') + b'\0' for name in self.names]
+        offsets = [8, 8 + len(strings[0])]
+        table = struct.pack('<II', *offsets) + b''.join(strings)
+        struct.pack_into('<I', data, 68, flags)
+        struct.pack_into('<QQq', data, 0x100, relocation, 1025, 0)
+        struct.pack_into('<Q', data, 0x480 + 32, 24)
+        data[start:start + len(table)] = table
+        if duplicate:
+            data[0x280:0x280 + len(table)] = table
+        self.path.write_bytes(data)
+        return data, len(table)
+
+    def test_relative_name_offsets_match_complete_order_without_pointer_relocations(self):
+        data, _ = self.relative_table()
+        self.assertEqual(evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names), 0x200)
+        self.assertEqual(self.path.read_bytes(), data)
+        with self.assertRaisesRegex(RuntimeError, 'unique'):
+            evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), list(reversed(self.names)))
+
+    def test_relative_name_table_refuses_changed_offsets_or_string_terminators(self):
+        for kind in ['offset', 'terminator']:
+            data, size = self.relative_table()
+            if kind == 'offset':
+                struct.pack_into('<I', data, 0x204, 0xffffffff)
+            else:
+                data[0x200 + size - 1] = ord('X')
+            self.path.write_bytes(data)
+            with self.subTest(kind=kind), self.assertRaisesRegex(RuntimeError, 'unique'):
+                evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_relative_name_table_requires_aligned_read_only_storage(self):
+        for flags, start in [(6, 0x200), (1, 0x200), (0, 0x200), (4, 0x201)]:
+            self.relative_table(flags=flags, start=start)
+            with self.subTest(flags=flags, start=start), self.assertRaisesRegex(RuntimeError, 'unique'):
+                evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_relative_name_table_can_share_a_read_execute_load_with_code(self):
+        self.relative_table(flags=5)
+        self.assertEqual(evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names), 0x200)
+
+    def test_relative_name_table_rejects_relocations_inside_or_across_its_boundary(self):
+        for address in [0x1f4, 0x1fc, 0x200, 0x204, 0x210]:
+            self.relative_table(relocation=address)
+            with self.subTest(address=address), self.assertRaisesRegex(RuntimeError, 'unique'):
+                evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_relative_name_table_requires_complete_mapped_extent(self):
+        data, size = self.relative_table()
+        struct.pack_into('<Q', data, 64 + 32, 0x200 + size - 1)
+        self.path.write_bytes(data)
+        with self.assertRaisesRegex(RuntimeError, 'unique'):
+            evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
+    def test_relative_name_table_ambiguity_and_work_limit_remain_errors(self):
+        self.relative_table(duplicate=True)
+        with self.assertRaisesRegex(RuntimeError, 'unique'):
+            evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+        with patch.object(evidence, 'MAX_NAME_TABLE_CANDIDATES', 1), self.assertRaisesRegex(RuntimeError, 'excessive'):
+            evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)
+
     def test_relocated_pointer_order_works_without_contiguous_name_storage(self):
         original = self.path.read_bytes()
         table = evidence.validate_engine_stub_table(evidence.OriginalElf(self.path), self.names)

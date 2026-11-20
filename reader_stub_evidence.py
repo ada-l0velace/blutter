@@ -1,4 +1,5 @@
 """Original Android ELF evidence for the source-backed ARM64 stub ABI contract."""
+import bisect
 import struct
 
 from elftools.elf.elffile import ELFFile
@@ -8,6 +9,7 @@ from runtime_evidence import MAX_LIBRARY_BYTES, MAX_PROGRAM_HEADERS
 
 MAX_RELOCATIONS = 1_000_000
 MAX_STUB_BYTES = 64 * 1024
+MAX_NAME_TABLE_CANDIDATES = 64
 
 
 def require(condition, message):
@@ -141,6 +143,9 @@ class OriginalElf:
 def validate_engine_stub_table(engine, names):
     require(engine.relocation_bytes is not None, 'Android stub relocation section missing')
     require(2 <= len(names) <= 4096, 'invalid VM stub order length')
+    require(all(isinstance(name, str) and 1 <= len(name) <= 128 and
+                name.isascii() and '\0' not in name for name in names),
+            'invalid VM stub order names')
     destinations = set()
     pointers = (plain_relative_relocations(engine.relocation_bytes, destinations)
                 if engine.relocation_encoding == 'rela'
@@ -163,7 +168,35 @@ def validate_engine_stub_table(engine, names):
             else:
                 engine.read(address, len(names) * stride)
             matches.append((address, stride))
-    require(len(matches) == 1, 'no unique relocated Android VM stub order')
+    # A relative string table stores uint32 offsets from its own base, followed
+    # by the complete ordered NUL-terminated names. It has no pointer relocations.
+    strings = [name.encode('ascii') + b'\0' for name in names]
+    offset = len(names) * 4
+    offsets = []
+    for string in strings:
+        offsets.append(struct.pack('<I', offset))
+        offset += len(string)
+    encoded = b''.join(offsets + strings)
+    writes = sorted(destinations)
+    candidates = 0
+    for segment in engine.loads:
+        # Some linkers put .rodata in the same read/execute load as .text.
+        if not segment['p_flags'] & 4 or segment['p_flags'] & 2:
+            continue
+        start, end = segment['p_offset'], segment['p_offset'] + segment['p_filesz']
+        position = engine.data.find(encoded, start, end)
+        while position != -1:
+            candidates += 1
+            require(candidates <= MAX_NAME_TABLE_CANDIDATES, 'excessive VM name table candidates')
+            address = segment['p_vaddr'] + position - start
+            # AArch64 TLSDESC relocations write two words; overlap includes a
+            # relocation beginning before the candidate's first byte.
+            index = bisect.bisect_left(writes, max(0, address - 15))
+            relocated = index < len(writes) and writes[index] < address + len(encoded)
+            if address % 4 == 0 and not relocated and engine.read(address, len(encoded)) == encoded:
+                matches.append((address, 4))
+            position = engine.data.find(encoded, position + 1, end)
+    require(len(matches) == 1, 'no unique Android VM stub order')
     return matches[0][0]
 
 

@@ -1,0 +1,67 @@
+--- a/runtime/vm/app_snapshot.cc
++++ b/runtime/vm/app_snapshot.cc
+@@ -728,6 +728,11 @@
+   }
+
+   ObjectPtr Ref(intptr_t index) const {
++#if defined(BLUTTER_SHOREBIRD_8768)
++    if (index <= 0 || index > num_objects_) {
++      FATAL("Shorebird reference index out of range: %" Pd, index);
++    }
++#endif
+     ASSERT(index > 0);
+     ASSERT(index <= num_objects_);
+     return refs_->untag()->element(index);
+@@ -766,6 +771,18 @@
+     ReadDispatchTable(&stream_, /*deferred=*/false, InstructionsTable::Handle(),
+                       -1, -1);
+   }
++#if defined(BLUTTER_SHOREBIRD_8768)
++  void ReadShorebirdIndirectStaticCallTable() {
++    // The matching analyzer reads one unsigned count after the dispatch table.
++    // This reader supports only an empty table. Nonempty tables require entry
++    // decoding and relocation support before they can be accepted.
++    const intptr_t length = ReadUnsigned();
++    if (length != 0) {
++      FATAL("Unsupported nonempty Shorebird indirect static call table: %" Pd,
++            length);
++    }
++  }
++#endif
+   void ReadDispatchTable(ReadStream* stream,
+                          bool deferred,
+                          const InstructionsTable& root_instruction_table,
+@@ -7534,6 +7551,9 @@
+
+     // Deserialize dispatch table (when applicable)
+     d->ReadDispatchTable();
++#if defined(BLUTTER_SHOREBIRD_8768)
++    d->ReadShorebirdIndirectStaticCallTable();
++#endif
+   }
+
+   void PostLoad(Deserializer* d, const Array& refs) override {
+@@ -9999,6 +10019,11 @@
+     }
+
+     // We should have completely filled the ref array.
++#if defined(BLUTTER_SHOREBIRD_8768)
++    if (next_ref_index_ - kFirstReference != num_objects_) {
++      FATAL("Snapshot object allocation count mismatch");
++    }
++#endif
+     ASSERT_EQUAL(next_ref_index_ - kFirstReference, num_objects_);
+
+     {
+@@ -10013,6 +10038,11 @@
+     }
+
+     roots->ReadRoots(this);
++#if defined(BLUTTER_SHOREBIRD_8768)
++    if (stream_.PendingBytes() != 0) {
++      FATAL("Unread snapshot root data: %" Pd, stream_.PendingBytes());
++    }
++#endif
+
+ #if defined(DEBUG)
+     int32_t section_marker = Read<int32_t>();

@@ -1663,6 +1663,8 @@ void DartDumper::DumpSnapshotCode(const char* asm_dir)
 	const std::string profileName = "shorebird_db65";
 #elif defined(BLUTTER_SHOREBIRD_26A7)
 	const std::string profileName = "shorebird_26a7";
+#elif defined(BLUTTER_SHOREBIRD_8768)
+	const std::string profileName = "shorebird_8768";
 #elif defined(BLUTTER_SHOREBIRD_7D8F)
 	const std::string profileName = "shorebird_7d8f";
 #elif defined(BLUTTER_SHOREBIRD_8399)
